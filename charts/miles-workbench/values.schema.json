@@ -90,6 +90,9 @@
         "paths": {
           "$ref": "#/definitions/Paths"
         },
+        "nodeLocalStorage": {
+          "$ref": "#/definitions/NodeLocalStorage"
+        },
         "scheduling": {
           "$ref": "#/definitions/Scheduling"
         },
@@ -110,6 +113,26 @@
         "image",
         "sharedStorage"
       ],
+      "type": "object"
+    },
+    "NodeLocalStorage": {
+      "additionalProperties": false,
+      "properties": {
+        "hostPath": {
+          "not": {
+            "pattern": "(^|/)\\.\\.(/|$)"
+          },
+          "pattern": "^(/.*)?$",
+          "type": "string"
+        },
+        "mountPath": {
+          "not": {
+            "pattern": "(^|/)\\.\\.(/|$)"
+          },
+          "pattern": "^/",
+          "type": "string"
+        }
+      },
       "type": "object"
     },
     "Paths": {

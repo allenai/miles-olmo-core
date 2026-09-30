@@ -74,6 +74,7 @@ def build_train_module(args, source=None):
     backend = _backend(kind)
     backend.validate_training_options(args)
     if kind == "moe":
+        backend.validate_emo_training(config, hf, args)
         backend.prepare_model_config(config, hf, args.olmo_core)
     model = config.build(init_device="meta")
     forward_capacity = args.olmo_core.packing_max_tokens or args.olmo_core.max_sequence_length

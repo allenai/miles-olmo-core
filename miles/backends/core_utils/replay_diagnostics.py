@@ -8,7 +8,7 @@ from contextlib import contextmanager
 
 import torch
 
-from miles.backends.core_utils import contract, data
+from miles.backends.core_utils import contract, data, router_diagnostics
 
 
 @contextmanager
@@ -21,6 +21,8 @@ def checked_context(actor, module, batch, context):
     calls = {name: {"entered": 0, "returned": 0, "grad_enabled": 0} for name in expected}
     mismatches = torch.zeros((), dtype=torch.int64, device=batch["tokens"].device)
     handles = []
+    detailed = getattr(getattr(actor.args, "olmo_core", None), "router_diagnostics", False)
+    observations = []
 
     def before(name, router, inputs):
         nonlocal mismatches
@@ -37,6 +39,21 @@ def checked_context(actor, module, batch, context):
         actual = output[1]
         if actual is None or actual.shape != expected[name].shape:
             raise ValueError(f"Missing or malformed returned replay routes: {name}")
+        if detailed:
+            observations.append(
+                dict(
+                    event="router_behavior",
+                    layer=name,
+                    rollout_id=actor.clock.next_rollout_id,
+                    phase="training" if module.model.training else "scoring",
+                    invocation=calls[name]["returned"],
+                    recomputation=calls[name]["returned"] > 0,
+                    grad_enabled=torch.is_grad_enabled(),
+                    **router_diagnostics.observe(
+                        router, output, batch.get("total_lengths", [batch["tokens"].numel()])
+                    ),
+                )
+            )
         calls[name]["returned"] += 1
         mismatches += (actual.to(device) != expected[name]).sum()
 
@@ -63,6 +80,8 @@ def checked_context(actor, module, batch, context):
                     layers=calls,
                 ),
             )
+            for observation in observations:
+                contract.record(actor.args, observation)
             if mismatch_count:
                 raise ValueError(f"Replay routes diverged: {mismatch_count} expert IDs")
     finally:

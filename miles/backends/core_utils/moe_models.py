@@ -151,8 +151,8 @@ def validate_emo_training(config, hf, args):
         router.num_experts != hf.n_routed_experts or router.top_k != hf.num_experts_per_tok for router in routers
     ):
         raise ValueError("EMO trainer and serving must agree on the full expert pool and top-k")
-    if args.olmo_core.router_aux_count_source != "dispatch":
-        raise ValueError("EMO RL v1 requires router_aux_count_source='dispatch'")
+    if args.olmo_core.router_aux_count_source != "executed":
+        raise ValueError("EMO RL v1 requires router_aux_count_source='executed'")
     if any(str(router.gating_function) != "softmax" or router.normalize_expert_weights != 1.0 for router in routers):
         raise ValueError("EMO serving requires softmax gating with L1-normalized expert weights")
 

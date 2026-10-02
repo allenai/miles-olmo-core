@@ -8,10 +8,10 @@ import torch.distributed as dist
 
 from miles.backends.fsdp_utils import checkpoint
 from miles.backends.fsdp_utils.adaptations import routing_replay
+from miles.backends.training_utils.metrics import train_dump
 from miles.backends.training_utils.parallel import get_parallel_state, set_parallel_state
 from miles.backends.training_utils.torch_native.actor import TorchNativeTrainRayActor
 from miles.backends.training_utils.torch_native.step_runner import LinearStepRunner, StepMetrics
-from miles.utils import train_dump_utils
 from miles.utils.context_utils import with_defer
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.ft_utils.indep_dp import IndepDPInfo
@@ -288,12 +288,7 @@ class FSDPTrainRayActor(TorchNativeTrainRayActor):
 
         return model
 
-    def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
-        """Delegate checkpoint saving to the shared checkpoint utilities."""
-        if self.args.debug_rollout_only or self.args.save is None:
-            return
-
-        assert not self.args.async_save, "FSDPTrainRayActor does not support async_save yet."
+    def _save_checkpoint(self, rollout_id: int) -> None:
         checkpoint.save(self, rollout_id)
 
     @contextmanager
@@ -328,7 +323,7 @@ class FSDPTrainRayActor(TorchNativeTrainRayActor):
 
     def _after_rollout(self, rollout_id: int, rollout_data) -> None:
         if self.args.save_debug_train_data is not None:
-            train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
+            train_dump.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
 
         if (
             self.args.ref_update_interval is not None

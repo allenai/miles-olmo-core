@@ -10,25 +10,29 @@ import torch.distributed as dist
 from tqdm import tqdm
 from transformers import PretrainedConfig, PreTrainedTokenizerBase
 
-from miles.backends.megatron_utils.ft.types import TrainStepOutcome, TrainStepOutput
-from miles.backends.training_utils.ci_utils import check_grad_norm
-from miles.backends.training_utils.data import DataIterator, get_batch, get_data_iterator, get_rollout_data
-from miles.backends.training_utils.log_utils import (
+from miles.backends.training_utils.data.rollout import DataIterator, get_batch, get_data_iterator, get_rollout_data
+from miles.backends.training_utils.data.sampling_mask import get_rollout_sampling_masks
+from miles.backends.training_utils.loss.objective import (
+    compute_advantages_and_returns,
+    get_log_probs_and_entropy,
+    loss_function,
+)
+from miles.backends.training_utils.metrics import perf
+from miles.backends.training_utils.metrics.checks import check_grad_norm
+from miles.backends.training_utils.metrics.log_utils import (
     aggregate_forward_results,
     aggregate_train_losses,
     log_rollout_data,
     log_train_step,
 )
-from miles.backends.training_utils.loss import compute_advantages_and_returns, get_log_probs_and_entropy, loss_function
 from miles.backends.training_utils.parallel import get_parallel_state
-from miles.backends.training_utils.sampling_mask import get_rollout_sampling_masks
-from miles.backends.training_utils.torch_native import routing_replay
+from miles.backends.training_utils.replay import routing_replay
 from miles.backends.training_utils.torch_native.offload import move_train_state
 from miles.backends.training_utils.torch_native.step_runner import StepRunner
+from miles.backends.training_utils.types import TrainStepOutcome, TrainStepOutput
 from miles.backends.training_utils.weight_update.updater import WeightUpdater
 from miles.ray.rollout.inference_controller import UpdatableEngines
 from miles.ray.train_actor import TrainRayActor
-from miles.utils import train_metric_utils
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.flops_utils import flops_args_from_hf_config, fwd_tflops_per_gpu
@@ -105,6 +109,15 @@ class TorchNativeTrainRayActor(TrainRayActor):
             return None
         return lambda seq_lens: fwd_tflops_per_gpu(seq_lens, flops_args, dist.get_world_size())
 
+    def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
+        if self.args.debug_rollout_only or self.args.save is None:
+            return
+        assert not self.args.async_save, f"{type(self).__name__} does not support async_save yet."
+        self._save_checkpoint(rollout_id)
+
+    def _save_checkpoint(self, rollout_id: int) -> None:
+        raise NotImplementedError
+
     @timer
     def sleep(self) -> None:
         if self.args.offload_train:
@@ -145,7 +158,7 @@ class TorchNativeTrainRayActor(TrainRayActor):
                     return TrainStepOutput(outcome=TrainStepOutcome.NORMAL)
                 self._train_core(rollout_id=rollout_id, rollout_data=rollout_data)
 
-        train_metric_utils.log_perf_data_raw(
+        perf.log_perf_data_raw(
             rollout_id=rollout_id,
             args=self.args,
             is_primary_rank=dist.get_rank() == 0,

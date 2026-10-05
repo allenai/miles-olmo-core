@@ -277,6 +277,9 @@ Sections mirror the launch-script argument groups.
 | `--group-rm` | flag | off | Batched reward computation. |
 | `--custom-rm-path` | str | – | Custom reward function (see [Customization](/user-guide/customization)). |
 | `--dynamic-sampling-filter-path` | str | – | Group filter (DAPO-style). |
+| `--async-unused-samples-handler` | enum | drop | What to do with a group that is not trained on, given why: `drop`, `retry` (recycle aborted and stale groups) or `never_give_up` (Never Give Up: keep retrying the prompt and merge earlier attempts into the group that trains; requires `--dynamic-sampling-filter-path`; without `--use-dynamic-global-batch-size` each rollout drains exactly `rollout_batch_size * n_samples_per_prompt` samples, dropping the oldest merged attempts that overshoot). `--fully-async` only. |
+| `--ngu-requeue-probability` | float | 1.0 | With `never_give_up`, probability of requeuing a rejected unsolved group instead of dropping it. |
+| `--ngu-solved-reward` | float | 1.0 | Reward at which `never_give_up` treats a prompt as solved and stops retrying it. |
 | `--rollout-submission-granularity` | enum | driver | `group` or `sample`: what frees rollout submission capacity. Unset means `sample` under `--fully-async`, `group` otherwise. |
 | `--buffer-filter-path` | str | – | Buffer dequeue filter. |
 | `--rollout-sample-filter-path` | str | – | Per-sample filter. |

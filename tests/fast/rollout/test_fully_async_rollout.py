@@ -15,6 +15,7 @@ import miles.rollout.fully_async_rollout as fully_async
 import miles.rollout.inference_rollout.inference_rollout_common as rollout_common
 from miles.rollout.base_types import BaseRolloutFn, RolloutFnConstructorInput, RolloutFnEvalInput, RolloutFnTrainInput
 from miles.rollout.filter_hub.base_types import FilterOutput
+from miles.rollout.filter_hub.common_filters import FilterReason
 from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
 
 N_SAMPLES_PER_PROMPT = 2
@@ -519,6 +520,14 @@ async def test_staleness_filter_off_before_the_first_weight_update(monkeypatch):
 # ── DataBuffer: staleness-bounded buffering ─────────────────────────
 
 
+def record_unused(unused: list) -> Callable:
+    def handler(prompt_group, *, group, reason):
+        if reason != FilterReason.kept:
+            unused.append(prompt_group)
+
+    return handler
+
+
 def make_buffer(max_groups=None, max_staleness=None):
     unused = []
     args = make_args(
@@ -527,7 +536,7 @@ def make_buffer(max_groups=None, max_staleness=None):
         max_weight_staleness=max_staleness,
     )
     buffer = data_buffer.DefaultDataBuffer(
-        data_buffer.DataBufferConstructorInput(args=args, unused_handler_fn=unused.append)
+        data_buffer.DataBufferConstructorInput(args=args, unused_handler_fn=record_unused(unused))
     )
     return buffer, unused
 

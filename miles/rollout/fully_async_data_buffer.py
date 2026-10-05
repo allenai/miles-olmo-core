@@ -11,17 +11,18 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 from argparse import Namespace
-from collections.abc import Callable
 from dataclasses import dataclass
 
-from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
+from miles.rollout.filter_hub.base_types import MetricGatherer, UnusedSamplesHandler, call_dynamic_filter
 from miles.rollout.filter_hub.common_filters import (
+    FilterReason,
     GroupWeightVersionStats,
     apply_aborted_filter,
     apply_missing_reward_filter,
     group_staleness,
     group_weight_version_stats,
 )
+from miles.rollout.never_give_up import prune_stale_attempts
 from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
 
@@ -39,7 +40,7 @@ def first_sample(group: Group) -> Sample:
 @dataclass(frozen=True)
 class DataBufferConstructorInput:
     args: Namespace
-    unused_handler_fn: Callable[[list[Sample]], None]  # --async-unused-samples-handler, applied to unused groups
+    unused_handler_fn: UnusedSamplesHandler  # --async-unused-samples-handler, applied to unused groups
 
 
 @dataclass
@@ -94,7 +95,7 @@ class DefaultDataBuffer(DataBuffer):
     (2) unused handling: ``--async-unused-samples-handler`` decides what happens
         to aborted and stale groups: drop discards them, retry recycles their
         prompts for regeneration. Missing-reward and custom-filter rejections
-        are discarded directly.
+        are discarded directly, except by never_give_up (see ``never_give_up.py``).
     """
 
     def __init__(self, input: DataBufferConstructorInput):
@@ -136,18 +137,21 @@ class DefaultDataBuffer(DataBuffer):
         output = apply_aborted_filter(self._args, input.group)
         if not output.keep:
             self._metric_aborted_groups += 1
-            self._unused_handler_fn(input.prompt_group)
+            self._unused_handler_fn(input.prompt_group, group=input.group, reason=output.reason)
             return False
 
         output = apply_missing_reward_filter(self._args, input.group)
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
+            self._unused_handler_fn(input.prompt_group, group=input.group, reason=output.reason)
             return False
 
         output = call_dynamic_filter(self._dynamic_filter, self._args, input.group)
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
+            self._unused_handler_fn(input.prompt_group, group=input.group, reason=output.reason)
             return False
+        self._unused_handler_fn(input.prompt_group, group=input.group, reason=FilterReason.kept)
         return True
 
     async def get(self, current_version: int | None = None, **_) -> DataBufferInput:
@@ -159,6 +163,12 @@ class DefaultDataBuffer(DataBuffer):
                     await self._cond.wait()
                 entry = self._buffer.pop(0)
                 self._cond.notify_all()  # wake producers blocked on a full buffer
+                entry.group = prune_stale_attempts(  # only a merged never_give_up group has attempts to prune
+                    entry.group,
+                    attempt_size=self._args.n_samples_per_prompt,
+                    current_version=current_version,
+                    max_staleness=self._args.max_weight_staleness,
+                )
 
                 version_stats = group_weight_version_stats(entry.group)
                 staleness = version_stats.oldest_lag(current_version)
@@ -172,7 +182,7 @@ class DefaultDataBuffer(DataBuffer):
                     if self._args.max_weight_staleness is not None and staleness > self._args.max_weight_staleness:
                         logger.info(f"Filtered stale group ({staleness=} > max={self._args.max_weight_staleness})")
                         self._metric_stale_groups += 1
-                        self._unused_handler_fn(entry.prompt_group)
+                        self._unused_handler_fn(entry.prompt_group, group=entry.group, reason=FilterReason.stale)
                         continue
                     self._metric_consumed_staleness.append(staleness)
                 self._record_selected_version_stats(version_stats, current_version)

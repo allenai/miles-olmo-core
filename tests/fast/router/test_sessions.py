@@ -1,0 +1,404 @@
+"""Integration tests for session HTTP routes (create / get / delete / proxy)."""
+
+import json
+import socket
+import uuid
+from contextlib import contextmanager
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+import requests
+from tests.fast.fixtures.session_fixtures import make_session_server_config
+
+from miles.rollout.session.server import SessionServer
+from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizer
+from miles.utils.http_utils import find_available_port
+from miles.utils.test_utils.mock_sglang_server import MockSGLangServer, ProcessResult, with_mock_server
+from miles.utils.test_utils.uvicorn_thread_server import UvicornThreadServer
+
+
+_INSTANCE_ID = "0123456789abcdef-0"
+
+
+def _create_session(url: str) -> str:
+    return requests.post(f"{url}/sessions", timeout=5.0).json()["session_id"]
+
+
+def _post_chat(url: str, session_id: str, payload: dict) -> requests.Response:
+    return requests.post(f"{url}/sessions/{session_id}/v1/chat/completions", json=payload, timeout=10.0)
+
+
+@pytest.fixture(scope="class")
+def router_env():
+    """Create a standalone SessionServer with session routes and a mock backend."""
+
+    def process_fn(prompt: str) -> ProcessResult:
+        return ProcessResult(text=f"echo: {prompt}", finish_reason="stop")
+
+    original_chat_response = MockSGLangServer._compute_chat_completions_response
+
+    def patched_chat_response(self, payload: dict) -> dict:
+        response = original_chat_response(self, payload)
+        choice = response["choices"][0]
+        logprobs_content = choice["logprobs"]["content"]
+        output_token_logprobs = [
+            (item["logprob"], self.tokenizer.convert_tokens_to_ids(item["token"])) for item in logprobs_content
+        ]
+        choice["meta_info"] = {
+            "output_token_logprobs": output_token_logprobs,
+            "completion_tokens": len(output_token_logprobs),
+            # R3 replay payloads: must reach the session record but never the
+            # client-facing chat response (see _strip_replay_payloads).
+            "routed_experts": [[0, 1], [2, 3]],
+            "indexer_topk": [[4], [5]],
+        }
+        return response
+
+    with patch.object(MockSGLangServer, "_compute_chat_completions_response", new=patched_chat_response):
+        with with_mock_server(process_fn=process_fn) as backend:
+            config = make_session_server_config(
+                backend_url=backend.url,
+                hf_checkpoint="Qwen/Qwen3-0.6B",
+                apply_chat_template_kwargs={"enable_thinking": False},
+                tito_model="default",
+                instance_id=_INSTANCE_ID,
+                pause_generation_mode="retract",
+            )
+            server_obj = SessionServer(config)
+
+            port = find_available_port(31000)
+            server = UvicornThreadServer(server_obj.app, host="127.0.0.1", port=port)
+            server.start()
+
+            url = f"http://127.0.0.1:{port}"
+
+            try:
+                yield SimpleNamespace(url=url, backend=backend)
+            finally:
+                server.stop()
+
+
+class TestSessionRoutes:
+    def test_health_reports_stable_instance_id(self, router_env):
+        first = requests.get(f"{router_env.url}/health", timeout=5.0)
+        second = requests.get(f"{router_env.url}/health", timeout=5.0)
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        first_body = first.json()
+        second_body = second.json()
+        assert first_body["status"] == "ok"
+        assert second_body["status"] == "ok"
+        assert first_body["session_server_instance_id"] == _INSTANCE_ID
+        assert second_body["session_server_instance_id"] == first_body["session_server_instance_id"]
+
+    def test_create_session(self, router_env):
+        response = requests.post(f"{router_env.url}/sessions", timeout=5.0)
+        assert response.status_code == 200
+        data = response.json()
+        assert "session_id" in data
+        assert len(data["session_id"]) == 32
+
+    def test_get_session_initial_state(self, router_env):
+        session_id = requests.post(f"{router_env.url}/sessions", timeout=5.0).json()["session_id"]
+
+        get_resp = requests.get(f"{router_env.url}/sessions/{session_id}", timeout=5.0)
+        assert get_resp.status_code == 200
+        data = get_resp.json()
+        assert data["session_id"] == session_id
+        assert data["records"] == []
+
+    def test_get_session_not_found(self, router_env):
+        response = requests.get(f"{router_env.url}/sessions/nonexistent", timeout=5.0)
+        assert response.status_code == 404
+        assert response.json()["error"] == "session not found: session_id=nonexistent"
+
+    def test_delete_session(self, router_env):
+        session_id = requests.post(f"{router_env.url}/sessions", timeout=5.0).json()["session_id"]
+
+        delete_resp = requests.delete(f"{router_env.url}/sessions/{session_id}", timeout=5.0)
+        assert delete_resp.status_code == 204
+        assert delete_resp.text == ""
+
+        assert requests.delete(f"{router_env.url}/sessions/{session_id}", timeout=5.0).status_code == 404
+
+    def test_delete_session_not_found(self, router_env):
+        response = requests.delete(f"{router_env.url}/sessions/nonexistent", timeout=5.0)
+        assert response.status_code == 404
+        assert response.json()["error"] == "session not found: session_id=nonexistent"
+
+
+class TestSessionProxy:
+    def test_proxy_chat_appends_record(self, router_env):
+        session_id = requests.post(f"{router_env.url}/sessions", timeout=5.0).json()["session_id"]
+
+        payload = {
+            "messages": [{"role": "user", "content": "What is 1+2?"}],
+            "return_logprob": True,
+        }
+        resp = requests.post(
+            f"{router_env.url}/sessions/{session_id}/v1/chat/completions",
+            json=payload,
+            timeout=10.0,
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "choices" in body
+        assert body["choices"]
+
+        get_resp = requests.get(f"{router_env.url}/sessions/{session_id}", timeout=5.0)
+        records = get_resp.json()["records"]
+
+        assert isinstance(records, list)
+        assert len(records) == 1
+        record = records[0]
+        assert record["path"] == "/v1/chat/completions"
+        assert record["status_code"] == 200
+
+    def test_proxy_chat_postprocesses_completion_once(self, router_env, monkeypatch):
+        calls = []
+        original = TITOTokenizer.postprocess_completion
+
+        def tracked_postprocess(self, *, choice, assistant_message, completion_token_ids):
+            calls.append((choice, assistant_message, completion_token_ids))
+            return original(
+                self,
+                choice=choice,
+                assistant_message=assistant_message,
+                completion_token_ids=completion_token_ids,
+            )
+
+        monkeypatch.setattr(TITOTokenizer, "postprocess_completion", tracked_postprocess)
+        session_id = _create_session(router_env.url)
+
+        response = _post_chat(
+            router_env.url,
+            session_id,
+            {"messages": [{"role": "user", "content": "hook once"}]},
+        )
+
+        assert response.status_code == 200
+        assert len(calls) == 1
+        choice, assistant_message, completion_token_ids = calls[0]
+        assert choice["message"] is assistant_message
+        assert completion_token_ids
+
+    def test_proxy_chat_response_has_no_duplicate_server_or_date_header(self, router_env):
+        # Both the backend and this server run under uvicorn, so each emits its own
+        # server/date. Echoing upstream's copy puts two of each on the wire, and
+        # aiohttp (the transport litellm uses) then refuses to read the body at all.
+        session_id = requests.post(f"{router_env.url}/sessions", timeout=5.0).json()["session_id"]
+        host, port = router_env.url.removeprefix("http://").split(":")
+        body = json.dumps({"messages": [{"role": "user", "content": "hi"}], "return_logprob": True})
+        request = (
+            f"POST /sessions/{session_id}/v1/chat/completions HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n\r\n"
+            f"{body}"
+        )
+
+        with socket.create_connection((host, int(port)), timeout=10.0) as sock:
+            sock.sendall(request.encode())
+            raw = b""
+            while b"\r\n\r\n" not in raw:
+                chunk = sock.recv(4096)
+                assert chunk, "connection closed before response headers were complete"
+                raw += chunk
+
+        head = raw.split(b"\r\n\r\n", 1)[0].decode()
+        assert head.splitlines()[0].endswith("200 OK")
+        names = [line.split(":", 1)[0].lower() for line in head.splitlines()[1:]]
+        assert names.count("server") == 1
+        assert names.count("date") == 1
+
+    def test_chat_malformed_json_body_returns_400(self, router_env):
+        session_id = requests.post(f"{router_env.url}/sessions", timeout=5.0).json()["session_id"]
+
+        resp = requests.post(
+            f"{router_env.url}/sessions/{session_id}/v1/chat/completions",
+            data=b"{not json",
+            headers={"Content-Type": "application/json"},
+            timeout=10.0,
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"].startswith("invalid JSON body:")
+
+    def test_chat_template_kwargs_override_reaches_render_and_backend(self, router_env):
+        """A request response-mode kwarg wins over the launch default in both
+        the locally rendered input_ids and the outbound backend request."""
+        default_session = requests.post(f"{router_env.url}/sessions", timeout=5.0).json()["session_id"]
+        resp = requests.post(
+            f"{router_env.url}/sessions/{default_session}/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hi"}]},
+            timeout=10.0,
+        )
+        assert resp.status_code == 200
+        default_payload = router_env.backend.request_log[-1]
+        assert default_payload["chat_template_kwargs"] == {"enable_thinking": False}
+
+        override_session = requests.post(f"{router_env.url}/sessions", timeout=5.0).json()["session_id"]
+        resp = requests.post(
+            f"{router_env.url}/sessions/{override_session}/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "chat_template_kwargs": {"enable_thinking": True},
+            },
+            timeout=10.0,
+        )
+        assert resp.status_code == 200
+        override_payload = router_env.backend.request_log[-1]
+        assert override_payload["chat_template_kwargs"] == {"enable_thinking": True}
+        assert override_payload["input_ids"] != default_payload["input_ids"]
+
+    def test_chat_upstream_null_message_returns_502(self, router_env):
+        session_id = requests.post(f"{router_env.url}/sessions", timeout=5.0).json()["session_id"]
+
+        fixture_response = MockSGLangServer._compute_chat_completions_response
+
+        def null_message_response(self, payload: dict) -> dict:
+            response = fixture_response(self, payload)
+            response["choices"][0]["message"] = None
+            return response
+
+        with patch.object(MockSGLangServer, "_compute_chat_completions_response", new=null_message_response):
+            resp = requests.post(
+                f"{router_env.url}/sessions/{session_id}/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "hi"}]},
+                timeout=10.0,
+            )
+        assert resp.status_code == 502
+        assert "assistant message content is None" in resp.json()["error"]
+
+    def test_chat_response_strips_replay_payloads_but_record_keeps_them(self, router_env):
+        session_id = requests.post(f"{router_env.url}/sessions", timeout=5.0).json()["session_id"]
+
+        payload = {
+            "messages": [{"role": "user", "content": "What is 2+2?"}],
+            "return_logprob": True,
+        }
+        resp = requests.post(
+            f"{router_env.url}/sessions/{session_id}/v1/chat/completions",
+            json=payload,
+            timeout=10.0,
+        )
+        assert resp.status_code == 200
+        client_meta = resp.json()["choices"][0]["meta_info"]
+        assert "routed_experts" not in client_meta
+        assert "indexer_topk" not in client_meta
+        # Stripping must not swallow the rest of meta_info.
+        assert "output_token_logprobs" in client_meta
+
+        record = requests.get(f"{router_env.url}/sessions/{session_id}", timeout=5.0).json()["records"][0]
+        record_meta = record["response"]["choices"][0]["meta_info"]
+        assert record_meta["routed_experts"] == [[0, 1], [2, 3]]
+        assert record_meta["indexer_topk"] == [[4], [5]]
+
+
+# ── additional R3 (non-retract pause modes): derivation and request offsets ──
+
+
+@contextmanager
+def _serve_router(extra_args: dict | None = None):
+    """A dedicated v1 SessionServer for tests that flip args router_env's
+    class-scoped fixture pins (routing replay, pause_generation_mode)."""
+
+    def process_fn(prompt: str) -> ProcessResult:
+        return ProcessResult(text="ok", finish_reason="stop")
+
+    with with_mock_server(process_fn=process_fn) as backend:
+        defaults = {
+            "hf_checkpoint": "Qwen/Qwen3-0.6B",
+            "apply_chat_template_kwargs": {"enable_thinking": False},
+            "tito_model": "default",
+            "pause_generation_mode": "retract",
+        }
+        config = make_session_server_config(
+            backend_url=backend.url,
+            timeout=30,
+            instance_id=uuid.uuid4().hex,
+            **(defaults | (extra_args or {})),
+        )
+        server_obj = SessionServer(config)
+        port = find_available_port(31000)
+        server = UvicornThreadServer(server_obj.app, host="127.0.0.1", port=port)
+        server.start()
+        try:
+            yield SimpleNamespace(url=f"http://127.0.0.1:{port}", backend=backend)
+        finally:
+            server.stop()
+
+
+class TestUseAdditionR3Derivation:
+    """use_addition_r3 is derived once at server bootstrap from
+    pause_generation_mode; it is not independently configurable."""
+
+    @pytest.mark.parametrize(("mode", "expected"), [("abort", True), ("in_place", True), ("retract", False)])
+    def test_mode_mapping(self, mode, expected):
+        config = make_session_server_config(hf_checkpoint=None, pause_generation_mode=mode)
+        assert SessionServer(config).use_addition_r3 is expected
+
+
+class TestAdditionR3RequestOffset:
+    MESSAGES = [{"role": "user", "content": "hi"}]
+
+    def _accumulated(self, url: str, session_id: str) -> list[int]:
+        data = requests.get(f"{url}/sessions/{session_id}", timeout=5.0).json()
+        return data["metadata"]["accumulated_token_ids"]
+
+    def _turn2_messages(self, first_response: dict, tool_content: str) -> list[dict]:
+        return [
+            *self.MESSAGES,
+            first_response["choices"][0]["message"],
+            {"role": "tool", "content": tool_content, "tool_call_id": "t0"},
+        ]
+
+    @pytest.mark.parametrize("mode", ["abort", "in_place"])
+    def test_incremental_offsets_across_turns_and_rollback(self, mode):
+        with _serve_router({"use_rollout_routing_replay": True, "pause_generation_mode": mode}) as env:
+            session_id = _create_session(env.url)
+
+            first = _post_chat(env.url, session_id, {"messages": self.MESSAGES})
+            assert first.status_code == 200
+            turn1_body = env.backend.request_log[-1]
+            assert turn1_body["return_routed_experts"] is True
+            assert turn1_body["routed_experts_start_len"] == 0
+            checkpoint1 = self._accumulated(env.url, session_id)
+
+            second = _post_chat(env.url, session_id, {"messages": self._turn2_messages(first.json(), "ok")})
+            assert second.status_code == 200
+            turn2_body = env.backend.request_log[-1]
+            # The turn-1 checkpoint's prefix is stable, so only its last row is new.
+            assert turn2_body["routed_experts_start_len"] == len(checkpoint1) - 1
+            checkpoint2 = self._accumulated(env.url, session_id)
+            assert len(checkpoint2) > len(checkpoint1)
+
+            # Retrying turn 2 rolls back to checkpoint 1: the offset moves backward.
+            retry = _post_chat(env.url, session_id, {"messages": self._turn2_messages(first.json(), "different")})
+            assert retry.status_code == 200
+            retry_body = env.backend.request_log[-1]
+            assert retry_body["routed_experts_start_len"] == len(checkpoint1) - 1
+            assert len(checkpoint1) - 1 < len(checkpoint2) - 1
+
+            # The exact offset each successful turn used is persisted on its record.
+            records = requests.get(f"{env.url}/sessions/{session_id}", timeout=5.0).json()["records"]
+            assert [r["request"]["routed_experts_start_len"] for r in records] == [0, len(checkpoint1) - 1]
+
+    def test_retract_request_has_no_start_len(self):
+        with _serve_router({"use_rollout_routing_replay": True, "pause_generation_mode": "retract"}) as env:
+            session_id = _create_session(env.url)
+            assert _post_chat(env.url, session_id, {"messages": self.MESSAGES}).status_code == 200
+            body = env.backend.request_log[-1]
+            assert body["return_routed_experts"] is True
+            assert "routed_experts_start_len" not in body
+
+    def test_in_place_without_replay_sends_false_flag_and_no_start_len(self):
+        with _serve_router({"pause_generation_mode": "in_place"}) as env:
+            session_id = _create_session(env.url)
+            assert _post_chat(env.url, session_id, {"messages": self.MESSAGES}).status_code == 200
+            body = env.backend.request_log[-1]
+            # The launch flag is authoritative: off means an explicit False, never a client-provided value.
+            assert body["return_routed_experts"] is False
+            assert "routed_experts_start_len" not in body

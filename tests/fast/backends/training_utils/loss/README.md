@@ -1,0 +1,36 @@
+# Loss Snapshot Tests
+
+Regression tests that compare loss outputs to saved snapshots with an absolute
+tolerance of `2e-6`. The unsharded non-true-on-policy path uses PyTorch cross
+entropy, whose gradients retain float32 precision. Its archived Megatron
+gradients were rounded to bfloat16, so those gradients are instead checked
+against an independent float64 log-sum-exp reference with the same tolerance.
+All forward outputs and the other configurations still use the frozen snapshots.
+
+## Quick Start
+
+```bash
+# 1. Save snapshots from current code
+python -m pytest tests/fast/backends/training_utils/loss/test_loss_snapshot.py --snapshot -v
+
+# 2. Make your changes to loss code
+
+# 3. Compare against snapshots
+python -m pytest tests/fast/backends/training_utils/loss/test_loss_snapshot.py --compare -v
+```
+
+## Adding a new config
+
+Edit `CONFIGS` in `test_loss_snapshot.py`:
+
+```python
+CONFIGS = [
+    ...
+    # (name, args_overrides, batch_size, prompt_lens, response_lens)
+    ("grpo_opsm_b2",
+     dict(advantage_estimator="grpo", loss_type="policy_loss", use_opsm=True),
+     2, [40, 60], [20, 40]),
+]
+```
+
+Then re-run `--snapshot`.

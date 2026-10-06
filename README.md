@@ -12,7 +12,7 @@
 >
 > Pull requests are welcome. Please use [GitHub issues](https://github.com/allenai/miles-olmo-core/issues) for public
 > questions about this fork, or contact [robertb@allenai.org](mailto:robertb@allenai.org) for other inquiries.
-> Third-party attributions are collected in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+> Attribution for included source is collected in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The [dependency review list](DEPENDENCIES.md) separately labels user-installed dependencies as not distributed.
 > The README below describes upstream Miles.
 
 <div align="center">

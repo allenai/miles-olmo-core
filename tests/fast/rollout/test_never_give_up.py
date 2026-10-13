@@ -40,6 +40,7 @@ def _args(**overrides) -> Namespace:
         dynamic_sampling_filter_path=f"{__name__}.nonzero_std",
         async_unused_samples_handler="never_give_up",
         ngu_requeue_probability=1.0,
+        ngu_max_retries=None,
         ngu_solved_reward=1.0,
         async_data_buffer_capacity_factor=1000.0,
         max_weight_staleness=None,
@@ -125,6 +126,37 @@ class TestNeverGiveUp:
 
         assert not _offer(ngu, _group(7, [0.0] * GROUP_SIZE)).keep
         assert source.buffer == [] and ngu._chains == {}
+
+    def test_max_retries_requeues_until_the_budget_is_spent(self):
+        ngu, source = _make_ngu(ngu_max_retries=2)
+        ngu._rng.random = lambda: 0.99  # the draw is ignored once a retry budget is set
+
+        assert not _offer(ngu, _group(7, [0.0] * GROUP_SIZE)).keep
+        [retry] = source.get_samples(1)
+        assert not _offer(ngu, _answer(retry, [0.0] * GROUP_SIZE)).keep
+        [retry] = source.get_samples(1)
+        assert ngu._chains[7].retries == 2
+
+        assert not _offer(ngu, _answer(retry, [0.0] * GROUP_SIZE)).keep
+        assert source.buffer == [] and ngu._chains == {}
+
+    def test_zero_max_retries_never_requeues(self):
+        ngu, source = _make_ngu(ngu_max_retries=0)
+
+        assert not _offer(ngu, _group(7, [0.0] * GROUP_SIZE)).keep
+        assert source.buffer == [] and ngu._chains == {}
+
+    def test_a_retry_within_budget_that_the_filter_keeps_merges_the_chain(self):
+        ngu, source = _make_ngu(ngu_max_retries=1)
+
+        assert not _offer(ngu, _group(7, [0.0] * GROUP_SIZE)).keep
+        [retry] = source.get_samples(1)
+        kept = _answer(retry, [0.0, 1.0, 0.0, 0.0])
+
+        assert _offer(ngu, kept).keep
+        assert len(kept) == 2 * GROUP_SIZE
+        assert kept[0].metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] == 2 * GROUP_SIZE
+        assert ngu._chains == {}
 
     def test_improved_retry_is_merged_in_place_with_a_chain_wide_baseline(self):
         ngu, source = _make_ngu()
@@ -386,6 +418,7 @@ class TestValidateNeverGiveUpArgs:
         "overrides",
         [
             dict(),
+            dict(ngu_max_retries=3, ngu_requeue_probability=1.0),
             dict(use_dynamic_global_batch_size=False),
             dict(
                 train_backend="olmo_core",
@@ -406,6 +439,8 @@ class TestValidateNeverGiveUpArgs:
         "overrides",
         [
             dict(ngu_requeue_probability=1.5),
+            dict(ngu_max_retries=-1, ngu_requeue_probability=1.0),
+            dict(ngu_max_retries=3),  # a retry budget with a requeue draw other than 1.0
             dict(dynamic_sampling_filter_path=None),
             dict(fully_async=False),
             dict(custom_async_data_buffer_path="my.Buffer"),

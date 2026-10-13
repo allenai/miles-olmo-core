@@ -54,6 +54,12 @@ def _validate_never_give_up_args(args) -> None:
     assert (
         0.0 <= args.ngu_requeue_probability <= 1.0
     ), f"--ngu-requeue-probability must be in [0, 1], got {args.ngu_requeue_probability}"
+    max_retries = getattr(args, "ngu_max_retries", None)
+    if max_retries is not None:
+        assert max_retries >= 0, f"--ngu-max-retries must be non-negative, got {max_retries}"
+        assert (
+            args.ngu_requeue_probability == 1.0
+        ), "--ngu-max-retries replaces the requeue draw; leave --ngu-requeue-probability at 1.0"
     assert (
         args.dynamic_sampling_filter_path is not None
     ), "never_give_up retries groups the dynamic sampling filter rejects; set --dynamic-sampling-filter-path"
@@ -728,6 +734,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "for another attempt instead of dropped. Earlier attempts are buffered until the filter keeps "
                     "one; then the attempts at most --max-weight-staleness versions old train together as one "
                     "group, with the mean reward over the whole chain of attempts as the baseline."
+                ),
+            )
+            parser.add_argument(
+                "--ngu-max-retries",
+                type=int,
+                default=None,
+                help=(
+                    "With --async-unused-samples-handler never_give_up: requeue a rejected unsolved prompt "
+                    "deterministically until it has been retried this many times, instead of drawing with "
+                    "--ngu-requeue-probability (which must then stay at 1.0). 0 never retries."
                 ),
             )
             parser.add_argument(

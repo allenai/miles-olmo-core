@@ -3,14 +3,16 @@
 Selected with ``--async-unused-samples-handler never_give_up`` under ``--fully-async``. With
 dynamic sampling, a prompt group with no learning signal (for example all rewards equal) is
 dropped. NGU instead requeues
-the *same* prompt through the data source's buffer like any other resubmitted group, with
-probability ``--ngu-requeue-probability``. All attempts at one prompt form a *chain* that shares
+the *same* prompt through the data source's buffer like any other resubmitted group, either with
+probability ``--ngu-requeue-probability`` or, with ``--ngu-max-budget M``, until the prompt has had
+M attempts (at most ``M * n_samples_per_prompt`` samples). All attempts at one prompt form a *chain* that shares
 the first attempt's ``group_index``.
 
 The :class:`NeverGiveUp` handler is told why a group is or is not trained on:
 
 - a dynamic filter rejection: the attempt is buffered on its chain and the prompt requeued, unless
-  the chain already reached ``--ngu-solved-reward`` or the requeue draw fails;
+  the chain already reached ``--ngu-solved-reward``, the requeue draw fails, or the chain has used
+  its ``--ngu-max-budget`` attempts;
 - aborted or missing reward: nothing is learned, so the chain's retry is requeued as it was;
 - stale: a failure that keeps going. Its rewards and completions are buffered
   for the baseline, the chain's best reward is reset, and the prompt is always requeued;
@@ -60,6 +62,7 @@ class PendingChain:
     reward_sum: float = 0.0
     reward_sq_sum: float = 0.0
     sample_count: int = 0
+    rejected_attempts: int = 0  # filter rejections so far, counted against --ngu-max-budget
 
 
 class NeverGiveUp(UnusedSamplesHandler):
@@ -132,7 +135,8 @@ class NeverGiveUp(UnusedSamplesHandler):
         rewards = _rewards(self._args, group)
         pending = self._chains.pop(chain_id, None) or PendingChain(retry_template=group[0])
         best_reward = max(rewards) if pending.best_reward is None else max(pending.best_reward, *rewards)
-        if best_reward >= self._args.ngu_solved_reward or self._rng.random() >= self._args.ngu_requeue_probability:
+        pending.rejected_attempts += 1
+        if best_reward >= self._args.ngu_solved_reward or not self._should_requeue(pending):
             return
 
         pending.samples.extend(group)
@@ -142,6 +146,14 @@ class NeverGiveUp(UnusedSamplesHandler):
         pending.best_reward = best_reward
         self._chains[chain_id] = pending
         self._requeue(pending.retry_template)
+
+    def _should_requeue(self, pending: PendingChain) -> bool:
+        """Whether a rejected chain gets another attempt: within its attempt budget, or by the draw."""
+        max_budget = getattr(self._args, "ngu_max_budget", None)
+        if max_budget is not None:
+            return pending.rejected_attempts < max_budget
+        probability = self._args.ngu_requeue_probability
+        return probability is None or self._rng.random() < probability
 
     def _requeue(self, retry_template: Sample) -> None:
         sample_indices = self._data_source.reserve_sample_indices(self._args.n_samples_per_prompt)

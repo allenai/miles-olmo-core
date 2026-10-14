@@ -77,9 +77,14 @@ _CORE_HOMOGENEOUS_DATA_BUFFER_PATH = "miles.backends.core_utils.rollout.async_bu
 def _validate_never_give_up_args(args) -> None:
     if args.async_unused_samples_handler != "never_give_up":
         return
+    probability, max_budget = args.ngu_requeue_probability, getattr(args, "ngu_max_budget", None)
     assert (
-        0.0 <= args.ngu_requeue_probability <= 1.0
-    ), f"--ngu-requeue-probability must be in [0, 1], got {args.ngu_requeue_probability}"
+        probability is None or max_budget is None
+    ), "--ngu-requeue-probability and --ngu-max-budget are mutually exclusive; set at most one"
+    assert (
+        probability is None or 0.0 <= probability <= 1.0
+    ), f"--ngu-requeue-probability must be in [0, 1], got {probability}"
+    assert max_budget is None or max_budget >= 1, f"--ngu-max-budget must be at least 1, got {max_budget}"
     assert (
         args.dynamic_sampling_filter_path is not None
     ), "never_give_up retries groups the dynamic sampling filter rejects; set --dynamic-sampling-filter-path"
@@ -846,13 +851,25 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--ngu-requeue-probability",
                 type=float,
-                default=1.0,
+                default=None,
                 help=(
                     "With --async-unused-samples-handler never_give_up (Never Give Up, NGU): probability in "
                     "[0, 1] that an unsolved prompt group rejected by --dynamic-sampling-filter-path is requeued "
-                    "for another attempt instead of dropped. Earlier attempts are buffered until the filter keeps "
+                    "for another attempt instead of dropped. Unset means always requeue (1.0); mutually "
+                    "exclusive with --ngu-max-budget. Earlier attempts are buffered until the filter keeps "
                     "one; then the attempts at most --max-weight-staleness versions old train together as one "
                     "group, with the mean reward over the whole chain of attempts as the baseline."
+                ),
+            )
+            parser.add_argument(
+                "--ngu-max-budget",
+                type=int,
+                default=None,
+                help=(
+                    "With --async-unused-samples-handler never_give_up: maximum attempts per unsolved prompt, "
+                    "as a multiple of --n-samples-per-prompt (4 allows up to 4 * n_samples_per_prompt samples). "
+                    "A rejected prompt is requeued deterministically until it has had this many attempts. "
+                    "Mutually exclusive with --ngu-requeue-probability; 1 never retries."
                 ),
             )
             parser.add_argument(

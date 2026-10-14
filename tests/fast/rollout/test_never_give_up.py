@@ -39,7 +39,8 @@ def _args(**overrides) -> Namespace:
         reward_key=None,
         dynamic_sampling_filter_path=f"{__name__}.nonzero_std",
         async_unused_samples_handler="never_give_up",
-        ngu_requeue_probability=1.0,
+        ngu_requeue_probability=None,
+        ngu_max_budget=None,
         ngu_solved_reward=1.0,
         async_data_buffer_capacity_factor=1000.0,
         max_weight_staleness=None,
@@ -125,6 +126,43 @@ class TestNeverGiveUp:
 
         assert not _offer(ngu, _group(7, [0.0] * GROUP_SIZE)).keep
         assert source.buffer == [] and ngu._chains == {}
+
+    def test_max_budget_requeues_until_the_chain_has_had_that_many_attempts(self):
+        ngu, source = _make_ngu(ngu_max_budget=3)
+
+        assert not _offer(ngu, _group(7, [0.0] * GROUP_SIZE)).keep
+        [retry] = source.get_samples(1)
+        assert not _offer(ngu, _answer(retry, [0.0] * GROUP_SIZE)).keep
+        [retry] = source.get_samples(1)
+        assert ngu._chains[7].rejected_attempts == 2
+
+        assert not _offer(ngu, _answer(retry, [0.0] * GROUP_SIZE)).keep  # the third attempt spends the budget
+        assert source.buffer == [] and ngu._chains == {}
+
+    def test_a_budget_of_one_never_requeues(self):
+        ngu, source = _make_ngu(ngu_max_budget=1)
+
+        assert not _offer(ngu, _group(7, [0.0] * GROUP_SIZE)).keep
+        assert source.buffer == [] and ngu._chains == {}
+
+    def test_a_retry_within_budget_that_the_filter_keeps_merges_up_to_budget_times_the_group(self):
+        ngu, source = _make_ngu(ngu_max_budget=2)
+
+        assert not _offer(ngu, _group(7, [0.0] * GROUP_SIZE)).keep
+        [retry] = source.get_samples(1)
+        kept = _answer(retry, [0.0, 1.0, 0.0, 0.0])
+
+        assert _offer(ngu, kept).keep
+        assert len(kept) == 2 * GROUP_SIZE
+        assert kept[0].metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] == 2 * GROUP_SIZE
+        assert ngu._chains == {}
+
+    def test_unset_probability_always_requeues(self):
+        ngu, source = _make_ngu()
+        ngu._rng.random = lambda: 0.999
+
+        assert not _offer(ngu, _group(7, [0.0] * GROUP_SIZE)).keep
+        assert len(source.get_samples(1)) == 1
 
     def test_improved_retry_is_merged_in_place_with_a_chain_wide_baseline(self):
         ngu, source = _make_ngu()
@@ -386,6 +424,8 @@ class TestValidateNeverGiveUpArgs:
         "overrides",
         [
             dict(),
+            dict(ngu_requeue_probability=None),
+            dict(ngu_requeue_probability=None, ngu_max_budget=4),
             dict(use_dynamic_global_batch_size=False),
             dict(
                 train_backend="olmo_core",
@@ -406,6 +446,9 @@ class TestValidateNeverGiveUpArgs:
         "overrides",
         [
             dict(ngu_requeue_probability=1.5),
+            dict(ngu_max_budget=4),  # with a requeue probability set
+            dict(ngu_requeue_probability=1.0, ngu_max_budget=4),
+            dict(ngu_requeue_probability=None, ngu_max_budget=0),
             dict(dynamic_sampling_filter_path=None),
             dict(fully_async=False),
             dict(custom_async_data_buffer_path="my.Buffer"),

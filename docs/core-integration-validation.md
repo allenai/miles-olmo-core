@@ -27,10 +27,10 @@ automatic profile. Disable zero-variance reward filtering for the random model;
 router auxiliary losses provide an update signal.
 
 Keep toy models local. Use the established trained H045 checkpoint on WEKA with
-the two-GPU structure in `configs/miles/examples/small.toml`, bounded generation,
-fixed data and seeds, and explicit checkpoint/evaluation cadence. The
-qualification config directory and fork-specific GPU CI workflow above are
-proposed follow-up work, not an already enabled CI gate.
+`configs/miles/qualification/h045.toml`, introduced in Open Instruct PR #1987,
+with bounded generation, fixed data and seeds, and explicit checkpoint/evaluation
+cadence. The fork-specific GPU CI workflow remains proposed follow-up work, not
+an already enabled CI gate.
 
 The existing toy script calls Open Instruct's Python API. A maintained structured
 CLI recipe should additionally cover configuration compilation and preparation;

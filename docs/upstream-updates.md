@@ -65,3 +65,6 @@ publication, checkpointing, training, or dependency versions also need the
 relevant GPU smoke/resume runs in the consuming Open Instruct pinned runtime.
 CPU contracts alone do not qualify a new upstream runtime. The hooks refactor
 itself changes no runtime pin and imports no new upstream version.
+
+See [Core integration validation](core-integration-validation.md) for the proposed
+local, two-GPU, and distributed consumer gates and their repository ownership.

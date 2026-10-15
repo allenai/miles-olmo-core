@@ -13,6 +13,7 @@ from miles.rollout.filter_hub.base_types import FilterOutput
 from miles.rollout.filter_hub.common_filters import FilterReason
 from miles.rollout.fully_async_data_buffer import DataBufferConstructorInput, DataBufferInput, DefaultDataBuffer
 from miles.rollout.fully_async_rollout import FullyAsyncRolloutFn
+from miles.rollout.group_metrics import group_size_metrics
 from miles.rollout.never_give_up import (
     NGU_BASELINE_REWARD_SQ_SUM_KEY,
     NGU_BASELINE_REWARD_SUM_KEY,
@@ -93,6 +94,36 @@ def _offer(ngu: NeverGiveUp, group: list[Sample]) -> FilterOutput:
 
 
 class TestNeverGiveUp:
+    def test_metrics_include_exhausted_chains_and_reset_without_losing_pending_state(self):
+        ngu, source = _make_ngu(ngu_max_budget=4)
+        _offer(ngu, _group(7, [0.0] * GROUP_SIZE))
+        first = ngu.collect_metrics()
+        assert first["rollout/ngu/filter_retries"] == 1
+        assert first["rollout/ngu/pending_chains"] == 1
+        assert ngu.collect_metrics()["rollout/ngu/filter_retries"] == 0
+        for _ in range(3):
+            _offer(ngu, _answer(source.get_samples(1)[0], [0.0] * GROUP_SIZE))
+        final = ngu.collect_metrics()
+        assert final["rollout/ngu/filter_retries"] == 2
+        assert final["rollout/ngu/filtered_attempts"] == 3
+        assert final["rollout/ngu/budget_exhausted_chains"] == 1
+        assert final["rollout/ngu/pending_chains"] == 0
+
+    def test_accepted_retry_metrics_count_pruned_history_and_separate_recovery(self):
+        ngu, source = _make_ngu(max_weight_staleness=1)
+        _offer(ngu, _group(7, [0.0] * GROUP_SIZE, version=1))
+        retry = source.get_samples(1)[0]
+        ngu(retry, group=retry, reason=FilterReason.aborted)
+        _offer(ngu, _answer(source.get_samples(1)[0], [0.0, 0.0, 0.0, 1.0], version=4))
+        _offer(ngu, _group(8, [0.0, 0.0, 0.0, 1.0], version=4))
+        _offer(ngu, _group(9, [1.0] * GROUP_SIZE))
+        metrics = ngu.collect_metrics()
+        assert metrics["rollout/ngu/accepted_chains"] == 2
+        assert metrics["rollout/ngu/accepted_retried_fraction"] == 0.5
+        assert metrics["rollout/ngu/accepted_attempts"] == 3
+        assert metrics["rollout/ngu/recovery_retries"] == 1
+        assert metrics["rollout/ngu/solved_filtered_chains"] == 1
+
     def test_group_with_signal_is_kept_with_its_own_baseline(self):
         ngu, source = _make_ngu()
         group = _group(7, [0.0, 1.0, 0.0, 1.0])
@@ -374,6 +405,17 @@ def _versioned(chain_id: int, *versions: int, first_index: int = 0) -> list[Samp
 
 
 class TestSampleBudget:
+    def test_group_metrics_distinguish_prompt_and_sample_weighting(self):
+        groups = [_versioned(0, 1), _versioned(1, 1, 2, 3), _versioned(2, 1, 2)]
+        metrics = group_size_metrics(groups, attempt_size=GROUP_SIZE, stage="training")
+        prefix = "rollout/groups/training/"
+        assert metrics[prefix + "size_mean"] == 2 * GROUP_SIZE
+        assert metrics[prefix + "merged_fraction"] == pytest.approx(2 / 3)
+        assert metrics[prefix + "extra_sample_fraction"] == 0.5
+        assert metrics[prefix + "attempts_3/count"] == 1
+        assert metrics[prefix + "attempts_4/count"] == 0
+        assert all(value == 0 for value in group_size_metrics([], attempt_size=4, stage="empty").values())
+
     def test_the_oldest_buffered_attempts_go_first_and_the_kept_ones_stay(self):
         groups = [_versioned(0, 3, 5), _versioned(1, 1, 2, 6), _versioned(2, 6)]
 
@@ -404,6 +446,9 @@ class TestSampleBudget:
         assert sum(map(len, output.samples)) == 3 * GROUP_SIZE
         assert [len(group) // GROUP_SIZE for group in output.samples] == [1, 2]  # both kept attempts survive
         assert entries == [_versioned(2, 6)]  # the budget was met before the third group
+        assert output.metrics["rollout/groups/selected/size_mean"] == 2.5 * GROUP_SIZE
+        assert output.metrics["rollout/groups/training/size_mean"] == 1.5 * GROUP_SIZE
+        assert output.metrics["rollout/groups/budget_trimmed_samples"] == 2 * GROUP_SIZE
 
 
 class TestValidateNeverGiveUpArgs:

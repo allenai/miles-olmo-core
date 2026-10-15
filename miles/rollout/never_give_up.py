@@ -34,6 +34,7 @@ A port of allenai/open-instruct#1861.
 
 import copy
 import random
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -78,6 +79,29 @@ class NeverGiveUp(UnusedSamplesHandler):
         self._data_source = data_source
         self._rng = random.Random(args.rollout_seed)
         self._chains: dict[int, PendingChain] = {}
+        self._metrics = Counter()
+
+    def collect_metrics(self) -> dict[str, float]:
+        """Windowed retry decisions, including chains that never produce training data."""
+        counts, self._metrics = self._metrics, Counter()
+        names = (
+            "accepted_chains",
+            "accepted_retried_chains",
+            "accepted_attempts",
+            "filtered_attempts",
+            "filter_retries",
+            "stale_retries",
+            "recovery_retries",
+            "budget_exhausted_chains",
+            "solved_filtered_chains",
+            "probability_dropped_chains",
+        )
+        metrics = {name: counts[name] for name in names}
+        metrics["pending_chains"] = len(self._chains)
+        metrics["accepted_retried_fraction"] = counts["accepted_retried_chains"] / max(1, counts["accepted_chains"])
+        metrics["filter_retry_fraction"] = counts["filter_retries"] / max(1, counts["filtered_attempts"])
+        metrics["accepted_attempts_mean"] = counts["accepted_attempts"] / max(1, counts["accepted_chains"])
+        return {f"rollout/ngu/{name}": value for name, value in metrics.items()}
 
     def __call__(self, prompt_group: list[Sample], *, group: list[Sample], reason: str | None) -> None:
         if reason == FilterReason.kept:
@@ -104,6 +128,9 @@ class NeverGiveUp(UnusedSamplesHandler):
             max_staleness=self._args.max_weight_staleness,
         )
         rewards = _rewards(self._args, group)
+        self._metrics["accepted_chains"] += 1
+        self._metrics["accepted_retried_chains"] += pending.sample_count > 0
+        self._metrics["accepted_attempts"] += (pending.sample_count + len(group)) // self._args.n_samples_per_prompt
         chain_stats = {
             NGU_BASELINE_REWARD_SUM_KEY: pending.reward_sum + sum(rewards),
             NGU_BASELINE_REWARD_SQ_SUM_KEY: pending.reward_sq_sum + _sq_sum(rewards),
@@ -116,6 +143,7 @@ class NeverGiveUp(UnusedSamplesHandler):
 
     def _retry_pending_chain(self, group: list[Sample]) -> None:
         if (pending := self._chains.get(group[0].group_index)) is not None:
+            self._metrics["recovery_retries"] += 1
             self._requeue(pending.retry_template)
 
     def _keep_going_after_stale(self, group: list[Sample]) -> None:
@@ -128,6 +156,7 @@ class NeverGiveUp(UnusedSamplesHandler):
         pending.sample_count += metadata.get(NGU_BASELINE_SAMPLE_COUNT_KEY, len(group))
         pending.best_reward = None
         self._chains[group[0].group_index] = pending
+        self._metrics["stale_retries"] += 1
         self._requeue(pending.retry_template)
 
     def _keep_going_or_drop(self, group: list[Sample]) -> None:
@@ -136,7 +165,17 @@ class NeverGiveUp(UnusedSamplesHandler):
         pending = self._chains.pop(chain_id, None) or PendingChain(retry_template=group[0])
         best_reward = max(rewards) if pending.best_reward is None else max(pending.best_reward, *rewards)
         pending.rejected_attempts += 1
-        if best_reward >= self._args.ngu_solved_reward or not self._should_requeue(pending):
+        self._metrics["filtered_attempts"] += 1
+        if best_reward >= self._args.ngu_solved_reward:
+            self._metrics["solved_filtered_chains"] += 1
+            return
+        if not self._should_requeue(pending):
+            outcome = (
+                "budget_exhausted_chains"
+                if getattr(self._args, "ngu_max_budget", None) is not None
+                else "probability_dropped_chains"
+            )
+            self._metrics[outcome] += 1
             return
 
         pending.samples.extend(group)
@@ -145,6 +184,7 @@ class NeverGiveUp(UnusedSamplesHandler):
         pending.sample_count += len(group)
         pending.best_reward = best_reward
         self._chains[chain_id] = pending
+        self._metrics["filter_retries"] += 1
         self._requeue(pending.retry_template)
 
     def _should_requeue(self, pending: PendingChain) -> bool:

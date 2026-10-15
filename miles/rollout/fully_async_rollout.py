@@ -41,6 +41,7 @@ from miles.rollout.fully_async_data_buffer import (
     first_sample,
 )
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
+from miles.rollout.group_metrics import group_size_metrics
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
 from miles.rollout.never_give_up import NeverGiveUp, fit_to_sample_budget
@@ -77,6 +78,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             self._handle_unused = self._recycle
         else:
             self._handle_unused = drop_unused
+        self._ngu_handler = self._handle_unused if isinstance(self._handle_unused, NeverGiveUp) else None
         self._sample_filter = load_function(input.args.rollout_sample_filter_path)
         self._worker: asyncio.Task | None = None
         self._eval_prompt_dataset_cache: dict = {}
@@ -214,8 +216,12 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
 
             data.append(entry.group)
 
+        metrics = group_size_metrics(data, attempt_size=args.n_samples_per_prompt, stage="selected")
         if sample_budget is not None:
             data = fit_to_sample_budget(data, budget=sample_budget, attempt_size=args.n_samples_per_prompt)
+        metrics["rollout/groups/budget_trimmed_samples"] = metrics["rollout/groups/selected/samples"] - sum(
+            map(len, data)
+        )
 
         sample = first_sample(data[-1])
         logger.info(
@@ -230,7 +236,10 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         if self._sample_filter is not None:
             self._sample_filter(args, data)
 
-        return RolloutFnTrainOutput(samples=data, metrics=self._output.get_metrics())
+        metrics.update(group_size_metrics(data, attempt_size=args.n_samples_per_prompt, stage="training"))
+        if (ngu := getattr(self, "_ngu_handler", None)) is not None:
+            metrics.update(ngu.collect_metrics())
+        return RolloutFnTrainOutput(samples=data, metrics={**self._output.get_metrics(), **metrics})
 
     def _recycle(self, prompt_group: list[Sample], *, group: Group, reason: str | None) -> None:
         """Recycle aborted and stale groups; groups the filters reject are dropped."""

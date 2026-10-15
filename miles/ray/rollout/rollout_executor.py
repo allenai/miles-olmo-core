@@ -4,6 +4,8 @@ import time
 
 import ray
 
+from miles.backends.core_utils import integration as core_integration
+from miles.backends.hooks import get_backend_hooks
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.debug_data import RolloutDataInjectionUtil, load_debug_rollout_data, save_debug_rollout_data
 from miles.ray.rollout.eval_fleet import EvalFleet
@@ -23,7 +25,6 @@ from miles.rollout.base_types import (
 from miles.rollout.checkpoint_eval import CheckpointEvalFn, EvalSkip
 from miles.rollout.inference_rollout.compatibility import call_rollout_function, load_rollout_function
 from miles.utils import object_store
-from miles.utils.async_utils import run
 from miles.utils.audit_utils.event_analyzer import analyzer as event_analyzer
 from miles.utils.audit_utils.event_logger import checkpoint as event_logger_checkpoint
 from miles.utils.audit_utils.process_identity import RolloutExecutorProcessIdentity
@@ -102,29 +103,15 @@ class RolloutExecutor:
     # TODO: may have a `async def init` here later
 
     async def core_publication_boundary(self, begin: bool, *, refresh: bool = False):
-        producer = self.generate_rollout
-        if refresh:
-            method = "begin_refresh" if begin else "end_refresh"
-            if not hasattr(producer, method):
-                raise RuntimeError("Policy refresh requires the managed refreshing producer")
-        else:
-            method = "prepare_publication" if begin else "finish_publication"
-        if hasattr(producer, method):
-            return await asyncio.to_thread(run, getattr(producer, method)())
+        return await core_integration.publication_boundary(self.generate_rollout, begin, refresh=refresh)
 
     async def core_engine_drain(self, operation: str, **kwargs):
-        """Run ownership mutations on the producer event loop, never the Ray loop."""
-        if not hasattr(self.generate_rollout, "engine_drain_control"):
-            raise RuntimeError("engine drain requires the Open Instruct draining producer")
-        result = await asyncio.to_thread(run, self.generate_rollout.engine_drain_control(operation, **kwargs))
-        if operation in ("initialize", "step", "publish"):
-            # Dequeue lag uses the consuming trainer step; serving versions are per engine.
-            self.set_weight_version(result["optimizer_step"])
-        return result
+        return await core_integration.engine_drain(
+            self.generate_rollout, operation, set_weight_version=self.set_weight_version, **kwargs
+        )
 
     def dispose(self):
-        if self.args.train_backend == "olmo_core" and hasattr(self.generate_rollout, "shutdown"):
-            run(self.generate_rollout.shutdown())
+        get_backend_hooks(self.args.train_backend).shutdown_rollout(getattr(self, "generate_rollout", None))
         if (close := getattr(self.data_source, "close", None)) is not None:
             close()
         event_analyzer.run_analysis_from_args(self.args)

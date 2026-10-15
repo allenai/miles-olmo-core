@@ -4,6 +4,7 @@ import os
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
+from miles.backends.hooks import get_backend_hooks
 from miles.ray.placement_group import create_rollout_components, create_training_models, update_weights
 from miles.ray.rollout.eval_dispatch import EvalDispatcher
 from miles.ray.wiring import launch_worker_manager
@@ -99,8 +100,7 @@ async def train(args):
         if args.use_critic:
             await save_training_model(critic_model)
         await rollout_executor.save.remote(rollout_id)
-        if args.train_backend == "olmo_core":
-            await actor_model.finalize_checkpoint(rollout_id)
+        await get_backend_hooks(args.train_backend).finalize_checkpoint(actor_model, rollout_id)
 
     if args.num_rollout > args.start_rollout_id and args.eval_interval is not None and not args.skip_eval_before_train:
         await inference_controller.prepare_eval()

@@ -42,3 +42,16 @@ removals, so it is not an exact copy of that upstream commit.
    a complete reviewed update, advance the comparison base above in the same
    commit. If importing only selected fixes, record their SHAs separately and
    leave the comparison base unchanged so later updates do not skip changes.
+
+### Integration and exclusion policy
+
+Keep backend-specific implementations behind the small interfaces in
+`miles/backends/hooks.py`, with Core implementations under
+`miles/backends/core_utils/`. Put fork-added regression tests in separate files
+instead of appending them to upstream test modules.
+
+Use `upstream-exclusions.json` when resolving deliberately deleted paths. Preserve
+those deletions and excluded prefixes, and review relocated paths at their new
+locations. Run `python tools/check_upstream_exclusions.py` before committing an
+update. This check cannot identify renamed/copied implementations or partial-file
+removals; follow [the update guide](docs/upstream-updates.md) for that review.

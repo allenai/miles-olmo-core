@@ -8,6 +8,14 @@ commit rather than copy that harness into this repository.
 
 ## Proposed gates
 
+Hosted CPU checks pin public SGLang and Megatron source revisions in
+`tests/ci/cpu-dependency-lock.json`. Update these revisions deliberately alongside
+compatibility changes; moving dependency branches must not change the result of
+an unchanged fork commit. Workflow-dispatch overrides take precedence over PR-body
+overrides, then a release lock, then this CPU lock. These are CPU test dependencies,
+not the Open Instruct GPU runtime pins. Model-tokenizer checks still download
+external assets and can fail independently of source compatibility.
+
 | Gate | Location | What it establishes |
 | --- | --- | --- |
 | CPU interfaces | `miles-olmo-core/tests/fast/` | Hook dispatch, event-loop ownership, publication acknowledgement and errors, checkpoint ordering, shutdown, and exclusion policy. Required on every change. |

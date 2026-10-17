@@ -77,6 +77,14 @@ jobs:
             [ -z "$MEGATRON_PR" ] && MEGATRON_PR="$LOCK_MEGATRON"
             echo "release-lock.json present: sglang=$LOCK_SGLANG megatron=$LOCK_MEGATRON"
           fi
+          # Keep hosted CPU checks reproducible while the fork advances separately
+          # from upstream. Explicit overrides and release locks above still win.
+          if [ -f tests/ci/cpu-dependency-lock.json ]; then
+            CPU_SGLANG=$(python3 -c "import json; print(json.load(open('tests/ci/cpu-dependency-lock.json'))['sglang_commit'])")
+            CPU_MEGATRON=$(python3 -c "import json; print(json.load(open('tests/ci/cpu-dependency-lock.json'))['megatron_commit'])")
+            [ -z "$SGLANG_PR" ] && SGLANG_PR="$CPU_SGLANG"
+            [ -z "$MEGATRON_PR" ] && MEGATRON_PR="$CPU_MEGATRON"
+          fi
           [ -z "$MEGATRON_PR" ] && MEGATRON_PR="miles-main"
           [ -z "$SGLANG_PR" ] && SGLANG_PR="sglang-miles"
           resolve_fetch_ref() {

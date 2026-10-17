@@ -67,18 +67,18 @@ def _patch_single_rank_loss_helpers(monkeypatch):
             torch.tensor([0.40, 0.80], dtype=torch.float32),
             torch.tensor([0.10, 0.20], dtype=torch.float32),
             torch.tensor([0.40, 0.80], dtype=torch.float32),
-            0.45,
+            0.0,
         ),
         (
             True,
             torch.tensor([0.50, 1.00], dtype=torch.float32),
             torch.tensor([0.10, 0.20], dtype=torch.float32),
             torch.tensor([0.40, 0.80], dtype=torch.float32),
-            0.0,
+            0.15,
         ),
     ],
 )
-def test_train_rollout_logprob_abs_diff_uses_policy_loss_reference_logprobs(
+def test_train_rollout_logprob_abs_diff_uses_current_forward_independent_of_ppo_reference(
     monkeypatch,
     use_rollout_logprobs: bool,
     train_log_probs: torch.Tensor,

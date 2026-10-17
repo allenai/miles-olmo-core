@@ -306,7 +306,7 @@ class TestLossSnapshot:
             if not saved_args.true_on_policy_mode:
                 # The archived fused Megatron CE rounds its backward result to
                 # bf16. Validate the fork's fp32 gradients against an independent
-                # reference, retaining every frozen forward-value assertion and
+                # reference, retaining every frozen loss-value assertion and
                 # the same strict tolerance for gradients.
                 with monkeypatch.context() as patch:
                     patch.setattr(math_utils, "compute_log_probs", _reference_unsharded_log_probs)

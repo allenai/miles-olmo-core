@@ -72,6 +72,7 @@ def resolve_rollout_function_paths(args) -> tuple[str, str]:
 
 # The Core adapter's buffer: it checks each attempt before handing it to the default buffer.
 _CORE_HOMOGENEOUS_DATA_BUFFER_PATH = "miles.backends.core_utils.rollout.async_buffer.HomogeneousPolicyDataBuffer"
+_CORE_REFRESH_DATA_BUFFER_PATH = "miles.backends.core_utils.rollout.async_buffer.RefreshPolicyDataBuffer"
 
 
 def _validate_never_give_up_args(args) -> None:
@@ -89,7 +90,12 @@ def _validate_never_give_up_args(args) -> None:
         args.dynamic_sampling_filter_path is not None
     ), "never_give_up retries groups the dynamic sampling filter rejects; set --dynamic-sampling-filter-path"
     assert args.fully_async, "never_give_up runs in --fully-async mode only"
-    assert args.custom_async_data_buffer_path in (None, _CORE_HOMOGENEOUS_DATA_BUFFER_PATH) and (
+    buffers = (None, _CORE_HOMOGENEOUS_DATA_BUFFER_PATH)
+    if getattr(args, "train_backend", None) == "olmo_core" and getattr(
+        getattr(args, "olmo_core", None), "publication_mode", None
+    ) == "refresh":
+        buffers += (_CORE_REFRESH_DATA_BUFFER_PATH,)
+    assert args.custom_async_data_buffer_path in buffers and (
         getattr(args, "custom_async_data_buffer_path_per_model", None) is None
     ), "never_give_up runs in the default fully-async data buffer; drop --custom-async-data-buffer-path"
     assert not args.partial_rollout, "never_give_up does not support --partial-rollout"

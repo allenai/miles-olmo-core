@@ -85,8 +85,8 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
             self._handle_unused = self._acknowledge_unused
         elif isinstance(self._handle_unused, NeverGiveUp):
             mode = getattr(getattr(self.args, "olmo_core", None), "publication_mode", "barrier")
-            if mode != "barrier":
-                raise ValueError(f"never_give_up supports only the barrier publication mode, not {mode}")
+            if mode not in ("barrier", "refresh"):
+                raise ValueError(f"never_give_up supports barrier or refresh publication, not {mode}")
             self._never_give_up = self._handle_unused
             self._handle_unused = self._never_give_up_unused
 

@@ -477,6 +477,12 @@ class TestValidateNeverGiveUpArgs:
                 use_dynamic_global_batch_size=False,
                 custom_async_data_buffer_path="miles.backends.core_utils.rollout.async_buffer.HomogeneousPolicyDataBuffer",
             ),
+            dict(
+                train_backend="olmo_core",
+                olmo_core=Namespace(publication_mode="refresh"),
+                use_dynamic_global_batch_size=False,
+                custom_async_data_buffer_path="miles.backends.core_utils.rollout.async_buffer.RefreshPolicyDataBuffer",
+            ),
         ],
     )
     def test_supported_setups_pass(self, overrides):
@@ -497,6 +503,7 @@ class TestValidateNeverGiveUpArgs:
             dict(dynamic_sampling_filter_path=None),
             dict(fully_async=False),
             dict(custom_async_data_buffer_path="my.Buffer"),
+            dict(custom_async_data_buffer_path="miles.backends.core_utils.rollout.async_buffer.RefreshPolicyDataBuffer"),
             dict(partial_rollout=True),
             dict(train_backend="olmo_core"),
         ],

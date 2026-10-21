@@ -11,7 +11,7 @@ import orjson
 
 from miles.backends.core_utils import infra_timeouts
 from miles.backends.core_utils.publication import policy_refresh
-from miles.backends.core_utils.rollout import pipeline_observer, sibling_timing
+from miles.backends.core_utils.rollout import pipeline_observer, response_seed, sibling_timing
 from miles.backends.core_utils.rollout.async_rollout import ManagedFullyAsyncRolloutFn
 from miles.backends.core_utils.rollout.errors import GenerationRequestTimeout
 from miles.backends.core_utils.rollout.generation_admission import GenerationAdmission
@@ -95,13 +95,31 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         finally:
             sibling_timing.finished(input.sample, outcome)
 
+    async def _score_response_seed(self, input, prompt_ids, seed_ids):
+        """Score requested opening tokens under the serving policy before generating."""
+        payload = response_seed.scoring_payload(prompt_ids, seed_ids, input.sampling_params)
+        payload["rid"] = uuid.uuid4().hex
+        url = f"http://{input.args.sglang_router_ip}:{input.args.sglang_router_port}/generate"
+        output = await infra_timeouts.wait_for(
+            post(url, payload, max_retries=1, headers={"x-miles-request-id": payload["rid"]}),
+            self.args.olmo_core.refresh_request_timeout,
+            operation=f"response seed scoring request {payload['rid']}",
+        )
+        return response_seed.parse_scores(output, seed_ids)
+
     async def _generate_response_impl(self, input):
         sample = input.sample
-        payload, halt = compute_request_payload(
-            input.args,
-            input_ids=compute_prompt_ids_from_sample(input.state, sample),
-            sampling_params=input.sampling_params,
-        )
+        input_ids = compute_prompt_ids_from_sample(input.state, sample)
+        sampling_params = input.sampling_params
+        # Optional opening tokens chosen by the data source; absent for ordinary samples.
+        seed = response_seed.requested(sample)
+        if seed is not None:
+            seed_ids = response_seed.tokenize(input.state, sample, input_ids, seed)
+            scores, version = await self._score_response_seed(input, input_ids, seed_ids)
+            response_seed.apply(sample, input_ids, seed_ids, seed, scores, version)
+            sampling_params = response_seed.remaining_sampling_params(input.args, sampling_params, len(seed_ids))
+            input_ids = sample.tokens
+        payload, halt = compute_request_payload(input.args, input_ids=input_ids, sampling_params=sampling_params)
         if payload is None:
             raise ValueError(f"Policy refresh prompt has no response-token budget ({halt}); increase context length")
         payload["rid"] = uuid.uuid4().hex
@@ -158,7 +176,8 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         if output.get("meta_info", {}).get("finish_reason", {}).get("type") not in ("stop", "length"):
             raise RuntimeError("Policy refresh request did not finish; refusing a partial training sample")
         await update_sample_from_response(input.args, sample, payload, output)
-        record = policy_refresh.record_response(sample, output["meta_info"])
+        meta = output["meta_info"] if seed is None else response_seed.merged_meta_info(sample, output["meta_info"])
+        record = policy_refresh.record_response(sample, meta)
         logger.info(
             "Policy refresh response: request=%s tokens=%d spans=%s replay_version=%d",
             payload["rid"],

@@ -82,6 +82,10 @@ raw upstream directly; future merge bases belong to the filtered lineage.
 
 ## Keep the integration seams small
 
+For consumer dependency updates and validation ownership, follow
+[Core runtime maintenance](core-runtime-maintenance.md) and
+[Core integration validation](core-integration-validation.md).
+
 - `miles/backends/hooks.py` defines three synchronous/asynchronous boundaries:
   rollout path selection, producer shutdown, and checkpoint finalization.
   Native backends have no-op defaults. Errors propagate to the caller.

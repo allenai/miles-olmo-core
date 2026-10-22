@@ -14,7 +14,11 @@ backend-owned qualification and the separate consumer boundary.
    preserve the exclusion policy. Do not attach raw upstream ancestry.
 2. Review the target release's source interfaces and Docker/dependency recipe
    together. A new SGLang checkout can require different Python and compiled
-   packages even when the old image still imports successfully.
+   packages even when the old image still imports successfully. Audit the source
+   requirements and the selected packages' transitive requirements, including
+   CUDA extras. `--no-deps` does not install an extra's dependencies; verify what
+   the pinned base already provides. Import the serving engine as well as the
+   top-level package, but do not treat successful imports as dependency validation.
 3. Update the consumer's existing source lock and image definition. Keep the
    established base/build stages unless a required dependency change justifies
    replacing them. Do not use an old application image as a new base merely to
@@ -61,8 +65,12 @@ initialized distributed process group's rank; it does not change model math.
 The previous FlashInfer package lacked a Blackwell BF16 kernel imported by the
 new SGLang path. Updating both FlashInfer packages allowed automatic BF16 backend
 selection to run on Blackwell. The existing Torch selection remains available.
-This is a targeted compatibility fix, not a claim that all dependencies or
-optional backends match the upstream release recipe.
+A subsequent source-requirement audit found nine additional missing or mismatched
+serving packages in the inherited base. Open-Instruct PR #2047 aligns these in
+the existing Dockerfile, including Cython required by nvshmem4py. The audit of
+SGLang requirements and the changed packages' direct requirements passed for
+image `01M5JW54NEVGNZES1SY2FKY63A` (application `b32020aee`). This does not
+qualify every optional backend or substitute for a GPU run.
 
 The router wheel is the `sglang_router-0.3.2-cp38-abi3-manylinux_2_39_x86_64.whl`
 asset from the upstream [cu130-torch213-x86_64 wheel bundle](https://github.com/radixark/miles-wheels/releases/tag/cu130-torch213-x86_64),
@@ -104,3 +112,10 @@ Open-Instruct PR #2047 subsequently removed the qualification additions and
 simplified its image recipe. New builds must identify their own source/image
 and validation; do not carry the historical image IDs forward as if they tested
 that revised recipe.
+
+The reviewed rebuild above passed 606 CPU-compatible runtime tests (57 skipped)
+and the standalone real-router regression. The existing packed-attention GPU
+test, with its moved Miles imports corrected, failed on an RTX 4090: Transformer
+Engine selected an FA4 kernel requesting 131072 bytes of shared memory, above
+the device limit of 101376 bytes. This rebuild is not GPU-qualified; do not
+carry forward the older GPU results as its validation.

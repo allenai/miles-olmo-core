@@ -7,6 +7,7 @@ from typing import Any
 import yaml
 from sglang_router.launch_router import RouterArgs
 
+from miles.backends.hooks import get_backend_hooks
 from miles.backends.sglang_utils.arguments import add_sglang_arguments, collect_eval_sglang_overrides
 from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_args
@@ -80,23 +81,7 @@ def _resolve_rollout_functions(args) -> None:
 
     user_eval_path = args.eval_function_path
     args.rollout_function_path, args.eval_function_path = resolve_rollout_function_paths(args)
-    if getattr(args, "train_backend", None) == "olmo_core" and args.fully_async:
-        original_path = args.rollout_function_path
-        mode = getattr(getattr(args, "olmo_core", None), "publication_mode", "barrier")
-        draining = mode == "engine_drain"
-        if mode in ("engine_drain", "refresh") and user_eval_path is not None:
-            raise ValueError(f"{mode} requires managed shared-engine evaluation; omit --eval-function-path")
-        args.rollout_function_path = (
-            "miles.backends.core_utils.rollout.draining_rollout.DrainingRolloutFn"
-            if draining
-            else (
-                "miles.backends.core_utils.rollout.refreshing_rollout.RefreshingRolloutFn"
-                if mode == "refresh"
-                else "miles.backends.core_utils.rollout.async_rollout.ManagedFullyAsyncRolloutFn"
-            )
-        )
-        if args.eval_function_path == original_path:
-            args.eval_function_path = args.rollout_function_path
+    get_backend_hooks(getattr(args, "train_backend", None)).configure_rollout(args, user_eval_path)
     # An inherited eval path is the rollout fn serving eval itself, never a checkpoint
     # backend: skip the resolve so custom rollout modules are not imported on the driver.
     checkpoint_backend = user_eval_path is not None and is_checkpoint_eval_fn(args.eval_function_path)
@@ -2719,9 +2704,9 @@ def parse_args(add_custom_arguments=None, entry="train", preprocess_args=None):
         args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
         args = set_default_megatron_args(args)
     elif backend == "olmo_core":
-        from open_instruct.miles.configuration.arguments import load_core_args
-
-        args = load_core_args(extra_args_provider=add_miles_arguments)
+        args = load_function("miles.backends.core_utils.integration.load_args")(
+            extra_args_provider=add_miles_arguments
+        )
         args.rank = 0
         args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
         args.num_layers = resolve_fsdp_num_layers(load_hf_config(args.hf_checkpoint))

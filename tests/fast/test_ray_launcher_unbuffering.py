@@ -24,7 +24,11 @@ def ray_launchers() -> list[Path]:
 
 def test_the_repo_has_ray_launchers_to_check() -> None:
     """A discovery bug that finds nothing would make every other check in this file vacuous."""
-    assert len(ray_launchers()) > 30
+    # The fork deliberately removes upstream example launchers. Check retained
+    # entrypoints rather than an upstream inventory size, and still scan every
+    # discovered launcher in the parametrized checks below.
+    expected = {"miles/utils/external_utils/command_utils.py", "tools/convert_torch_dist_to_hf_ray.py"}
+    assert expected <= {path.relative_to(REPO_ROOT).as_posix() for path in ray_launchers()}
 
 
 @pytest.mark.parametrize("launcher", ray_launchers(), ids=lambda path: str(path.relative_to(REPO_ROOT)))

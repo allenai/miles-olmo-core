@@ -117,5 +117,30 @@ The reviewed rebuild above passed 606 CPU-compatible runtime tests (57 skipped)
 and the standalone real-router regression. The existing packed-attention GPU
 test, with its moved Miles imports corrected, failed on an RTX 4090: Transformer
 Engine selected an FA4 kernel requesting 131072 bytes of shared memory, above
-the device limit of 101376 bytes. This rebuild is not GPU-qualified; do not
-carry forward the older GPU results as its validation.
+the device limit of 101376 bytes. That FA4 path remains unresolved; the later
+Blackwell check below uses the established Torch attention settings.
+
+The same image subsequently passed the trained H045 two-GPU Blackwell check:
+[Holmes run](https://beaker.org/ex/01M5JWY055PD11Z6R06W64CJF2), unallocated high
+priority in `ai2/olmo-instruct`, with a 30-minute execution timeout. It exited 0
+after 13m59s, completed two optimizer steps and 16 responses from eight prompts,
+published weight versions 0/1/2, and passed three exact serving-weight comparisons.
+All 16 driver timing stages passed. Driver, trainer and rollout W&B logs recorded
+exit code 0. Mean train/serving log-probability differences were 0.02459 and
+0.03273 against the configured 0.05 mean limit; tokenwise maxima were 0.86104 and
+0.83716. This is not a per-token 0.05 guarantee. All responses were truncated at
+128 tokens with zero task reward; entropy supplied finite, nonzero gradients.
+
+Serving startup took 303s, trainer startup 60s, the first training stage 284s
+including first-use overhead, and the second training stage 6.03s. Publication
+stages with equality diagnostics took about 22s each. The image pull took 7m55s
+before application startup. Nonfatal SGLang `freeze_gc` connection-refused and
+warm-up health-check messages occurred before serving recovered. No checkpoint,
+resume, multi-node, OPD/FA4 or online W&B qualification is implied.
+
+The same H045 recipe on an A100 80GB
+([Saturn run](https://beaker.org/ex/01M5JWVBD3J2306QHW5229C9MA)) passed serving
+startup but exhausted trainer GPU memory while allocating optimizer state,
+before any training step. Its driver W&B log correctly recorded exit code 1,
+and the job exited 1. An A100 gate needs a smaller trained checkpoint; reducing
+response length alone does not fix this optimizer-state capacity limit.

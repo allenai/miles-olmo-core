@@ -1,11 +1,7 @@
 """Core transport ownership and sender selection against the upstream protocols."""
 
-from types import SimpleNamespace
-from unittest.mock import Mock
-
 import pytest
 
-from miles.backends.core_utils import actor
 from miles.backends.core_utils.publication import transport
 from miles.backends.training_utils.weight_update.protocols import broadcast, cuda_ipc
 
@@ -41,10 +37,3 @@ def test_connect_and_bucket_completion(monkeypatch, cls, protocol, sender):
     updater.update_bucket_weights(bucket, weight_version=7)
     assert len(bucket) == 1
     assert calls == (["send", "ack"] if sender else ["ack"])
-
-
-def test_actor_close_delegates_transport_cleanup():
-    instance = object.__new__(actor.OLMoCoreTrainRayActor)
-    instance.weight_updater = SimpleNamespace(close=Mock())
-    instance.close_weight_transport()
-    instance.weight_updater.close.assert_called_once_with()

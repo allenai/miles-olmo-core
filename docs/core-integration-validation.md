@@ -118,3 +118,23 @@ The trained H045 WEKA gate remains separate; a local pass does not qualify it.
 
 Adam first/second moments use the stricter absolute tolerance `1e-12` (relative
 tolerance `1e-5`), since small moments must not compare equal to a reset optimizer.
+
+### Initial local evidence for the v0.1.2 consumer companion
+
+The optional self-contained group completed on one RTX 4090 in 416 seconds.
+Three uninterrupted updates matched two updates plus a fresh-process third update:
+all generated tokens/routes, scheduler/data state and 560 floating checkpoint
+tensors matched exactly (maximum absolute difference zero). Both arms processed
+12 responses and passed generation, nonzero gradient/update, routing, publication,
+checkpoint and exact export/reload audits. Fixture preparation repeated with
+identical file hashes. These are mechanics checks using auxiliary losses, not
+learning evidence.
+
+A separate fresh-container control differed numerically after its first update
+and later produced some different greedy tokens. Its cause is not established;
+the successful paired resume comparison does not establish cold-start or
+cross-build reproducibility. Keep the group opt-in, preserve strict comparisons,
+and characterize that variability before defining a golden numerical baseline
+or making this a required GPU CI gate. The trained H045 two-GPU gate remains
+unrun for this source update. A source-mounted local test image does not replace
+building and qualifying the eventual committed consumer runtime lock.

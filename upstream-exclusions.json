@@ -103,6 +103,7 @@
     "tests/fast-gpu/kernels/hyper_connection/test_mhc.py",
     "tests/fast-gpu/kernels/position/test_rope.py",
     "tests/fast-gpu/kernels/quant/test_fake_quant.py",
+    "tests/fast-gpu/test_dsv4_1_rope_autograd.py",
     "tests/fast-gpu/test_dsv4_indexer_cp_balance.py",
     "tests/fast-gpu/test_dsv4_thd_cp_correctness.py",
     "tests/fast/backends/megatron_utils/test_dsa_arguments.py",

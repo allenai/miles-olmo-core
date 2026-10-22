@@ -1,10 +1,84 @@
 # Maintaining the OLMo-core fork
 
-The comparison base and source-only update procedure live in [AGENTS.md](../AGENTS.md).
-The fork's flattened ancestry is intentional: prepare comparisons in a separate
-upstream checkout and import only reviewed source. Do not merge upstream Git
-history into this repository. Selected backports do not advance the comparison
-base; a complete reviewed update does.
+The fork uses a **filtered upstream lineage**, bridged once to its existing
+history. Raw upstream commits remain in an unpublished comparison checkout.
+Filtering changes commit IDs, but retains parent relationships, authors, dates,
+messages and commits that become empty. Original signatures are dropped because
+they cannot attest to rewritten commits. The original SHA is recorded in each
+commit and in a checked-in mapping.
+
+The lineage starts at a filtered snapshot of upstream `e89b45f7` (September 22,
+2026). Its earlier ancestry remains omitted. All 450 subsequent commits through
+v0.1.2 (`a22fd824`) are retained as filtered commits. The bridge has the existing
+fork main as its first parent and the filtered baseline as its second parent;
+its source tree is identical to fork main. The next merge has the bridge and the
+filtered release as parents, with the already-reviewed conflict resolutions.
+
+```text
+filtered baseline -- 450 filtered upstream commits -- filtered v0.1.2
+        \                                                \
+fork main -- bridge ----------------------------------- release merge
+```
+
+This replaces the source-only approach in PR #5. The runnable source at the
+release merge is exactly PR #5's reviewed `20ae4ce` tree. A subsequent maintenance
+commit adds this workflow, filter tool, tests and provenance. No training behavior
+is changed by the history conversion.
+
+## Filter, audit, then merge
+
+From a fork checkout, with raw upstream fetched into a separate local repository:
+
+```bash
+python tools/filter_upstream_history.py build \
+  --source /path/to/raw-upstream \
+  --output /tmp/miles-filtered-next.git \
+  --baseline e89b45f7f85a0e76fba6a99474b1dd9b67a3c20e \
+  --target UPSTREAM_RELEASE_SHA \
+  --previous-map docs/upstream-history/v0.1.2-map.json \
+  --map /tmp/miles-next-map.json
+python tools/filter_upstream_history.py audit \
+  --repo /tmp/miles-filtered-next.git --head filtered-upstream \
+  --map /tmp/miles-next-map.json
+python tools/filter_upstream_history.py scan \
+  --source /path/to/raw-upstream --repo /tmp/miles-filtered-next.git \
+  --map /tmp/miles-next-map.json --report /tmp/miles-next-content-review.json
+```
+
+The output directory must not exist. The tool copies only retained or sanitized
+blobs into a fresh object database; it never clones raw history, creates replace
+refs/grafts, or pushes. It keeps the two approved example helpers at their fork
+paths, omits the original Typer implementation, and removes the session SSE
+adaptation. The reviewed fork implementation of Typer remains in the merge head.
+Historical filtered upstream commits are comparison material, not individually
+qualified runnable releases.
+
+Before fetching this output, complete the content review below. The audit scans
+all reachable trees and rejects excluded paths and known excluded blobs even
+under different names. Empty package markers are allowed. Similarity review must
+also cover extracted functions, modified copies and the remaining commit text.
+
+Then fetch only the filtered branch and merge it normally:
+
+```bash
+git fetch /tmp/miles-filtered-next.git \
+  refs/heads/filtered-upstream:refs/heads/filtered/upstream-next
+git merge --no-ff --no-commit filtered/upstream-next
+# Resolve integration changes; run validation; save the new map and audit.
+# Commit the merge and push only the explicit proposal branch.
+```
+
+Use `--previous-map` on every subsequent build. Recomputing the published prefix
+must produce the same SHAs, even if exclusions are extended. If a newly discovered
+exclusion affects already-published history, the tool refuses the update: that
+requires a separately reviewed history migration, not a second bridge hidden in
+an ordinary update. Side branches originating before the baseline also fail
+closed until their boundary is explicitly reviewed. Current v0.1.2 history is
+linear; the tool and tests preserve merges after the baseline.
+
+The PR must be merged with a **merge commit**, or a true fast-forward. GitHub's
+squash/rebase options would remove the ancestry we are introducing. Never merge
+raw upstream directly; future merge bases belong to the filtered lineage.
 
 ## Keep the integration seams small
 
@@ -35,7 +109,7 @@ belong in shared code and can be proposed upstream separately.
 ## Preserve deliberate exclusions
 
 `upstream-exclusions.json` records the paths deliberately absent from the
-flattened release, plus prefixes for removed components. This is a source-update
+flattened release, plus prefixes for removed components. This is a source and history exclusion
 policy, not a `.gitignore` file and not permission to skip review of retained
 files. Existing notices describe the source actually distributed.
 
@@ -126,10 +200,13 @@ local, two-GPU, and distributed consumer gates and their repository ownership.
 
 ## v0.1.2 source update
 
-Target: `a22fd824191c64ba7c5d6c531f125406e4ce9cc6`. This is a reviewed source-only
-import prepared in an isolated local comparison checkout. The comparison base
-advances for subsequent source updates; no upstream ancestry is attached. Runtime
-qualification is separate and remains pending the consumer gates below.
+Target: `a22fd824191c64ba7c5d6c531f125406e4ce9cc6`, filtered to
+`d03162fba159188ed16251d66b0e9ce4cbe282d9`. The source resolutions from PR #5
+are reused exactly. See the [history review](upstream-history/v0.1.2-review.md)
+for graph/source identity, exclusion findings and validation. The [mapping](upstream-history/v0.1.2-map.json) records all
+451 upstream-to-filtered commit pairs. Runtime qualification remains separate;
+see the recorded local evidence and outstanding gates in
+[Core integration validation](core-integration-validation.md).
 
 - Weight publication now opens/closes its inference window in
   `placement_group.update_weights`. The trainer accepts `UpdatableEngines`; it

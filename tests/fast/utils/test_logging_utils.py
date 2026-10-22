@@ -144,6 +144,8 @@ class TestServedWorkerLogging:
         itself, opens its event log and reports its environment."""
         if ".torchtitan_utils." in worker_class_path:
             pytest.importorskip("torchtitan", reason="torchtitan ships with the gpu image, not the cpu lane")
+        if ".core_utils." in worker_class_path:
+            pytest.importorskip("olmo_core", reason="OLMo-core is optional in the upstream CPU lane")
         assert _configures_logger(
             _load_class(worker_class_path)
         ), f"{worker_class_path} runs as its own process but never calls configure_logger"

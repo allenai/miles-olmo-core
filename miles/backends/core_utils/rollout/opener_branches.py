@@ -4,29 +4,41 @@ Before a prompt group is generated, the serving policy's most likely openers for
 prompt are read in prefill-only requests. An opener is the response's first tokens up
 to and including the first token that completes visible text: whitespace-only and
 incomplete-character prefixes are expanded, so ``" Okay"``, ``"Okay"`` and
-``"\\nOkay"`` are distinct openers. The ``pool`` most likely openers form the
-candidate set; ``branches`` of them are drawn uniformly without replacement, and each
-gets an equal share of the group's samples as a response seed (``response_seed``).
+``"\\nOkay"`` are distinct openers. Special tokens are never part of an opener.
 
-The draw does not follow the policy's probabilities and no correction is applied for
-it: rare candidates are tried as often as the favorite. Seeded tokens still carry the
-policy's own scores, so TIS corrects only drift and numerical mismatch.
+The ``pool`` most likely openers are found by best-first search. A prefix's
+probability bounds every opener under it, and the next tokens a probe did not return
+are each bounded by the smaller of the omitted mass and the last returned token. The
+search fetches more next tokens wherever such a bound could still beat the pool, so
+a completed search returns the exact top ``pool``. A search cut short by its request
+budget or depth limit is recorded as inexact, with the largest probability it could
+have missed. All probes of one search must report the same policy version; a search
+that spans a publication is repeated.
+
+``branches`` openers are drawn from the pool uniformly without replacement and each
+gets an equal share of the group's samples as a response seed (``response_seed``). The
+draw does not follow the policy's probabilities and no correction is applied for it.
+Seeded tokens still carry the policy's own scores, so TIS corrects only drift and
+numerical mismatch.
 """
 
-import asyncio
 import hashlib
+import heapq
+import itertools
 import math
 import random
 
 from miles.backends.core_utils.rollout import response_seed
 
 RECORD_KEY = "opener_branches"
-# Read this many next tokens at each explored prefix.
+# Next tokens read per probe, widened by WIDEN up to MAX_TOP where bounds require it.
 TOP = 20
-# Prefixes at most this long; deeper unfinished prefixes are dropped.
-MAX_DEPTH = 4
-# Expand an unfinished prefix only while its probability is at least this.
-EXPAND_FLOOR = 1e-6
+WIDEN = 10
+MAX_TOP = 2000
+# Openers at most this many tokens; deeper unfinished prefixes are omissions.
+MAX_DEPTH = 6
+MAX_REQUESTS = 64
+VERSION_ATTEMPTS = 3
 
 
 def settings(args):
@@ -38,12 +50,12 @@ def settings(args):
     return branches, getattr(core, "opener_pool", 20)
 
 
-def probe_payload(input_ids):
+def probe_payload(input_ids, top=TOP):
     return {
         "input_ids": list(input_ids),
         "sampling_params": {"temperature": 1.0, "max_new_tokens": 1},
         "return_logprob": True,
-        "top_logprobs_num": TOP,
+        "top_logprobs_num": top,
     }
 
 
@@ -61,34 +73,74 @@ def finished(tokenizer, ids):
     return bool(text.strip()) and "�" not in text
 
 
-async def candidates(score, tokenizer, prompt_ids, pool):
-    """Return the ``pool`` most likely openers as (token ids, joint log probability), and
-    the policy version that served the first probe.
+def unseen_bound(prefix_logprob, top, requested):
+    """Log bound on any next token a probe did not return (None when it returned all)."""
+    if len(top) < requested:
+        return None
+    omitted = 1.0 - math.fsum(math.exp(v) for v, _ in top)
+    bound = min(omitted, math.exp(min(v for v, _ in top)))
+    return prefix_logprob + math.log(bound) if bound > 0 else None
 
-    ``score(input_ids)`` sends one probe request and returns its output. Special tokens
-    (end of text, closing tags) are never openers.
+
+async def search(probe, tokenizer, prompt_ids, pool):
+    """Best-first search for the ``pool`` most likely openers.
+
+    ``probe(input_ids, top)`` sends one probe and returns its output. Probes run one at
+    a time, so a failure leaves no other probe of the search in flight. Returns a dict
+    with ``found`` [(token ids, log probability)], ``versions``, ``exact``, ``missed``
+    (largest probability an omitted opener could have) and ``requests``.
     """
     special = set(getattr(tokenizer, "all_special_ids", []) or [])
-    frontier, found, version = [([], 0.0)], [], None
-    for _ in range(MAX_DEPTH):
-        if not frontier:
-            break
-        outputs = await asyncio.gather(*(score(list(prompt_ids) + path) for path, _ in frontier))
-        if version is None:
-            version = outputs[0].get("meta_info", {}).get("weight_version")
-        nxt = []
-        for (path, lp), output in zip(frontier, outputs, strict=True):
-            for value, token in next_tokens(output):
-                if token in special:
-                    continue
-                ids, joint = path + [token], lp + value
-                if finished(tokenizer, ids):
-                    found.append((ids, joint))
-                elif joint >= math.log(EXPAND_FLOOR):
-                    nxt.append((ids, joint))
-        frontier = nxt
-    found.sort(key=lambda item: -item[1])
-    return found[:pool], version
+    order = itertools.count()
+    # Entries: (-log bound, tie, kind, prefix ids, prefix log probability, seen ids, top).
+    heap = [(0.0, next(order), "prefix", [], 0.0, set(), 0)]
+    found, versions, requests, missed = [], set(), 0, 0.0
+    while heap and len(found) < pool:
+        neg, _, kind, ids, lp, seen, top = heapq.heappop(heap)
+        if kind == "done":
+            found.append((ids, lp))
+            continue
+        if kind == "deep" or requests >= MAX_REQUESTS:
+            missed = max(missed, math.exp(-neg))
+            if kind != "deep":
+                break
+            continue
+        top = TOP if kind == "prefix" else min(top * WIDEN, MAX_TOP)
+        output = await probe(list(prompt_ids) + ids, top)
+        requests += 1
+        versions.add(output.get("meta_info", {}).get("weight_version"))
+        returned = next_tokens(output)
+        for value, token in returned:
+            if token in seen or token in special:
+                continue
+            seen.add(token)
+            child, joint = ids + [token], lp + value
+            if finished(tokenizer, child):
+                heapq.heappush(heap, (-joint, next(order), "done", child, joint, set(), 0))
+            else:
+                deep = len(child) >= MAX_DEPTH
+                heapq.heappush(heap, (-joint, next(order), "deep" if deep else "prefix", child, joint, set(), 0))
+        rest = unseen_bound(lp, returned, top)
+        if rest is not None and top < MAX_TOP:
+            heapq.heappush(heap, (-rest, next(order), "more", ids, lp, seen, top))
+        elif rest is not None:
+            missed = max(missed, math.exp(rest))
+    # Best-first order: whatever is left in the heap is bounded by the last admitted opener.
+    if len(found) == pool:
+        exact = missed < math.exp(found[-1][1])
+    else:
+        exact = missed == 0.0
+    return {"found": found, "versions": versions, "exact": exact, "missed": missed, "requests": requests}
+
+
+async def candidates(probe, tokenizer, prompt_ids, pool):
+    """Search under one policy version, repeating a search that spans a publication."""
+    for _ in range(VERSION_ATTEMPTS):
+        result = await search(probe, tokenizer, prompt_ids, pool)
+        if len(result["versions"]) == 1:
+            result["version"] = next(iter(result["versions"]))
+            return result
+    raise RuntimeError(f"Opener probes spanned policy versions in {VERSION_ATTEMPTS} consecutive searches")
 
 
 def choose(pool, branches, key):
@@ -99,15 +151,25 @@ def choose(pool, branches, key):
     return rng.sample(pool, branches)
 
 
-def assign(prompt_group, chosen, pool, version):
+def assigned(prompt_group):
+    """Whether every sample already carries a persisted branch assignment."""
+    return all(
+        RECORD_KEY in (s.metadata or {}) and response_seed.REQUEST_KEY in (s.metadata or {}) for s in prompt_group
+    )
+
+
+def assign(prompt_group, chosen, result):
     """Give each chosen opener an equal, contiguous share of the group as a response seed."""
     if len(prompt_group) % len(chosen):
         raise ValueError(f"Group of {len(prompt_group)} samples cannot split evenly over {len(chosen)} openers")
     share = len(prompt_group) // len(chosen)
     record = {
-        "pool": [{"token_ids": ids, "logprob": lp} for ids, lp in pool],
+        "pool": [{"token_ids": ids, "logprob": lp} for ids, lp in result["found"]],
         "chosen": [ids for ids, _ in chosen],
-        "probe_weight_version": version,
+        "probe_weight_version": result["version"],
+        "pool_exact": result["exact"],
+        "pool_missed_probability": result["missed"],
+        "probe_requests": result["requests"],
     }
     for slot, sample in enumerate(prompt_group):
         ids = chosen[slot // share][0]

@@ -5,7 +5,7 @@ import math
 import torch
 from torch import distributed as dist
 
-from miles.backends.training_utils import log_utils
+from miles.backends.training_utils.metrics import log_utils
 from miles.utils.tracking_utils import tracking
 
 _COUNT = "_miles_metric_count"

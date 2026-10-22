@@ -8,7 +8,6 @@ import os
 from unittest.mock import MagicMock
 
 import pytest
-
 from miles.utils.chat_template_utils import TEMPLATE_DIR, TITOTokenizerType, resolve_fixed_chat_template
 from miles.utils.chat_template_utils.template import apply_chat_template_from_str
 from miles.utils.chat_template_utils.tito_tokenizer import (
@@ -45,6 +44,7 @@ _EXPECTED_FIXED_TEMPLATES = {
     TITOTokenizerType.MINIMAX_M25: ("minimax_m25_fixed.jinja", {"clear_thinking": False}),
     TITOTokenizerType.MINIMAX_M27: ("minimax_m27_fixed.jinja", {"clear_thinking": False}),
     TITOTokenizerType.DEEPSEEKV4: (None, {"drop_thinking": False}),
+    TITOTokenizerType.DEEPSEEKV41: (None, {"drop_thinking": False}),
     TITOTokenizerType.INKLING: ("inkling_fixed.jinja", {}),
 }
 

@@ -14,7 +14,7 @@ from olmo_core.nn.transformer import config as transformer_config
 
 from miles.backends.core_utils import router_objective
 from miles.backends.core_utils.timing import startup_stage
-from miles.utils.hf_config import load_hf_config
+from miles.utils.hf_utils.config import load_hf_config
 
 
 def _backend(kind):

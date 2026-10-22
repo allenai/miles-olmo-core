@@ -27,7 +27,10 @@ def test_the_repo_has_ray_launchers_to_check() -> None:
     # The fork deliberately removes upstream example launchers. Check retained
     # entrypoints rather than an upstream inventory size, and still scan every
     # discovered launcher in the parametrized checks below.
-    expected = {"miles/utils/external_utils/command_utils.py", "tools/convert_torch_dist_to_hf_ray.py"}
+    expected = {
+        "miles/utils/external_utils/command_utils/ray_backend/backend.py",
+        "tools/convert_torch_dist_to_hf_ray.py",
+    }
     assert expected <= {path.relative_to(REPO_ROOT).as_posix() for path in ray_launchers()}
 
 

@@ -18,7 +18,7 @@ from torch import distributed as dist
 
 from miles.backends.core_utils import models
 from miles.backends.core_utils.publication.engine_drain import WeightSnapshot
-from miles.backends.fsdp_utils import update_weight_utils
+from miles.backends.training_utils.weight_update.protocols.cuda_ipc import FlattenedTensorBucket
 from miles.utils import async_utils, distributed_utils
 
 
@@ -50,7 +50,7 @@ def capture(actor):
         # Pack on the source device and perform one D2H copy per bucket. Doing
         # CPU concatenation and a blocking copy for every individual parameter
         # cost 44 seconds for the first measured 37 GB snapshot.
-        flat = update_weight_utils.FlattenedTensorBucket(named_tensors=bucket).get_flattened_tensor()
+        flat = FlattenedTensorBucket(named_tensors=bucket).get_flattened_tensor()
         packed = copy_bucket_to_host(actor, flat)
         # ray.put serializes before returning. The resulting NumPy object is
         # read-only on retrieval; subsequent optimizer writes cannot alias it.

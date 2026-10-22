@@ -192,3 +192,5 @@ local/
 .DS_Store
 
 .humanize/
+
+charts/*/charts/

@@ -121,19 +121,30 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         return response_seed.parse_scores(output, seed_ids)
 
     async def _branch_openers(self, prompt_group):
-        """Probe the prompt's likely openers and seed the group's samples with a uniform draw."""
+        """Probe the prompt's likely openers and seed the group's samples with a uniform draw.
+
+        A retried or resumed group reuses its persisted assignment. Probes take a
+        generation-admission slot, so admission pauses park them and lifecycle drains
+        wait for them like any generation request.
+        """
+        if opener_branches.assigned(prompt_group):
+            return
         branches, pool = opener_branches.settings(self.args)
         first = prompt_group[0]
         prompt_ids = compute_prompt_ids_from_sample(self.state, first)
-        found, version = await opener_branches.candidates(
-            lambda ids: self._prefill(opener_branches.probe_payload(ids), "opener probe"),
-            self.state.tokenizer,
-            prompt_ids,
-            pool,
-        )
+
+        async def probe(ids, top):
+            async with self._generation_admission:
+                return await self._prefill(opener_branches.probe_payload(ids, top), "opener probe")
+
+        result = await opener_branches.candidates(probe, self.state.tokenizer, prompt_ids, pool)
         key = f"{getattr(self.args, 'rollout_seed', 0)}:{first.group_index}:{first.index}"
-        chosen = opener_branches.choose(found, branches, key)
-        opener_branches.assign(prompt_group, chosen, found, version)
+        chosen = opener_branches.choose(result["found"], branches, key)
+        opener_branches.assign(prompt_group, chosen, result)
+        persist = getattr(self.data_source, "persist_group_metadata", None)
+        if persist is None:
+            raise RuntimeError("Opener branches require a data source that persists group metadata for retries")
+        persist(prompt_group, (response_seed.REQUEST_KEY, opener_branches.RECORD_KEY))
 
     async def _generate_response_impl(self, input):
         sample = input.sample

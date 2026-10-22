@@ -100,11 +100,19 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         payload = response_seed.scoring_payload(prompt_ids, seed_ids, input.sampling_params)
         payload["rid"] = uuid.uuid4().hex
         url = f"http://{input.args.sglang_router_ip}:{input.args.sglang_router_port}/generate"
-        output = await infra_timeouts.wait_for(
-            post(url, payload, max_retries=1, headers={"x-miles-request-id": payload["rid"]}),
-            self.args.olmo_core.refresh_request_timeout,
-            operation=f"response seed scoring request {payload['rid']}",
-        )
+        timeout = self.args.olmo_core.refresh_request_timeout
+        try:
+            output = await infra_timeouts.wait_for(
+                post(url, payload, max_retries=1, headers={"x-miles-request-id": payload["rid"]}),
+                timeout,
+                operation=f"response seed scoring request {payload['rid']}",
+            )
+        except TimeoutError as error:
+            # Recoverable like a generation timeout: the producer requeues the group.
+            raise GenerationRequestTimeout(
+                f"Response seed scoring request {payload['rid']} exceeded "
+                f"core.refresh_request_timeout={timeout:g}s. Check engine progress and admission pressure."
+            ) from error
         return response_seed.parse_scores(output, seed_ids)
 
     async def _generate_response_impl(self, input):

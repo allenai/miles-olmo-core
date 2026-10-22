@@ -13,7 +13,12 @@ import torch
 from safetensors import torch as safetensors_torch
 from torch import distributed as dist
 
-from miles.backends.core_utils import checkpoint, contract, data, expert_schedule
+from miles.backends.core_utils import (
+    checkpoint,
+    contract,
+    data,
+    expert_schedule,
+)
 from miles.backends.core_utils import metrics as training_metrics
 from miles.backends.core_utils import (
     models,
@@ -26,30 +31,41 @@ from miles.backends.core_utils import (
 )
 from miles.backends.core_utils import scoring as config
 from miles.backends.core_utils import stopping
-from miles.backends.core_utils.publication import engine_delivery, policy_refresh, publication
+from miles.backends.core_utils.publication import engine_delivery, policy_refresh, publication, transport
 from miles.backends.core_utils.publication.state import PolicyClock
 from miles.backends.core_utils.timing import startup_stage
-from miles.backends.fsdp_utils import update_weight_utils
-from miles.backends.megatron_utils.ft.types import TrainStepOutcome, TrainStepOutput
-from miles.backends.training_utils import data as miles_data
-from miles.backends.training_utils import loss as miles_loss
 from miles.backends.training_utils import parallel
+from miles.backends.training_utils.data import rollout as miles_data
+from miles.backends.training_utils.loss import objective as miles_loss
+from miles.backends.training_utils.types import TrainStepOutcome, TrainStepOutput
 from miles.ray.train_actor import TrainRayActor
 from miles.utils import async_utils, distributed_utils, logger_utils
 from miles.utils.ft_utils.process_group_utils import GroupInfo
 from miles.utils.function_registry import load_function
-from miles.utils.hf_config import HF_EXPORT_COMPLETE_MARKER
+from miles.utils.hf_utils.config import HF_EXPORT_COMPLETE_MARKER
 from miles.utils.processing_utils import load_tokenizer
 
 logger = logger_utils.setup_logger(__name__)
 
 
 class OLMoCoreTrainRayActor(TrainRayActor):
-    def init(self, args, role, with_ref=False, with_opd_teacher=False, *, recv_ckpt_src_rank=None, indep_dp_info=None):
+    def init(
+        self,
+        args,
+        role,
+        with_ref=False,
+        with_opd_teacher=False,
+        *,
+        recv_ckpt_src_rank=None,
+        indep_dp_info=None,
+        indep_dp_store_addr=None,
+    ):
         if role != "actor" or with_opd_teacher or recv_ckpt_src_rank is not None:
             raise ValueError("Core backend supports the policy actor without trainer-cell recovery")
+        if indep_dp_store_addr is not None or (indep_dp_info is not None and indep_dp_info.quorum_id != 0):
+            raise ValueError("Core backend does not support independent-DP recovery")
         with startup_stage(args, "distributed_init"):
-            super().init(args, role, with_ref=with_ref, with_opd_teacher=False)
+            super()._init_common(args, role, with_ref=with_ref, with_opd_teacher=False)
         self._agree(lambda: training_metrics.init_tracking(args))
         torch.manual_seed(args.seed)
         world = dist.get_world_size()
@@ -81,11 +97,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         with startup_stage(args, "native_restore", device=torch.cuda):
             checkpoint.restore(self)
         self.train_module._trainer.global_step = self.clock.completed_steps
-        updater = (
-            update_weight_utils.UpdateWeightFromTensor
-            if args.colocate
-            else update_weight_utils.UpdateWeightFromDistributed
-        )
+        updater = transport.TensorUpdater if args.colocate else transport.DistributedUpdater
         if not args.colocate and args.olmo_core.weight_sync_mode == "flattened":
             updater = publication.FlattenedDistributedUpdater
         self.weight_updater = updater(args, self.model)
@@ -790,18 +802,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         updater = getattr(self, "weight_updater", None)
         if updater is None:
             return
-        group = getattr(updater, "_model_update_groups", None)
-        if group is None:
-            return
-        pending = [
-            async_utils.submit(engine.destroy_weights_update_group(updater._group_name))
-            for engine in updater.rollout_engines
-        ]
-        try:
-            dist.destroy_process_group(group)
-        finally:
-            async_utils.wait_futures(pending)
-        updater._model_update_groups = None
+        updater.close()
 
     def capture_evaluation_snapshot(self, rollout_id, target):
         target = Path(target)

@@ -67,7 +67,7 @@ class MeasuredDataBuffer(DefaultDataBuffer):
         finally:
             self._consumer_wait_seconds += time.monotonic() - started
 
-    def get_metrics(self):
+    def get_metrics(self, trainer_model_id=None):
         waited, self._consumer_wait_seconds = self._consumer_wait_seconds, 0.0
         return {
             **super().get_metrics(),
@@ -118,7 +118,7 @@ class HomogeneousPolicyDataBuffer:
     async def get(self, current_version=None, **context):
         return await self._delegate.get(current_version=current_version, **context)
 
-    def get_metrics(self):
+    def get_metrics(self, trainer_model_id=None):
         rejected, incomplete, mixed = self._rejected, self._incomplete, self._mixed
         self._rejected = self._incomplete = self._mixed = 0
         return {

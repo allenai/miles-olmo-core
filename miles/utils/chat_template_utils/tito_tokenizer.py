@@ -880,6 +880,26 @@ class DeepSeekV4TITOTokenizer(TITOTokenizer):
         return self._encode_text(text_new[len(text_old) :])
 
 
+class DeepSeekV41TITOTokenizer(DeepSeekV4TITOTokenizer):
+    """DeepSeek V4.1 — official encoder via sglang's ``encoding_dsv41``; the
+    V4 incremental-render machinery applies unchanged."""
+
+    reasoning_parser = "deepseek-v41"
+    tool_call_parser = "deepseekv41"
+
+    def __init__(
+        self,
+        tokenizer: Any,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        assistant_start_str: str | None = None,
+    ):
+        super().__init__(tokenizer, chat_template_kwargs=chat_template_kwargs, assistant_start_str=assistant_start_str)
+        self.chat_template_kwargs = {
+            **self.chat_template_kwargs,
+            "thinking": deepseek.V41.render_thinking_enabled(self.chat_template_kwargs),
+        }
+
+
 class InklingTITOTokenizer(TITOTokenizer):
     """Inkling family (Inkling / Inkling-Small).
 
@@ -976,6 +996,7 @@ class TITOTokenizerType(StrEnum):
     MINIMAX_M25 = "minimax_m25"
     MINIMAX_M27 = "minimax_m27"
     DEEPSEEKV4 = "deepseekv4"
+    DEEPSEEKV41 = "deepseekv41"
     INKLING = "inkling"
 
     @classmethod
@@ -1010,6 +1031,8 @@ class TITOTokenizerType(StrEnum):
                 return MinimaxM27TITOTokenizer
             case cls.DEEPSEEKV4:
                 return DeepSeekV4TITOTokenizer
+            case cls.DEEPSEEKV41:
+                return DeepSeekV41TITOTokenizer
             case cls.INKLING:
                 return InklingTITOTokenizer
             case _:

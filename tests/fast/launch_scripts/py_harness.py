@@ -5,7 +5,7 @@ import re
 import subprocess
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -13,8 +13,9 @@ from types import ModuleType
 from tests.fast.launch_scripts.sh_harness import REPO_ROOT, sanitize
 from tests.fast.utils.command_recorder import record_commands
 
-import miles.utils.external_utils.command_utils as command_utils
-from miles.utils.external_utils.model_args_utils import import_module_from_path
+from miles.utils.external_utils import command_utils
+from miles.utils.external_utils.command_utils import base_backend
+from miles.utils.external_utils.model_args_utils import _import_module_from_path
 
 FROZEN_RUN_ID = "260101-000000-000"
 FROZEN_HARDWARE = "H200"
@@ -51,6 +52,8 @@ CLEARED_ENV = (
     "RAY_ADDRESS",
     "ROTARY_SCALING_FACTOR",
     "SLURM_JOB_NUM_NODES",
+    "TRITON_CACHE_DIR",
+    "TORCHINDUCTOR_CACHE_DIR",
 )
 
 
@@ -125,11 +128,14 @@ def freeze_environment(monkeypatch, hardware: str = FROZEN_HARDWARE) -> None:
         monkeypatch.setenv(key, value)
     for key in CLEARED_ENV:
         monkeypatch.delenv(key, raising=False)
-    monkeypatch.setattr(command_utils, "detect_hardware", lambda: hardware)
+    monkeypatch.setattr(base_backend, "detect_hardware", lambda: hardware)
 
 
 def install_command_recorder(monkeypatch) -> Recording:
     recording = Recording(commands=record_commands(monkeypatch), pseudo_files=[])
+    # Record conversion commands without acquiring a real model-cache lock.
+    # Separate preparation tests cover locking and committed conversion stamps.
+    monkeypatch.setattr(base_backend, "exclusive_path_lock", lambda path: nullcontext())
 
     def fake_encode_pseudo_file(text: str) -> str:
         recording.pseudo_files.append(text)
@@ -143,7 +149,7 @@ def install_command_recorder(monkeypatch) -> Recording:
 
 def import_launch_script(path: Path) -> ModuleType:
     name = "miles_launch_script_" + path.relative_to(REPO_ROOT).with_suffix("").as_posix().replace("/", "_")
-    return import_module_from_path(path, name)
+    return _import_module_from_path(path, name)
 
 
 @contextmanager
@@ -157,17 +163,32 @@ def host_filesystem_frozen(sandbox: Path) -> Iterator[None]:
     """
     visible_roots = (sandbox, REPO_ROOT)
     real_exists = Path.exists
+    real_mkdir = Path.mkdir
+    real_write_text = Path.write_text
 
     def exists(self: Path, **kwargs: object) -> bool:
         if any(self == root or self.is_relative_to(root) for root in visible_roots):
             return real_exists(self, **kwargs)
         return False
 
+    def mkdir(self, *args, **kwargs):
+        if any(self == root or self.is_relative_to(root) for root in visible_roots):
+            return real_mkdir(self, *args, **kwargs)
+
+    def write_text(self, data, *args, **kwargs):
+        if any(self == root or self.is_relative_to(root) for root in visible_roots):
+            return real_write_text(self, data, *args, **kwargs)
+        return len(data)
+
     Path.exists = exists
+    Path.mkdir = mkdir
+    Path.write_text = write_text
     try:
         yield
     finally:
         Path.exists = real_exists
+        Path.mkdir = real_mkdir
+        Path.write_text = real_write_text
 
 
 def call_entrypoint(module: ModuleType, name: str, overrides: dict[str, object], sandbox: Path) -> None:

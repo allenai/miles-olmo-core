@@ -6,7 +6,7 @@ application configs, rewards, preparation, and end-to-end audit code in Open
 Instruct. CI should run a pinned consumer harness against the candidate MILES
 commit rather than copy that harness into this repository.
 
-## Proposed gates
+## Validation gates
 
 Hosted CPU checks pin public SGLang and Megatron source revisions in
 `tests/ci/cpu-dependency-lock.json`. Update these revisions deliberately alongside
@@ -90,3 +90,31 @@ Start with manually triggered qualification and a bounded timeout. Promote the
 measured local/two-GPU cases to required checks once repeatability and cost are
 known. Keep distributed and publication-mode coverage visible as separate checks;
 do not label the basic two-GPU recipe as exercising every integration interface.
+
+## Optional consumer group
+
+The isolated Open Instruct companion provides
+`tests/miles/qualification/runner.py --case lifecycle|resume|all`. It is an explicit
+command, outside ordinary pytest discovery, and does not launch cluster jobs.
+The local fixture JSON fixes a three-layer hybrid architecture, seed, tokenizer
+construction and three synthetic arithmetic prompts. Preparation is offline.
+The lifecycle case runs three updates with four responses per prompt; the resume
+case compares it with two updates followed by a fresh-process third update.
+
+The audit covers routing replay, policy versions, finite nonzero gradients and
+updates, complete checkpoints, data cursor, serving/training score agreement and
+exact export reload. The comparison includes all saved model and Adam state,
+scheduler state and data state. Exact tokens/routes and `rtol=1e-5, atol=1e-6`
+for floating optimizer state are acceptance thresholds to validate on the
+intended hardware. Do not relax a failed threshold without investigating it.
+Greedy decoding and router auxiliary losses make this a mechanics/resume test;
+it does not establish task learning or sampling-RNG continuity.
+
+Missing runtime or GPU is an explicit failure. Each subprocess has a bounded
+timeout. Results include imported paths, source-content hashes, fixture hashes,
+the launcher-supplied immutable image ID, command logs and comparison metrics.
+Keep this group opt-in until repeatability and runtime cost are established.
+The trained H045 WEKA gate remains separate; a local pass does not qualify it.
+
+Adam first/second moments use the stricter absolute tolerance `1e-12` (relative
+tolerance `1e-5`), since small moments must not compare equal to a reset optimizer.

@@ -52,5 +52,7 @@ def set_default_megatron_args(args):
 
     if not hasattr(args, "miles_dsa_topk_backend"):
         args.miles_dsa_topk_backend = "torch"
+    if args.cp_comm_type is None:
+        args.cp_comm_type = ["p2p"]
 
     return args

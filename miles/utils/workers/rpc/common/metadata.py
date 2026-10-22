@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import inspect
 import typing
 from collections.abc import Callable
@@ -12,11 +13,14 @@ DEFAULT_CONCURRENCY_GROUP = "default"
 
 _RPC_CONFIG_ATTR = "_miles_rpc_config"
 
+_RAY_TRACE_CONTEXT_PARAMETER = "_ray_trace_ctx"
+
 _F = TypeVar("_F", bound=Callable[..., Any])
 
 
-def rpc(*, concurrency_group: str = DEFAULT_CONCURRENCY_GROUP) -> Callable[[_F], _F]:
-    config = _RpcConfig(concurrency_group=concurrency_group)
+def rpc(*, concurrency_group: str = DEFAULT_CONCURRENCY_GROUP, enabled: bool = True) -> Callable[[_F], _F]:
+    """Configure RPC exposure; Ray-only backend extensions may explicitly opt out."""
+    config = _RpcConfig(concurrency_group=concurrency_group, enabled=enabled)
 
     def decorator(fn: _F) -> _F:
         setattr(fn, _RPC_CONFIG_ATTR, config)
@@ -46,6 +50,24 @@ def canonicalize_method_arguments(
 
 
 def collect_rpc_method_specs(worker_cls: type) -> dict[str, RpcMethodSpec]:
+    return dict(_collect_rpc_method_specs(worker_cls))
+
+
+def declared_concurrency_groups(worker_cls: type) -> dict[str, str]:
+    groups = {}
+    for name in sorted(dir(worker_cls)):
+        if name.startswith("_"):
+            continue
+        attr = inspect.getattr_static(worker_cls, name)
+        if not callable(attr):
+            continue
+        if (group := _find_rpc_config(attr).concurrency_group) != DEFAULT_CONCURRENCY_GROUP:
+            groups[name] = group
+    return groups
+
+
+@functools.cache
+def _collect_rpc_method_specs(worker_cls: type) -> dict[str, RpcMethodSpec]:
     specs: dict[str, RpcMethodSpec] = {}
 
     for name in sorted(dir(worker_cls)):
@@ -54,12 +76,9 @@ def collect_rpc_method_specs(worker_cls: type) -> dict[str, RpcMethodSpec]:
         static_attr = inspect.getattr_static(worker_cls, name)
         if isinstance(static_attr, (classmethod, staticmethod, property)):
             continue
-        if not callable(static_attr):
+        if not callable(static_attr) or not _find_rpc_config(static_attr).enabled:
             continue
         specs[name] = _build_method_spec(worker_cls=worker_cls, name=name, attr=static_attr)
-
-    if len(specs) == 0:
-        raise TypeError(f"{worker_cls.__name__} exposes no public rpc methods")
 
     return specs
 
@@ -67,6 +86,7 @@ def collect_rpc_method_specs(worker_cls: type) -> dict[str, RpcMethodSpec]:
 @dataclasses.dataclass(frozen=True)
 class _RpcConfig:
     concurrency_group: str
+    enabled: bool = True
 
 
 def _find_rpc_config(attr: Callable[..., Any]) -> _RpcConfig:
@@ -114,6 +134,8 @@ def _build_method_spec(*, worker_cls: type, name: str, attr: Callable[..., Any])
 
     query_fields: dict[str, Any] = {}
     for param in parameters[1:]:
+        if _is_ray_trace_ctx_param(param):
+            continue
         if param.kind in (
             inspect.Parameter.VAR_POSITIONAL,
             inspect.Parameter.VAR_KEYWORD,
@@ -143,4 +165,13 @@ def _build_method_spec(*, worker_cls: type, name: str, attr: Callable[..., Any])
             query_fields=query_fields,
             result_annotation=hints["return"],
         ),
+    )
+
+
+def _is_ray_trace_ctx_param(param: inspect.Parameter) -> bool:
+    return (
+        param.name == _RAY_TRACE_CONTEXT_PARAMETER
+        and param.kind is inspect.Parameter.KEYWORD_ONLY
+        and param.default is None
+        and param.annotation is inspect.Parameter.empty
     )

@@ -1,10 +1,12 @@
 """Opening response tokens chosen by the data source for refresh generation.
 
-A sample may request ``metadata["response_seed"] = {"text": "..."}``. The text is
-tokenized after the prompt, scored by the serving policy in a prefill-only
-request, and becomes the first response tokens: rewarded and trained like any
-response token, carrying the scored behavior log-probabilities and the policy
-version that scored them. Generation then continues from the seeded tokens.
+A sample may request ``metadata["response_seed"] = {"text": "..."}`` or
+``{"token_ids": [...]}``. Text is tokenized after the prompt; token ids (for
+example a path read from the policy's own next-token distribution) are used as
+given. The seed is scored by the serving policy in a prefill-only request and
+becomes the first response tokens: rewarded and trained like any response token,
+carrying the scored behavior log-probabilities and the policy version that scored
+them. Generation then continues from the seeded tokens.
 
 Samples without the key are untouched. The request is never modified, so a reset
 or requeued sample is seeded again from the same text; the scored outcome is
@@ -18,25 +20,36 @@ RECORD_KEY = "response_seed_scored"
 
 
 def requested(sample):
-    """Return the requested seed text, or None when the sample has no seed."""
+    """Return the requested seed ({"text": str} or {"token_ids": [int]}), or None."""
     request = (sample.metadata or {}).get(REQUEST_KEY)
     if request is None:
         return None
-    if not isinstance(request, dict) or set(request) != {"text"}:
-        raise ValueError(f'metadata["{REQUEST_KEY}"] must be {{"text": str}}, got {request!r}')
-    text = request["text"]
-    if not isinstance(text, str) or not text:
-        raise ValueError(f'metadata["{REQUEST_KEY}"]["text"] must be a nonempty string')
-    return text
+    if not isinstance(request, dict) or set(request) not in ({"text"}, {"token_ids"}):
+        raise ValueError(
+            f'metadata["{REQUEST_KEY}"] must be {{"text": str}} or {{"token_ids": [int]}}, got {request!r}'
+        )
+    if "text" in request:
+        if not isinstance(request["text"], str) or not request["text"]:
+            raise ValueError(f'metadata["{REQUEST_KEY}"]["text"] must be a nonempty string')
+    else:
+        ids = request["token_ids"]
+        if not isinstance(ids, list) or not ids or not all(isinstance(t, int) and t >= 0 for t in ids):
+            raise ValueError(f'metadata["{REQUEST_KEY}"]["token_ids"] must be a nonempty list of token ids')
+    return request
 
 
-def tokenize(state, sample, prompt_ids, text):
-    """Encode the seed and require that it tokenizes identically after the prompt.
+def tokenize(state, sample, prompt_ids, request):
+    """Return the seed's token ids and text.
 
-    Byte-level merges can join the seed with the end of the prompt (for example a
-    newline after ``>``). Such a seed would be a different token sequence from what
-    the policy samples in context, so it is rejected rather than silently trained.
+    Token ids are used as given. Text is encoded and must tokenize identically after
+    the prompt: byte-level merges can join it with the end of the prompt (for
+    example a newline after ``>``), which would train a different token sequence
+    from what the policy samples in context, so such text is rejected.
     """
+    if "token_ids" in request:
+        seed_ids = list(request["token_ids"])
+        return seed_ids, state.tokenizer.decode(seed_ids)
+    text = request["text"]
     seed_ids = state.tokenizer.encode(text, add_special_tokens=False)
     if not seed_ids:
         raise ValueError(f"Response seed {text!r} encodes to no tokens")
@@ -49,7 +62,7 @@ def tokenize(state, sample, prompt_ids, text):
             f"Response seed {text!r} tokenizes differently after the prompt: alone {seed_ids}, "
             f"in context {joined[len(prompt_ids) - 1:]} (from the last prompt token)"
         )
-    return seed_ids
+    return seed_ids, text
 
 
 def remaining_sampling_params(args, sampling_params, seed_length):

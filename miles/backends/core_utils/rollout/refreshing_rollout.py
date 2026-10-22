@@ -11,7 +11,7 @@ import orjson
 
 from miles.backends.core_utils import infra_timeouts
 from miles.backends.core_utils.publication import policy_refresh
-from miles.backends.core_utils.rollout import pipeline_observer, response_seed, sibling_timing
+from miles.backends.core_utils.rollout import opener_branches, pipeline_observer, response_seed, sibling_timing
 from miles.backends.core_utils.rollout.async_rollout import ManagedFullyAsyncRolloutFn
 from miles.backends.core_utils.rollout.errors import GenerationRequestTimeout
 from miles.backends.core_utils.rollout.generation_admission import GenerationAdmission
@@ -76,6 +76,8 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         records = sibling_timing.start_group(prompt_group) if observed else None
         outcome = "completed"
         try:
+            if opener_branches.settings(self.args) is not None:
+                await self._branch_openers(prompt_group)
             return await super()._generate_group(prompt_group)
         except BaseException as error:
             outcome = type(error).__name__
@@ -95,25 +97,44 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         finally:
             sibling_timing.finished(input.sample, outcome)
 
+    async def _prefill(self, payload, purpose):
+        """Send one prefill-only request; a timeout is recoverable like a generation timeout."""
+        payload = {**payload, "rid": uuid.uuid4().hex}
+        url = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}/generate"
+        timeout = self.args.olmo_core.refresh_request_timeout
+        try:
+            return await infra_timeouts.wait_for(
+                post(url, payload, max_retries=1, headers={"x-miles-request-id": payload["rid"]}),
+                timeout,
+                operation=f"{purpose} request {payload['rid']}",
+            )
+        except TimeoutError as error:
+            # The producer requeues the group, as for a generation timeout.
+            raise GenerationRequestTimeout(
+                f"{purpose.capitalize()} request {payload['rid']} exceeded "
+                f"core.refresh_request_timeout={timeout:g}s. Check engine progress and admission pressure."
+            ) from error
+
     async def _score_response_seed(self, input, prompt_ids, seed_ids):
         """Score requested opening tokens under the serving policy before generating."""
         payload = response_seed.scoring_payload(prompt_ids, seed_ids, input.sampling_params)
-        payload["rid"] = uuid.uuid4().hex
-        url = f"http://{input.args.sglang_router_ip}:{input.args.sglang_router_port}/generate"
-        timeout = self.args.olmo_core.refresh_request_timeout
-        try:
-            output = await infra_timeouts.wait_for(
-                post(url, payload, max_retries=1, headers={"x-miles-request-id": payload["rid"]}),
-                timeout,
-                operation=f"response seed scoring request {payload['rid']}",
-            )
-        except TimeoutError as error:
-            # Recoverable like a generation timeout: the producer requeues the group.
-            raise GenerationRequestTimeout(
-                f"Response seed scoring request {payload['rid']} exceeded "
-                f"core.refresh_request_timeout={timeout:g}s. Check engine progress and admission pressure."
-            ) from error
+        output = await self._prefill(payload, "response seed scoring")
         return response_seed.parse_scores(output, seed_ids)
+
+    async def _branch_openers(self, prompt_group):
+        """Probe the prompt's likely openers and seed the group's samples with a uniform draw."""
+        branches, pool = opener_branches.settings(self.args)
+        first = prompt_group[0]
+        prompt_ids = compute_prompt_ids_from_sample(self.state, first)
+        found, version = await opener_branches.candidates(
+            lambda ids: self._prefill(opener_branches.probe_payload(ids), "opener probe"),
+            self.state.tokenizer,
+            prompt_ids,
+            pool,
+        )
+        key = f"{getattr(self.args, 'rollout_seed', 0)}:{first.group_index}:{first.index}"
+        chosen = opener_branches.choose(found, branches, key)
+        opener_branches.assign(prompt_group, chosen, found, version)
 
     async def _generate_response_impl(self, input):
         sample = input.sample
@@ -122,9 +143,9 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         # Optional opening tokens chosen by the data source; absent for ordinary samples.
         seed = response_seed.requested(sample)
         if seed is not None:
-            seed_ids = response_seed.tokenize(input.state, sample, input_ids, seed)
+            seed_ids, seed_text = response_seed.tokenize(input.state, sample, input_ids, seed)
             scores, version = await self._score_response_seed(input, input_ids, seed_ids)
-            response_seed.apply(sample, input_ids, seed_ids, seed, scores, version)
+            response_seed.apply(sample, input_ids, seed_ids, seed_text, scores, version)
             sampling_params = response_seed.remaining_sampling_params(input.args, sampling_params, len(seed_ids))
             input_ids = sample.tokens
         payload, halt = compute_request_payload(input.args, input_ids=input_ids, sampling_params=sampling_params)

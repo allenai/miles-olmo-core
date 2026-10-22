@@ -1,6 +1,6 @@
 # Codex Instructions
 
-When creating or substantially modifying `miles/**/*.py`, `scripts/**/*.py`, `tools/**/*.py`, `train.py`, or `train_async.py`, read and follow `.claude/rules/general-code-style.md`.
+Before working in this repository, discover and read all Markdown rule files under `.agents/rules/`, including subdirectories. This repository-root-relative path is a symlink to `.claude/rules/`, the shared source of truth. Treat these files as repository instructions; newly added rules belong to the same set.
 
 When creating or substantially modifying a launcher under `scripts/` or `examples/`, or a model definition under `scripts/models/`, also read and follow `.claude/rules/launch-and-model-scripts.md`.
 
@@ -13,8 +13,8 @@ upstream; do not restore the pre-flattening history or attach upstream ancestry.
 ### Upstream provenance
 
 - Repository: https://github.com/radixark/miles
-- Upstream comparison base: `e89b45f7f85a0e76fba6a99474b1dd9b67a3c20e`
-  (September 22, 2026, `fix(train): hand off to the engine before an off-cadence final eval (#3615)`).
+- Upstream comparison base: `a22fd824191c64ba7c5d6c531f125406e4ce9cc6`
+  (upstream v0.1.2, October 8, 2026, `release: freeze dependency lockfile for release/v0.1.2`).
 - Flattened release root: `4772a6767f1079eb3548d680c59fe98e481d6ff5`.
 
 The upstream SHA records provenance as text; it is not a parent of the flattened

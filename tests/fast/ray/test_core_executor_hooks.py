@@ -9,7 +9,7 @@ from miles.ray.rollout import rollout_executor
 
 @pytest.mark.asyncio
 async def test_publication_and_drain_rpc_delegates_preserve_results_and_version():
-    executor = object.__new__(rollout_executor.RolloutExecutor.__ray_actor_class__)
+    executor = object.__new__(rollout_executor.RolloutExecutor)
     calls = []
 
     async def refresh():
@@ -27,16 +27,22 @@ async def test_publication_and_drain_rpc_delegates_preserve_results_and_version(
     assert calls == ["refresh", ("step", {"rollout_id": 3}), ("version", 8)]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ["megatron", "fsdp", "olmo_core"])
-def test_executor_stops_core_producer_before_shared_cleanup(monkeypatch, backend):
-    executor = object.__new__(rollout_executor.RolloutExecutor.__ray_actor_class__)
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_executor_stops_core_producer_before_shared_cleanup(monkeypatch, backend, legacy):
+    executor = object.__new__(rollout_executor.RolloutExecutor)
     calls = []
 
     async def shutdown():
         calls.append("producer")
 
+    async def dispose():
+        calls.append("dispose")
+
     executor.args = SimpleNamespace(train_backend=backend)
-    executor.generate_rollout = SimpleNamespace(shutdown=shutdown)
+    executor.use_legacy_rollout_v1 = legacy
+    executor.generate_rollout = SimpleNamespace(shutdown=shutdown, dispose=dispose)
     executor.data_source = SimpleNamespace(close=lambda: calls.append("data"))
     executor._metric_checker = None
     executor.eval_generate_rollout = None
@@ -44,5 +50,9 @@ def test_executor_stops_core_producer_before_shared_cleanup(monkeypatch, backend
         rollout_executor.event_analyzer, "run_analysis_from_args", lambda args: calls.append("analysis")
     )
     monkeypatch.setattr(rollout_executor, "finish_tracking", lambda: calls.append("tracking"))
-    executor.dispose()
-    assert calls == (["producer"] if backend == "olmo_core" else []) + ["data", "analysis", "tracking"]
+    await executor.dispose()
+    assert calls == (
+        (["producer"] if backend == "olmo_core" else [])
+        + ([] if legacy else ["dispose"])
+        + ["data", "analysis", "tracking"]
+    )

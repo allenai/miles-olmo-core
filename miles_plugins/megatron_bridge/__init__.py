@@ -78,5 +78,10 @@ def install() -> None:
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("miles nemotron_h plugin failed to load: %s", e)
 
+    try:
+        from miles_plugins.megatron_bridge import mimo_v2  # noqa: F401
+    except Exception as e:
+        logger.warning("miles mimo_v2 plugin failed to load: %s", e)
+
 
 install()

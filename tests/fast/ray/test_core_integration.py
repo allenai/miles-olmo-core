@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from miles.ray import placement_group
 from miles.ray.rollout.inference_controller import InferenceController
 from miles.ray.rollout.train_data_conversion import split_train_data_by_dp_raw
 from miles.ray.train.group import TrainerController
@@ -13,7 +14,9 @@ from miles.utils.retry_utils import NonRetryableError
 
 
 def _publication_pair():
-    inference = InferenceController(SimpleNamespace(use_miles_router=True))
+    inference = InferenceController(
+        SimpleNamespace(use_miles_router=True), engine_provider=AsyncMock(), router_providers=[]
+    )
     cell = SimpleNamespace(
         meta=SimpleNamespace(workers_hash="generation-1"),
         is_pending_weights=True,
@@ -28,11 +31,23 @@ def _publication_pair():
     inference.servers = {"actor": server}
     inference._health_monitoring_pause = AsyncMock()
     inference._ensure_cells_ready = AsyncMock()
-    inference._get_updatable_server = lambda: server
+    inference._get_updatable_server = lambda **kwargs: server
     trainer = TrainerController.__new__(TrainerController)
     trainer._inference_controller = inference
     trainer._maybe_log_inference_engine_weight_checksums = AsyncMock()
     return trainer, inference, cell
+
+
+async def _publish(trainer, inference, rollout_id=None):
+    rollout = SimpleNamespace(set_weight_version=AsyncMock())
+    await placement_group.update_weights(
+        SimpleNamespace(ci_ft_test_actions=None, ci_ft_test_actions_path=None, debug_train_only=True),
+        trainer,
+        rollout,
+        inference,
+        rollout_id=rollout_id,
+    )
+    return rollout.set_weight_version.call_args.args[0]
 
 
 @pytest.mark.asyncio
@@ -48,7 +63,7 @@ async def test_publication_admits_engines_only_after_core_acknowledges():
         return [7]
 
     trainer._execute_first_alive = publish
-    pending = asyncio.create_task(trainer.update_weights(rollout_id=3))
+    pending = asyncio.create_task(_publish(trainer, inference, rollout_id=3))
     try:
         await asyncio.wait_for(entered.wait(), timeout=2)
         assert inference.context_lock.locked
@@ -72,14 +87,14 @@ async def test_failed_core_publication_releases_window_without_admission(error_t
     trainer._execute_first_alive = AsyncMock(side_effect=error_type("publication interrupted"))
 
     with pytest.raises(error_type, match="publication interrupted"):
-        await trainer.update_weights()
+        await _publish(trainer, inference)
 
     assert not inference.context_lock.locked
     cell.mark_weights_ready.assert_not_awaited()
     trainer._maybe_log_inference_engine_weight_checksums.assert_not_awaited()
     # The next publication must be able to acquire the same window.
     trainer._execute_first_alive = AsyncMock(return_value=[8])
-    assert await asyncio.wait_for(trainer.update_weights(), timeout=2) == 8
+    assert await asyncio.wait_for(_publish(trainer, inference), timeout=2) == 8
     cell.mark_weights_ready.assert_awaited_once()
 
 

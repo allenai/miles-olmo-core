@@ -3,7 +3,7 @@
 import argparse
 
 from miles.utils import logger_utils
-from miles.utils.hf_config import load_hf_config
+from miles.utils.hf_utils.config import load_hf_config
 from miles.utils.processing_utils import load_tokenizer
 
 logger = logger_utils.setup_logger(__name__)

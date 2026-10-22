@@ -111,7 +111,9 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         finally:
             self._draining_groups = None
 
-    async def _next_group(self, current_version: int | None) -> Any:
+    async def _next_group(self, current_version: int | None, trainer_model_id: str | None = None) -> Any:
+        if trainer_model_id is not None:
+            raise ValueError("Core rollout does not support multi-policy training")
         # Own both outcomes: if the worker fails just as a dequeue succeeds,
         # that prompt must remain part of the interrupted batch's retry ledger.
         queue_get = asyncio.create_task(self._output.get(current_version=current_version))

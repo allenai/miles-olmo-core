@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 import torch
-from miles.backends.training_utils.loss_hub import losses
+from miles.backends.training_utils.loss.hub import losses
 
 
 def probe_rows(batch, tensor, context_parallel_size=1):

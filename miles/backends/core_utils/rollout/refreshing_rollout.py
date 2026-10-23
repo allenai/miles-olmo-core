@@ -156,7 +156,8 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         mode = getattr(self.args.olmo_core, "opener_mode", "visible")
         result = await opener_branches.candidates(probe, self.state.tokenizer, prompt_ids, pool, mode=mode)
         key = f"{getattr(self.args, 'rollout_seed', 0)}:{first.group_index}:{first.index}"
-        chosen = opener_branches.choose(result["found"], branches, key)
+        result["anchor_top1"] = getattr(self.args.olmo_core, "opener_anchor_top1", False)
+        chosen = opener_branches.choose(result["found"], branches, key, anchor_top1=result["anchor_top1"])
         opener_branches.assign(prompt_group, chosen, result)
         persist = getattr(self.data_source, "persist_group_metadata", None)
         if persist is None:

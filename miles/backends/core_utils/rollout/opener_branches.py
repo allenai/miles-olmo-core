@@ -185,11 +185,13 @@ async def candidates(probe, tokenizer, prompt_ids, pool, mode="visible"):
     raise RuntimeError(f"Opener probes spanned policy versions in {VERSION_ATTEMPTS} consecutive searches")
 
 
-def choose(pool, branches, key):
+def choose(pool, branches, key, anchor_top1=False):
     """Draw ``branches`` candidates uniformly without replacement, reproducibly by ``key``."""
     if len(pool) < branches:
         raise ValueError(f"Opener probe found {len(pool)} candidates; {branches} branches are required")
     rng = random.Random(hashlib.sha256(key.encode()).digest())
+    if anchor_top1:
+        return [pool[0], *rng.sample(pool[1:], branches - 1)]
     return rng.sample(pool, branches)
 
 
@@ -207,6 +209,7 @@ def assign(prompt_group, chosen, result):
     share = len(prompt_group) // len(chosen)
     record = {
         "mode": result.get("mode", "visible"),
+        "anchor_top1": result.get("anchor_top1", False),
         "pool": [{"token_ids": ids, "logprob": lp} for ids, lp in result["found"]],
         "chosen": [ids for ids, _ in chosen],
         "probe_weight_version": result["version"],

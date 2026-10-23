@@ -1,4 +1,4 @@
-"""Exercise Core refresh through the native async consumer interface."""
+"""Exercise Core publication modes through the native async consumer interface."""
 
 import asyncio
 from types import SimpleNamespace
@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import pytest
 
 from miles.backends.core_utils.publication import policy_refresh
-from miles.backends.core_utils.rollout.async_buffer import RefreshPolicyDataBuffer
+from miles.backends.core_utils.rollout.async_buffer import HomogeneousPolicyDataBuffer, RefreshPolicyDataBuffer
+from miles.backends.core_utils.rollout.draining_rollout import DrainingRolloutFn
 from miles.backends.core_utils.rollout.refreshing_rollout import RefreshingRolloutFn
 from miles.rollout.base_types import RolloutFnTrainInput
 from miles.rollout.fully_async_data_buffer import DataBufferConstructorInput, DataBufferInput
@@ -14,7 +15,11 @@ from miles.utils.types import Sample
 
 
 @pytest.mark.parametrize("trainer_model_id", [None, "unsupported-policy"])
-def test_native_drain_preserves_core_single_policy_contract(trainer_model_id):
+@pytest.mark.parametrize(
+    ("producer_type", "buffer_type"),
+    [(RefreshingRolloutFn, RefreshPolicyDataBuffer), (DrainingRolloutFn, HomogeneousPolicyDataBuffer)],
+)
+def test_native_drain_preserves_core_single_policy_contract(trainer_model_id, producer_type, buffer_type):
     async def scenario():
         args = SimpleNamespace(
             rollout_global_dataset=True,
@@ -45,9 +50,10 @@ def test_native_drain_preserves_core_single_policy_contract(trainer_model_id):
                 output_token_logprobs=[[-0.8, 10]],
             ),
         )
-        producer = RefreshingRolloutFn.__new__(RefreshingRolloutFn)
+        producer = producer_type.__new__(producer_type)
         producer.args = args
-        producer._output = RefreshPolicyDataBuffer(DataBufferConstructorInput(args, lambda samples: None))
+        producer._output = buffer_type(DataBufferConstructorInput(args, lambda samples: None))
+        producer.controller = SimpleNamespace(check=lambda: None)
         producer._sample_filter = None
         producer._publication_paused = producer._refreshing = producer._stopping = False
         producer._producer_resumed = asyncio.Event()

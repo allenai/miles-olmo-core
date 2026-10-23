@@ -200,11 +200,11 @@ class DrainingRolloutFn(ManagedFullyAsyncRolloutFn):
         await asyncio.sleep(self._probe_delay)
         self.controller.emit("qualification_delay_finished", engine=assignment.engine, request=request)
 
-    async def _next_group(self, current_version):
+    async def _next_group(self, current_version, trainer_model_id=None):
         self.controller.check()
         # A dead publication must interrupt a waiting dequeue, even if no request
         # remains to expose that error through the producer's worker task.
-        pending = asyncio.create_task(super()._next_group(current_version))
+        pending = asyncio.create_task(super()._next_group(current_version, trainer_model_id=trainer_model_id))
         try:
             while not pending.done():
                 self.controller.check()

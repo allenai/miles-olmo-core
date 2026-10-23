@@ -156,6 +156,13 @@ before opening a draft PR:
 - Check retained Dockerfiles, scripts, imports, tests, and documentation for
   references to removed files. Preserve omissions in every newly added Docker
   variant. Do not restore an excluded patch just to make a build succeed.
+- When excluding a plugin's argument registration, check shared model builders
+  for consumers of those arguments. The v0.1.2 merge removed DSA registration
+  but left an unconditional `args.dsa_impl` access in the raw model provider,
+  breaking Qwen checkpoint conversion. Remove that excluded callback together
+  with its registration. Run `tests/fast/backends/megatron_utils/test_filtered_conversion.py`
+  in the pinned Megatron runtime and exercise real checkpoint conversion in the
+  consumer GPU check; training-parser tests alone do not cover this boundary.
 - Apply the existing source-patch exclusions to newly added adaptations from the
   same excluded component. External dependencies and distributed source patches
   have different scopes; permission to install a dependency does not establish

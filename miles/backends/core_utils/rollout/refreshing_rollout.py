@@ -228,10 +228,10 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         if delegate is None or len(delegate._buffer) <= delegate._capacity:
             self._producer_resumed.set()
 
-    async def _next_group(self, current_version):
+    async def _next_group(self, current_version, trainer_model_id=None):
         # Discarding an over-age completion also frees capacity, so poll while
         # the delegate waits for a replacement after a lifecycle drain.
-        pending = asyncio.create_task(super()._next_group(current_version))
+        pending = asyncio.create_task(super()._next_group(current_version, trainer_model_id=trainer_model_id))
         try:
             while not pending.done():
                 self._resume_if_buffer_allows()

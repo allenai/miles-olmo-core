@@ -1,27 +1,5 @@
 # Core runtime maintenance
 
-## Automated code reviews
-
-The `Codex review` workflow reviews non-draft PRs from this repository when they
-are opened, updated, reopened, or marked ready for review. It uses the shared
-criteria in [CODE_REVIEW.md](../CODE_REVIEW.md), posts approvals, change requests,
-or advisory reviews, and reassesses its previous blockers on follow-up reviews.
-Required CI and branch rules still apply; the workflow does not merge PRs.
-
-Configure `OPENAI_API_KEY` as a repository Actions secret or an organization
-Actions secret granted to this repository. Actions workflow permissions must
-allow GitHub Actions to create and approve pull requests. Fork PRs are excluded
-from automatic reviews. Once the workflow is on `main`, maintainers can run
-Actions → Codex review → Run workflow with a PR number; manual reviews of drafts
-and forks publish advisory comments only.
-
-Before Codex starts, the workflow fetches public SGLang and Megatron source at
-the PR head's `release-lock.json` commits, falling back to
-`tests/ci/cpu-dependency-lock.json` if no release lock exists. These checkouts
-provide source context, not installed packages or consumer GPU-runtime
-qualification. CI dependency overrides in PR comments are not used by this
-prefetch step.
-
 Keep the backend maintenance policy in this repository. An Open-Instruct runtime
 upgrade should change its existing source lock and Dockerfile, integration calls,
 parser snapshot and regression tests. Avoid adding another dependency manifest,

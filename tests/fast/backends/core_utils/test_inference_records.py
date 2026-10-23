@@ -209,6 +209,45 @@ def test_recorder_writes_manifest_groups_and_dispositions(tmp_path, monkeypatch)
     }
 
 
+def test_filtered_branched_group_keeps_its_opener_pool_draw_and_seeds(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEAKER_WORKLOAD_ID", "workload-1")
+    records = create_recorder(make_args(tmp_path))
+    draw = {
+        "pool": [{"token_ids": [5], "logprob": -0.1}, {"token_ids": [7, 8], "logprob": -2.0}],
+        "chosen": [[7, 8], [5]],
+        "probe_weight_version": "4",
+        "pool_exact": True,
+        "pool_missed_probability": 0.0,
+        "probe_requests": 3,
+    }
+    branched = [sample(i, 0.0) for i in range(4)]
+    for i, s in enumerate(branched):
+        seed = draw["chosen"][i // 2]
+        s.metadata["opener_branches"] = {**draw, "branch": i // 2}
+        s.metadata["response_seed_scored"] = {
+            "token_ids": seed,
+            "log_probs": [-0.5] * len(seed),
+            "weight_version": "4",
+        }
+    plain = [sample(i, float(i % 2)) for i in range(4)]
+    records.record_group(branched, decision="filtered", reason="zero_std_0.0")
+    records.record_group(plain, decision="passed")
+    drain(records)
+    directory = next((tmp_path / "records").glob("*/run-a-workload-1"))
+    groups = rows(directory)
+    # A filtered group never reaches the rollout dumps; its record still carries the draw.
+    assert groups[0]["filter_decision"] == "filtered" and groups[0]["opener_branches"] == draw
+    assert [r["opener_branch"] for r in groups[0]["responses"]] == [0, 0, 1, 1]
+    assert groups[0]["responses"][0]["response_seed"] == {
+        "token_ids": [7, 8],
+        "log_probs": [-0.5, -0.5],
+        "weight_version": "4",
+    }
+    # Unseeded groups are recorded exactly as before.
+    assert "opener_branches" not in groups[1]
+    assert not {"opener_branch", "response_seed"} & set(groups[1]["responses"][0])
+
+
 def test_same_lineage_different_protocol_shares_task_but_not_input_key(tmp_path):
     policy = checkpoint(tmp_path)
     first = create_recorder(make_args(tmp_path, run="first", policy=policy))

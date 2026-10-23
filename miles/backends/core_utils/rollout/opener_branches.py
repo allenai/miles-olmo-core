@@ -1,4 +1,8 @@
-"""Per-prompt opener branches for refresh generation (first-token exploration).
+"""Per-prompt opener branches for refresh generation.
+
+``first_token`` mode ranks literal next tokens, including whitespace, excluding
+special IDs and think delimiters. The default ``visible`` mode below expands
+whitespace for compatibility with earlier experiments.
 
 Before a prompt group is generated, the serving policy's most likely openers for the
 prompt are read in prefill-only requests. An opener is the response's first tokens up
@@ -133,12 +137,40 @@ async def search(probe, tokenizer, prompt_ids, pool):
     return {"found": found, "versions": versions, "exact": exact, "missed": missed, "requests": requests}
 
 
-async def candidates(probe, tokenizer, prompt_ids, pool):
+async def first_token_search(probe, tokenizer, prompt_ids, pool):
+    """Rank literal next tokens; whitespace is a candidate, never an expansion.
+
+    Atomic think delimiters can be ordinary added tokens, absent from special IDs.
+    Exclude them by decoded spelling as well as excluding tokenizer special IDs.
+    Widen only at the original prompt, and fail closed if the full pool is unavailable.
+    """
+    special = set(getattr(tokenizer, "all_special_ids", []) or [])
+    top, versions, requests = max(TOP, pool), set(), 0
+    if top > MAX_TOP:
+        raise ValueError(f"First-token opener pool exceeds probe limit {MAX_TOP}")
+    while True:
+        output = await probe(list(prompt_ids), top)
+        versions.add(output.get("meta_info", {}).get("weight_version"))
+        requests += 1
+        returned = sorted(next_tokens(output), reverse=True)
+        found = [([token], lp) for lp, token in returned if token not in special and tokenizer.decode([token]) not in ("<think>", "</think>")][:pool]
+        if len(found) == pool:
+            return {"found": found, "versions": versions, "exact": True, "missed": 0.0, "requests": requests}
+        if len(returned) < top or top == MAX_TOP:
+            raise ValueError(f"First-token probe found {len(found)} eligible tokens; pool of {pool} required")
+        top = min(top * WIDEN, MAX_TOP)
+
+
+async def candidates(probe, tokenizer, prompt_ids, pool, mode="visible"):
     """Search under one policy version, repeating a search that spans a publication."""
+    searches = {"visible": search, "first_token": first_token_search}
+    if mode not in searches:
+        raise ValueError(f"Unknown opener mode {mode!r}")
     for _ in range(VERSION_ATTEMPTS):
-        result = await search(probe, tokenizer, prompt_ids, pool)
+        result = await searches[mode](probe, tokenizer, prompt_ids, pool)
         if len(result["versions"]) == 1:
             result["version"] = next(iter(result["versions"]))
+            result["mode"] = mode
             return result
     raise RuntimeError(f"Opener probes spanned policy versions in {VERSION_ATTEMPTS} consecutive searches")
 
@@ -153,9 +185,7 @@ def choose(pool, branches, key):
 
 def assigned(prompt_group):
     """Whether every sample already carries a persisted branch assignment."""
-    return all(
-        RECORD_KEY in (s.metadata or {}) and response_seed.REQUEST_KEY in (s.metadata or {}) for s in prompt_group
-    )
+    return all(RECORD_KEY in (s.metadata or {}) and response_seed.REQUEST_KEY in (s.metadata or {}) for s in prompt_group)
 
 
 def assign(prompt_group, chosen, result):
@@ -164,6 +194,7 @@ def assign(prompt_group, chosen, result):
         raise ValueError(f"Group of {len(prompt_group)} samples cannot split evenly over {len(chosen)} openers")
     share = len(prompt_group) // len(chosen)
     record = {
+        "mode": result.get("mode", "visible"),
         "pool": [{"token_ids": ids, "logprob": lp} for ids, lp in result["found"]],
         "chosen": [ids for ids, _ in chosen],
         "probe_weight_version": result["version"],

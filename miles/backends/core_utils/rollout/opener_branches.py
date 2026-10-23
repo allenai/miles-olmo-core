@@ -137,6 +137,14 @@ async def search(probe, tokenizer, prompt_ids, pool):
     return {"found": found, "versions": versions, "exact": exact, "missed": missed, "requests": requests}
 
 
+def protocol_token(tokenizer, token):
+    """Recognize control markers that some tokenizers store as ordinary added tokens."""
+    text = tokenizer.decode([token])
+    return text in ("<think>", "</think>", "<functions>", "</functions>", "<function_calls>", "</function_calls>") or (
+        text.startswith("<|") and text.endswith("|>")
+    )
+
+
 async def first_token_search(probe, tokenizer, prompt_ids, pool):
     """Rank literal next tokens; whitespace is a candidate, never an expansion.
 
@@ -153,7 +161,9 @@ async def first_token_search(probe, tokenizer, prompt_ids, pool):
         versions.add(output.get("meta_info", {}).get("weight_version"))
         requests += 1
         returned = sorted(next_tokens(output), reverse=True)
-        found = [([token], lp) for lp, token in returned if token not in special and tokenizer.decode([token]) not in ("<think>", "</think>")][:pool]
+        found = [
+            ([token], lp) for lp, token in returned if token not in special and not protocol_token(tokenizer, token)
+        ][:pool]
         if len(found) == pool:
             return {"found": found, "versions": versions, "exact": True, "missed": 0.0, "requests": requests}
         if len(returned) < top or top == MAX_TOP:
@@ -185,7 +195,9 @@ def choose(pool, branches, key):
 
 def assigned(prompt_group):
     """Whether every sample already carries a persisted branch assignment."""
-    return all(RECORD_KEY in (s.metadata or {}) and response_seed.REQUEST_KEY in (s.metadata or {}) for s in prompt_group)
+    return all(
+        RECORD_KEY in (s.metadata or {}) and response_seed.REQUEST_KEY in (s.metadata or {}) for s in prompt_group
+    )
 
 
 def assign(prompt_group, chosen, result):

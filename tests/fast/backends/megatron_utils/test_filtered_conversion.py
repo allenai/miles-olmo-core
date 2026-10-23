@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 
 pytest.importorskip("megatron")
+pytest.importorskip("mbridge", reason="Checkpoint conversion requires the pinned Megatron runtime")
 
 from megatron.training import arguments as megatron_arguments
 from tools import convert_hf_to_torch_dist as conversion

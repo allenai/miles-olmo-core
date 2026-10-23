@@ -76,7 +76,11 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         outcome = "completed"
         try:
             if opener_branches.settings(self.args) is not None:
-                await self._branch_openers(prompt_group)
+                try:
+                    await self._branch_openers(prompt_group)
+                except BaseException:
+                    self._return_unstarted_slots(prompt_group)
+                    raise
             return await super()._generate_group(prompt_group)
         except BaseException as error:
             outcome = type(error).__name__
@@ -84,6 +88,18 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         finally:
             if records is not None:
                 sibling_timing.write_group(self.args, records, outcome)
+
+    def _return_unstarted_slots(self, prompt_group):
+        """Free the sample slots charged at submission for a group that never started generating.
+
+        Slots are normally freed by each sample's completion callback; a group that fails
+        before its samples start has no callbacks, so its slots would stay charged until
+        the producer next went idle.
+        """
+        done = self._scheduler.sample_done_callback
+        if done is not None:
+            for _ in prompt_group:
+                done()
 
     async def _generate_response(self, input):
         sibling_timing.admitted(input.sample)

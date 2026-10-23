@@ -30,6 +30,7 @@ import uuid
 from pathlib import Path
 
 from miles.backends.core_utils.publication import policy_versions
+from miles.backends.core_utils.rollout import opener_branches, response_seed
 from miles.utils import logger_utils
 
 logger = logger_utils.setup_logger(__name__)
@@ -172,9 +173,23 @@ def response_record(sample, text, fresh_run):
         "policy_versions": versions,
         "policy_scope": policy_scope(versions, fresh_run),
     }
+    # Seeded responses only: the forced opening tokens with their serving-policy scores,
+    # and which of the group's opener branches the response belongs to.
+    if (seed := metadata.get(response_seed.RECORD_KEY)) is not None:
+        record["response_seed"] = {key: seed.get(key) for key in ("token_ids", "log_probs", "weight_version")}
+    if (branch := metadata.get(opener_branches.RECORD_KEY)) is not None:
+        record["opener_branch"] = branch.get("branch")
     if text:
         record["response"] = sample.response
     return record
+
+
+def opener_record(metadata):
+    """The group's opener pool and draw, without the per-response branch index; None when not branched."""
+    branch = metadata.get(opener_branches.RECORD_KEY)
+    if branch is None:
+        return None
+    return {key: value for key, value in branch.items() if key != "branch"}
 
 
 class Recorder:
@@ -281,6 +296,8 @@ class Recorder:
                 "responses_included": text,
                 "responses": [response_record(sample, text, self.fresh_run) for sample in samples],
             }
+            if (openers := opener_record(metadata)) is not None:
+                row["opener_branches"] = openers
         except Exception:
             self._count("failed")
             logger.exception("Inference record unavailable for group %s", getattr(samples[0], "group_index", None))

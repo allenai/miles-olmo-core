@@ -4,6 +4,20 @@ Before working in this repository, discover and read all Markdown rule files und
 
 When creating or substantially modifying a launcher under `scripts/` or `examples/`, or a model definition under `scripts/models/`, also read and follow `.claude/rules/launch-and-model-scripts.md`.
 
+## Code review
+
+Read and follow [CODE_REVIEW.md](CODE_REVIEW.md) when reviewing code.
+
+Begin every GitHub comment or review published by Codex with:
+
+```markdown
+> [!NOTE]
+> Drafted by Codex.
+```
+
+Use `Drafted by Codex and reviewed by Robert.` only when Robert actually reviewed
+the response before publication; permission to post alone does not count.
+
 ## Updating from upstream Miles
 
 This repository keeps a filtered upstream lineage, bridged to the existing fork.

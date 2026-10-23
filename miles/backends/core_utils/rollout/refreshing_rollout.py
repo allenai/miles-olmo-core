@@ -154,7 +154,8 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             async with self._generation_admission:
                 return await self._prefill(opener_branches.probe_payload(ids, top), "opener probe")
 
-        result = await opener_branches.candidates(probe, self.state.tokenizer, prompt_ids, pool)
+        mode = getattr(self.args.olmo_core, "opener_mode", "visible")
+        result = await opener_branches.candidates(probe, self.state.tokenizer, prompt_ids, pool, mode=mode)
         key = f"{getattr(self.args, 'rollout_seed', 0)}:{first.group_index}:{first.index}"
         chosen = opener_branches.choose(result["found"], branches, key)
         opener_branches.assign(prompt_group, chosen, result)

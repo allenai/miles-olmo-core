@@ -202,9 +202,10 @@ async def generate(
     if lora_rollout_enabled(args):
         payload["lora_path"] = LORA_ADAPTER_NAME
 
-    if args.use_rollout_routing_replay:
+    # Evaluation shares launch args with training but does not consume replay metadata.
+    if not evaluation and args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
-    if getattr(args, "use_rollout_indexer_replay", False):
+    if not evaluation and getattr(args, "use_rollout_indexer_replay", False):
         payload["return_indexer_topk"] = True
 
     if sample.multimodal_inputs and sample.multimodal_inputs["images"]:

@@ -297,7 +297,7 @@ def init_http_client(args):
     _client_concurrency = max(_client_concurrency, args.sglang_server_concurrency)
     if _http_client is None:
         _http_client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=_client_concurrency),
+            limits=_rollout_client_limits(_client_concurrency),
             timeout=httpx.Timeout(None),
         )
 
@@ -305,6 +305,15 @@ def init_http_client(args):
     if args.use_distributed_post:
         _init_ray_distributed_post(args)
         _distributed_post_enabled = True
+
+
+def _rollout_client_limits(concurrency):
+    # Large generation responses can stall the consumer after HTTPX chooses an
+    # idle socket but before it writes. The server can close that socket in the
+    # meantime, losing a whole prompt group to ReadError. New connections avoid
+    # this idle-reuse race without retrying potentially delivered generations.
+    # General/control clients owned by other providers retain their own pools.
+    return httpx.Limits(max_connections=max(1, concurrency), max_keepalive_connections=0)
 
 
 def _init_ray_distributed_post(args):
@@ -331,7 +340,7 @@ def _init_ray_distributed_post(args):
         def __init__(self, *, concurrency: int):
             # Lazy creation to this actor's event loop
             self._client = httpx.AsyncClient(
-                limits=httpx.Limits(max_connections=max(1, concurrency)),
+                limits=_rollout_client_limits(concurrency),
                 timeout=httpx.Timeout(None),
             )
 

@@ -319,10 +319,17 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                     self._producer_idle.clear()
                     continue
 
-                try:
-                    done, active = await asyncio.wait_for(self._scheduler.wait_for_progress(active), timeout=0.5)
-                except TimeoutError:
-                    continue
+                # Under a busy uvloop, the timeout can fire before the scheduled
+                # waiter observes even already-completed tasks. Never put ready
+                # groups behind that wait: repeated timeouts can starve training.
+                done = {task for task in active if task.done()}
+                if done:
+                    active -= done
+                else:
+                    try:
+                        done, active = await asyncio.wait_for(self._scheduler.wait_for_progress(active), timeout=0.5)
+                    except TimeoutError:
+                        continue
                 self._active_tasks = active
                 completions = []
                 for task in done:

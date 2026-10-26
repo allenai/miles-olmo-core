@@ -172,17 +172,19 @@ class MilesRouter:
             if headers is None:
                 headers = dict(request.headers)
             if body is not None:
-                headers = {
-                    k: v for k, v in headers.items() if k.lower() not in ("content-length", "transfer-encoding")
-                }
+                headers = {k: v for k, v in headers.items() if k.lower() not in ("content-length", "transfer-encoding")}
 
             response = await self.client.request(request.method, url, content=body, headers=headers)
             content = await response.aread()
+            response_headers = dict(response.headers)
+            if request.headers.get("x-miles-report-worker") == "1":
+                # Diagnostic attribution without parsing large generation payloads.
+                response_headers["x-miles-worker-url"] = worker_url
             return {
                 "request_body": body,
                 "response_body": content,
                 "status_code": response.status_code,
-                "headers": dict(response.headers),
+                "headers": response_headers,
             }
         except httpx.RequestError as error:
             logger.warning(

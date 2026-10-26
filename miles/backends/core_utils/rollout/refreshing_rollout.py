@@ -7,6 +7,7 @@ import uuid
 from typing import cast
 
 import httpx
+import orjson
 
 from miles.backends.core_utils import infra_timeouts
 from miles.backends.core_utils.publication import policy_refresh
@@ -122,11 +123,16 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             len(payload.get("input_ids", [])),
         )
         try:
-            output = await infra_timeouts.wait_for(
-                post(url, payload, max_retries=1, headers={"x-miles-request-id": payload["rid"]}),
-                timeout,
-                operation=f"generation request {payload['rid']}",
+            # Long generations are normal. Per-request 30s watchdog logs scale
+            # with fleet concurrency and compete with response delivery. Keep
+            # the deadline; driver/queue diagnostics report aggregate progress.
+            response = await asyncio.wait_for(
+                post(url, payload, max_retries=1, headers={"x-miles-request-id": payload["rid"]}, return_bytes=True),
+                timeout=infra_timeouts.seconds(timeout),
             )
+            # Routing replay makes responses large. Decode UTF-8 bytes directly
+            # rather than building an intermediate string in HTTPX/stdlib JSON.
+            output = orjson.loads(response)
         except httpx.HTTPError as error:
             logger.exception(
                 "Policy refresh HTTP failure: request=%s group=%s sample=%s url=%s elapsed_seconds=%.3f "

@@ -147,10 +147,11 @@ def probe_distributions(engine, tokenizer, model, records):
         records.append(record)
 
 
-def qualify(size, output, distribution_only=False, fp32_logits=False):
+def qualify(size, output, distribution_only=False, fp32_logits=False, reference_backbone=False):
     # Optional GPU dependency: import only in the model subprocess, after config registration.
     import sglang
 
+    os.environ["MILES_HYBRID_REFERENCE_BACKBONE"] = "1" if reference_backbone else "0"
     torch.set_num_threads(4)
     source = f"{ROOT}/{size}/midtrain/step{STEPS[size]}"
     config_bytes = (Path(source) / "config.json").read_bytes()
@@ -171,6 +172,7 @@ def qualify(size, output, distribution_only=False, fp32_logits=False):
         "throughput_includes_prefill": True,
         "qualification_mode": "distribution_only" if distribution_only else "complete",
         "fp32_logits": fp32_logits,
+        "serving_backbone": "hf_sdpa" if reference_backbone else "sglang_radix",
         "reference_mode": "hf_cached_decode_with_full_sequence_diagnostic",
         "status": "RUNNING",
     }
@@ -233,6 +235,7 @@ def main():
     parser.add_argument("--mirror-dir", type=Path)
     parser.add_argument("--distribution-only", action="store_true")
     parser.add_argument("--fp32-logits", action="store_true")
+    parser.add_argument("--reference-backbone", action="store_true")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.size == "all":
@@ -272,7 +275,7 @@ def main():
         return bool(failures)
     output = args.output_dir / f"{args.size}.json"
     try:
-        qualify(args.size, output, distribution_only=args.distribution_only, fp32_logits=args.fp32_logits)
+        qualify(args.size, output, distribution_only=args.distribution_only, fp32_logits=args.fp32_logits, reference_backbone=args.reference_backbone)
     except Exception:
         report = json.loads(output.read_text()) if output.exists() else {"size": args.size}
         report.update(status="FAILED", error=traceback.format_exc())

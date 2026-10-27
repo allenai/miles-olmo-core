@@ -6,6 +6,7 @@ chunked prefill, graph capture, and speculative decoding are deliberately reject
 """
 
 from collections.abc import Iterable
+import os
 
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -34,6 +35,9 @@ class MainlineLadderForCausalLM(nn.Module):
         if torch.get_default_dtype() != torch.bfloat16:
             raise ValueError("MainlineLadder bridge requires BF16 model computation")
         self.config = config
+        self.reference_backbone = os.environ.get("MILES_HYBRID_REFERENCE_BACKBONE") == "1"
+        if self.reference_backbone:
+            config._attn_implementation = "sdpa"
         self.model = release.MainlineLadderModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.logits_processor = LogitsProcessor(config)
@@ -102,19 +106,34 @@ class MainlineLadderForCausalLM(nn.Module):
         if input_ids.numel() == 0:
             raise ValueError("Empty/idle batches are unsupported by the TP=1 hybrid bridge")
         states = self._states_for_batch(forward_batch)
+        if self.reference_backbone:
+            if input_embeds is not None:
+                raise ValueError("Reference backbone requires token IDs")
+            return self._reference_forward(input_ids, states, forward_batch)
         hidden = self.model.embed_tokens(input_ids) if input_embeds is None else input_embeds
         hidden = self.model.embed_norm(hidden * self.config.embed_scale)
         for layer_id, layer in enumerate(self.model.layers):
             normalized = layer.input_layernorm(hidden)
-            mixed = (
-                self._linear_forward(layer, normalized, states)
-                if layer.layer_type == "linear_attention"
-                else self._attention_forward(layer, layer_id, normalized, forward_batch)
-            )
+            mixed = self._linear_forward(layer, normalized, states) if layer.layer_type == "linear_attention" else self._attention_forward(layer, layer_id, normalized, forward_batch)
             hidden = hidden + layer.post_attention_layernorm(mixed)
             hidden = hidden + layer.post_feedforward_layernorm(layer.mlp(layer.ffn_layernorm(hidden)))
         hidden = self.model.norm(hidden)
         return self.logits_processor(input_ids, hidden, self.lm_head, forward_batch)
+
+    def _reference_forward(self, input_ids, states, batch):
+        hidden = []
+        offset = 0
+        for state, length in states:
+            tokens = input_ids[offset : offset + length].unsqueeze(0)
+            output = self.model(tokens, past_key_values=state, use_cache=True)
+            hidden.append(output.last_hidden_state[0])
+            for recurrent in state.recurrent_states:
+                if recurrent is not None and recurrent.dtype != torch.float32:
+                    raise RuntimeError("Hybrid GDN recurrent state must remain FP32")
+            offset += length
+        if offset != input_ids.numel():
+            raise ValueError("Hybrid request lengths do not match the packed tokens")
+        return self.logits_processor(input_ids, torch.cat(hidden), self.lm_head, batch)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         parameters = dict(self.named_parameters())

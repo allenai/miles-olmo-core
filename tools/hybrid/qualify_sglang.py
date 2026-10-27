@@ -56,10 +56,9 @@ def compare_reference(model, prompt, generated, meta):
     chosen = decode_scores.gather(-1, targets[-len(generated) :, None]).squeeze(-1)
     gap = decode_scores.max(-1).values - chosen
     agreement = (gap <= 0.01).float().mean().item()
-    if error > 0.08 or agreement < 0.95:
-        raise AssertionError(f"HF parity failed: max logprob error={error}, greedy agreement={agreement}")
     full_expected = full_scores[row_indices].gather(-1, targets[:, None]).squeeze(-1).cpu()
     return {
+        "passed": error <= 0.08 and agreement >= 0.95,
         "max_logprob_error": error,
         "greedy_agreement_within_0.01": agreement,
         "full_sequence_max_logprob_error": (full_expected - actual).abs().max().item(),
@@ -129,11 +128,14 @@ def probe_distributions(engine, tokenizer, model, records):
         if not torch.isfinite(served).all() or served.logsumexp(-1).abs().max().item() > 1e-4:
             raise AssertionError("Serving full-vocabulary probabilities are not finite and normalized")
         cached = cached_logprobs(model, prompt, generated)
+        if not torch.isfinite(reference).all() or not torch.isfinite(cached).all():
+            raise AssertionError("Non-finite HF reference probabilities")
         full_kl = (served.exp() * (served - reference)).sum(-1).clamp_min(0)
         self_kl = (cached.exp() * (cached - reference)).sum(-1).clamp_min(0)
         kl = (served.exp() * (served - cached)).sum(-1).clamp_min(0)
         tv = (served.exp() - cached.exp()).abs().sum(-1) / 2
         record = {
+            "passed": kl.max().item() <= 0.001,
             "prompt_tokens": length,
             "prefill_kl": kl[0].item(),
             "cached_decode_kl": kl[1:].max().item(),
@@ -143,8 +145,6 @@ def probe_distributions(engine, tokenizer, model, records):
             "hf_cached_vs_full_max_kl": self_kl.max().item(),
         }
         records.append(record)
-        if kl.max().item() > 0.001:
-            raise AssertionError(f"Full-vocabulary KL exceeds 0.001: {record}")
 
 
 def qualify(size, output, distribution_only=False, fp32_logits=False):
@@ -211,6 +211,9 @@ def qualify(size, output, distribution_only=False, fp32_logits=False):
             generate_cases(engine, tokenizer, model, result["after_reload"])
         result["distribution_probes_after_reload"] = []
         probe_distributions(engine, tokenizer, model, result["distribution_probes_after_reload"])
+        checks = [record for key in ("distribution_probes", "cases", "after_reload", "distribution_probes_after_reload") for record in result[key]]
+        if not all(record["passed"] for record in checks):
+            raise AssertionError(f"Numerical parity failed in {sum(not record['passed'] for record in checks)} cases")
         result["status"] = "PASSED"
     finally:
         if engine is not None:

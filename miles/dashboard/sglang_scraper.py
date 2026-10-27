@@ -6,8 +6,9 @@ Two fetch modes (design doc §6.6):
   router fans the request out to every registered worker and labels each
   sample with ``worker_addr`` (sgl-model-gateway ``get_engine_metrics``).
 - ``direct``: concurrent ``GET {addr}/metrics`` against every engine address
-  from the topology. Needed under ``--use-miles-router``, whose router has no
-  aggregation endpoint; here the scraper attaches the address itself.
+  from the topology. Used under ``--use-miles-router``; here the scraper
+  attaches the address itself. The Miles router also provides aggregation
+  for clients such as W&B that configure a single scrape endpoint.
 
 Metric names are normalized (``sglang:num_running_reqs`` from a raw engine
 equals ``sglang_num_running_reqs`` from the router aggregation), filtered by

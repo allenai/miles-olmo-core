@@ -162,7 +162,11 @@ def _trainer_runtime_env(args, spec, context):
 def _serving_environment(args, spec, context):
     env = dict(spec.env_var(context))
     env["HF_MODULES_CACHE"] = _private_hf_modules_cache()
-    env["SGLANG_EXTERNAL_MODEL_PACKAGE"] = "olmo_sglang.models"
+    env["SGLANG_EXTERNAL_MODEL_PACKAGE"] = (
+        "miles_plugins.hybrid.models"
+        if env.get("MILES_HYBRID_BRIDGE") == "1" or os.environ.get("MILES_HYBRID_BRIDGE") == "1"
+        else "olmo_sglang.models"
+    )
     if policy := getattr(args, "olmo_core_startup_cache", None):
         slot = f"{spec.name}-{context.cell_index}-{context.worker_in_cell_index}"
         env[ENV] = json.dumps({**policy, "slot": slot})

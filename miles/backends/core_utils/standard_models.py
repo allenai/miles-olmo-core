@@ -138,7 +138,7 @@ def replay_context(module, batch):
     raise ValueError("Router replay is not supported by the standard dense trainer")
 
 
-def build_train_module(args, *, common, optim, hf_config, hf_state):
+def build_train_module(args, *, common, optim, hf_config, hf_state, state_converter=None):
     validate_training_options(args)
     # AdamW updates parameters in their storage dtype and has no master weights.
     # Promote before FSDP/optimizer construction so small RL updates accumulate;
@@ -163,7 +163,10 @@ def build_train_module(args, *, common, optim, hf_config, hf_state):
             else None
         ),
     )
-    native = convert.convert_state_from_hf(hf_config, hf_state, model_type=hf_config.model_type)
+    native = (
+        state_converter(hf_config, hf_state) if state_converter is not None
+        else convert.convert_state_from_hf(hf_config, hf_state, model_type=hf_config.model_type)
+    )
     distributed_state.set_model_state_dict(
         module.model, native, options=distributed_state.StateDictOptions(full_state_dict=True, strict=True)
     )

@@ -1,10 +1,14 @@
 """Restore the serving compiler cache before importing SGLang or its models."""
 
 import importlib
+import os
 import runpy
 import sys
 
 from miles.utils.compiler_cache import startup_cache
+
+if os.environ.get("MILES_HYBRID_BRIDGE") == "1":
+    importlib.import_module("transformers_plugin").register_config()
 
 if __name__ == "__main__":
     startup_cache.setup_worker()

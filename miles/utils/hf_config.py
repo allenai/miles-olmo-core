@@ -12,6 +12,7 @@ The default behavior is exactly the same as `AutoConfig.from_pretrained`.
 """
 
 import importlib
+from importlib import util
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -58,6 +59,8 @@ def register_hf_config_aliases() -> None:
     directly before a third-party entry point that won't go through either
     (e.g. megatron's `_build_tokenizer`).
     """
+    if util.find_spec("transformers_plugin") is not None:
+        importlib.import_module("transformers_plugin").register_config()
     for alias in _CONFIG_ALIASES:
         if alias.model_type in _REGISTERED_ALIASES:
             continue

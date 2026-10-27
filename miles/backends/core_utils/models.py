@@ -30,7 +30,9 @@ def __getattr__(name):
 
 
 def model_config_from_hf(hf: Any, options: Any):
-    if options.model_config:
+    if hf.model_type == "mainline_ladder":
+        config = _backend("hybrid").model_config_from_hf(hf, options)
+    elif options.model_config:
         document = json.loads(Path(options.model_config).read_text())
         config = core_config.Config.from_dict(document.get("model", document))
         if not isinstance(config, transformer.TransformerConfig | transformer_config.OLMoDDPModelConfig):
@@ -66,9 +68,13 @@ def build_train_module(args, source=None):
     if descriptor.get("model_type") == "olmo3moe":
         _backend("moe").register_hf_classes()
     hf = load_hf_config(source, trust_remote_code=True)
+    if hf.model_type == "mainline_ladder":
+        import_module("transformers_plugin").register()
     config = model_config_from_hf(hf, args.olmo_core)
     config.init_seed = args.seed
-    kind = "moe" if isinstance(config, transformer_config.OLMoDDPModelConfig) else "standard"
+    kind = "hybrid" if hf.model_type == "mainline_ladder" else (
+        "moe" if isinstance(config, transformer_config.OLMoDDPModelConfig) else "standard"
+    )
     if getattr(args.olmo_core, "publication_mode", "barrier") == "engine_drain" and kind != "moe":
         raise ValueError("engine_drain currently requires the Core MoE trainer")
     backend = _backend(kind)

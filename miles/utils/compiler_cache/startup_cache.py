@@ -161,6 +161,9 @@ def _trainer_runtime_env(args, spec, context):
 
 def _serving_environment(args, spec, context):
     env = dict(spec.env_var(context))
+    for name in ("MILES_HYBRID_BRIDGE", "MILES_HYBRID_REFERENCE_BACKBONE"):
+        if name in os.environ:
+            env.setdefault(name, os.environ[name])
     env["HF_MODULES_CACHE"] = _private_hf_modules_cache()
     env["SGLANG_EXTERNAL_MODEL_PACKAGE"] = (
         "miles_plugins.hybrid.models"

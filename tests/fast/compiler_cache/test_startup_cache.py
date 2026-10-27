@@ -55,6 +55,18 @@ def test_serving_module_cache_is_private_even_without_compiler_cache():
     assert original["HF_MODULES_CACHE"] == "/tmp/old-shared-modules"
 
 
+def test_hybrid_serving_environment_forwards_explicit_backbone_selection(monkeypatch):
+    monkeypatch.setenv("MILES_HYBRID_BRIDGE", "1")
+    monkeypatch.setenv("MILES_HYBRID_REFERENCE_BACKBONE", "1")
+    args = SimpleNamespace(olmo_core_startup_cache=None)
+    spec = SimpleNamespace(env_var=lambda context: {})
+    env = startup._serving_environment(args, spec, None)
+    assert env["SGLANG_EXTERNAL_MODEL_PACKAGE"] == "miles_plugins.hybrid.models"
+    assert env["MILES_HYBRID_BRIDGE"] == env["MILES_HYBRID_REFERENCE_BACKBONE"] == "1"
+    override = SimpleNamespace(env_var=lambda context: {"MILES_HYBRID_REFERENCE_BACKBONE": "0"})
+    assert startup._serving_environment(args, override, None)["MILES_HYBRID_REFERENCE_BACKBONE"] == "0"
+
+
 def test_worker_restore_publish_and_rank_isolation(tmp_path, monkeypatch):
     descriptor = policy(tmp_path, restore=False)
     monkeypatch.setenv(startup.ENV, json.dumps(descriptor))

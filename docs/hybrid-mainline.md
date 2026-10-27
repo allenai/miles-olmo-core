@@ -55,9 +55,9 @@ settings. It uses per-request forwards and growing HF KV tensors, so throughput
 and allocation behavior differ substantially from a native packed SGLang model.
 All existing eager/TP1/no-prefix/no-chunking restrictions still apply.
 
-Qualification command: add `--reference-backbone --fp32-logits` to the matrix.
-For MILES, also set `core.fp32_lm_head=true` so learner and serving output precision
-agree. The output-head flag alone did not qualify the RadixAttention path at every
+Qualification command: add `--reference-backbone` to the BF16 matrix.
+If separately testing `--fp32-logits`, also set `core.fp32_lm_head=true` in MILES
+so learner and serving output precision agree. The output-head flag alone did not qualify the RadixAttention path at every
 scale. This fallback is intended to unblock temporary experiments, pending the
 same numerical and reload checks, not replace an optimized inference backend.
 

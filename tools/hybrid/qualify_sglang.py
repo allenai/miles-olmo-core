@@ -7,6 +7,7 @@ This measures serving correctness and short throughput, not RL learning quality.
 import argparse
 import gc
 import hashlib
+from importlib.metadata import version
 import json
 import os
 import signal
@@ -66,24 +67,31 @@ def generate_cases(engine, tokenizer, model, records):
     lengths = [1, 3, 31, 127, 511, 2047, 3071]
     prompts = [(unit * ((length // len(unit)) + 1))[:length] for length in lengths]
     # Mixed sequence lengths exercise packed prefill, decode scheduling, and slot reuse.
-    for batch in (prompts[:3], prompts[3:6], prompts[6:], prompts[:3]):
+    batches = [(batch, [32] * len(batch)) for batch in (prompts[:3], prompts[3:6], prompts[6:], prompts[:3])]
+    # Six requests exceed max_running_requests=4. Different completion lengths
+    # force new prefills while other requests still own recurrent state.
+    batches.append((prompts[:6], [8, 32, 16, 48, 8, 32]))
+    for batch, decode_lengths in batches:
         start = time.monotonic()
         outputs = engine.generate(
             input_ids=batch,
-            sampling_params={"temperature": 0, "max_new_tokens": 32, "ignore_eos": True},
+            sampling_params=[
+                {"temperature": 0, "max_new_tokens": count, "ignore_eos": True} for count in decode_lengths
+            ],
             return_logprob=True,
             logprob_start_len=[max(1, len(prompt) - 16) for prompt in batch],
         )
         elapsed = time.monotonic() - start
-        for prompt, output in zip(batch, outputs, strict=True):
+        for prompt, output, expected_length in zip(batch, outputs, decode_lengths, strict=True):
             meta = output["meta_info"]
             generated = [entry[1] for entry in meta["output_token_logprobs"]]
-            if len(generated) != 32:
-                raise AssertionError(f"Expected 32 cached decode tokens, got {len(generated)}")
+            if len(generated) != expected_length:
+                raise AssertionError(f"Expected {expected_length} cached decode tokens, got {len(generated)}")
             parity = compare_reference(model, prompt, generated, meta)
             records.append({"prompt_tokens": len(prompt), "decode_tokens": len(generated), **parity})
         records[-1]["batch_seconds"] = elapsed
-        records[-1]["batch_decode_tokens_per_second"] = 32 * len(batch) / elapsed
+        records[-1]["batch_output_tokens_per_second"] = sum(decode_lengths) / elapsed
+        records[-1]["queued_requests"] = len(batch) > 4
     return records
 
 
@@ -102,6 +110,14 @@ def qualify(size, output):
         "source": source,
         "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
         "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "adapter_sha256": hashlib.sha256(
+            (Path(__file__).resolve().parents[2] / "miles_plugins/hybrid/models/mainline_ladder.py").read_bytes()
+        ).hexdigest(),
+        "gpu": torch.cuda.get_device_name(),
+        "torch": torch.__version__,
+        "transformers": version("transformers"),
+        "sglang": version("sglang"),
+        "throughput_includes_prefill": True,
         "status": "RUNNING",
     }
     output.write_text(json.dumps(result, indent=2) + "\n")

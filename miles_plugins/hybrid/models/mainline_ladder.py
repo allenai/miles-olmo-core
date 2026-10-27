@@ -77,6 +77,9 @@ class MainlineLadderForCausalLM(nn.Module):
         offset = 0
         for state, length in states:
             outputs.append(layer.linear_attn(hidden[offset : offset + length].unsqueeze(0), cache_params=state)[0])
+            recurrent = state.recurrent_states[layer.linear_attn.layer_idx]
+            if recurrent is None or recurrent.dtype != torch.float32:
+                raise RuntimeError("Hybrid GDN recurrent state must remain FP32")
             offset += length
         if offset != hidden.shape[0]:
             raise ValueError("Hybrid request lengths do not match the packed tokens")

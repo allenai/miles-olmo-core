@@ -141,3 +141,18 @@ def log_step(
     output["train/step"] = clock.completed_steps - 1
     tracking.log(args, output, step_key="train/step")
     return output
+
+
+def log_skipped_batches(args, clock, rollout_id, normalizations):
+    """Record excluded optimizer batches on a collection axis, without fake steps."""
+    if dist.get_rank() != 0:
+        return None
+    excluded = [item for item in normalizations if item.active_tokens == 0]
+    output = {
+        "train_skips/rollout_id": rollout_id,
+        "train_skips/no_active_token_batches": len(excluded),
+        "train_skips/excluded_samples": sum(item.samples for item in excluded),
+        "train_skips/completed_steps": clock.completed_steps,
+    }
+    tracking.log(args, output, step_key="train_skips/rollout_id")
+    return output

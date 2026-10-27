@@ -287,37 +287,63 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                 self._agree(lambda: policy_refresh.validate_batch(rollout))
             versions = self._agree(lambda: data.policy_versions(rollout))
             self._agree(lambda: self.clock.validate_versions(versions, self.args.olmo_core.max_policy_lag))
-            decision = self._scoring_pass()
-            checked = self._scoring_check_due(decision)
-            standalone = decision.standalone or checked
-            if not decision.standalone and len(steps) != 1:
-                raise ValueError("Skipping the standalone scoring pass requires one optimizer step per collection")
-            difference = agreement = profile = None
-            if standalone:
-                torch.cuda.synchronize()
-                score_started = time.perf_counter()
-                rollout["log_probs"] = self._score(self.train_module, batches, use_replay=True)
-                torch.cuda.synchronize()
-                contract.record(
-                    self.args,
-                    {
-                        "event": "score_timing",
-                        "rollout_id": rollout_id,
-                        "seconds": time.perf_counter() - score_started,
-                        "model_tokens": sum(batch["tokens"].numel() for batch in batches),
-                        "row_specialization": self.args.olmo_core.row_specialization,
-                    },
-                )
-                difference, agreement, profile = self._score_contract(rollout, rollout_id, "standalone")
-            if self.ref_module is not None:
-                rollout["ref_log_probs"] = self._score(self.ref_module, batches, use_replay=False)
-            with self._actor_forward_skipped(not standalone):
-                self._train_steps(rollout, rollout_id, local_batch, decision, checked, difference, agreement, profile)
+            self._agree(lambda: contract.validate_training_data(rollout))
+            normalizations = [
+                contract.step_normalization(step, self.args.global_batch_size, allow_empty=True) for step in steps
+            ]
+            for index, normalization in enumerate(normalizations):
+                if normalization.active_tokens == 0:
+                    logger.info(
+                        "Core optimizer batch skipped: %s",
+                        contract.record(
+                            self.args,
+                            {
+                                "event": "optimizer_skipped",
+                                "reason": "no_active_tokens",
+                                "rollout_id": rollout_id,
+                                "batch_index": index,
+                                "step": self.clock.completed_steps,
+                                "normalization": vars(normalization),
+                            },
+                        ),
+                    )
+            self._agree(lambda: training_metrics.log_skipped_batches(self.args, self.clock, rollout_id, normalizations))
+            if any(item.active_tokens for item in normalizations):
+                decision = self._scoring_pass()
+                checked = self._scoring_check_due(decision)
+                standalone = decision.standalone or checked
+                if not decision.standalone and len(steps) != 1:
+                    raise ValueError("Skipping the standalone scoring pass requires one optimizer step per collection")
+                difference = agreement = profile = None
+                if standalone:
+                    torch.cuda.synchronize()
+                    score_started = time.perf_counter()
+                    rollout["log_probs"] = self._score(self.train_module, batches, use_replay=True)
+                    torch.cuda.synchronize()
+                    contract.record(
+                        self.args,
+                        {
+                            "event": "score_timing",
+                            "rollout_id": rollout_id,
+                            "seconds": time.perf_counter() - score_started,
+                            "model_tokens": sum(batch["tokens"].numel() for batch in batches),
+                            "row_specialization": self.args.olmo_core.row_specialization,
+                        },
+                    )
+                    difference, agreement, profile = self._score_contract(rollout, rollout_id, "standalone")
+                if self.ref_module is not None:
+                    rollout["ref_log_probs"] = self._score(self.ref_module, batches, use_replay=False)
+                with self._actor_forward_skipped(not standalone):
+                    self._train_steps(
+                        rollout, rollout_id, local_batch, decision, checked, difference, agreement, profile, normalizations
+                    )
             self.clock.next_rollout_id = rollout_id + 1
         self._heartbeat.bump()
         return TrainStepOutput(outcome=cast(TrainStepOutcome, TrainStepOutcome.NORMAL))
 
-    def _train_steps(self, rollout, rollout_id, local_batch, decision, checked, difference, agreement, profile):
+    def _train_steps(
+        self, rollout, rollout_id, local_batch, decision, checked, difference, agreement, profile, normalizations
+    ):
         # Without the standalone pass, old log-probabilities come from the training
         # forward itself. That is exact only at unchanged weights, which the caller
         # guarantees by admitting exactly one optimizer step per collection.
@@ -326,7 +352,9 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         miles_loss.compute_advantages_and_returns(self.args, rollout)
         self._agree(lambda: contract.validate_training_data(rollout))
         advantages = training_metrics.advantage_metrics(rollout)
-        for step_batches in self._batch_steps(rollout):
+        for step_batches, normalization in zip(self._batch_steps(rollout), normalizations, strict=True):
+            if normalization.active_tokens == 0:
+                continue
             expert_metrics = None
             if self.args.olmo_core.expert_balanced_packing:
                 local_loads = self._agree(lambda batches=step_batches: expert_schedule.local_loads(self.args, batches))
@@ -363,7 +391,6 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             self._agree(
                 lambda current=step_versions: self.clock.validate_versions(current, self.args.olmo_core.max_policy_lag)
             )
-            normalization = contract.step_normalization(step_batches, self.args.global_batch_size)
             for batch in step_batches:
                 batch["aux_loss_div_factor"] = normalization.auxiliary_denominator
                 batch["aux_loss_response_div_factor"] = normalization.samples / normalization.world_size

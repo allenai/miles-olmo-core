@@ -19,7 +19,7 @@ from miles.ray.rollout.cell_state import (
     StateServing,
     StateUninitialized,
 )
-from miles.utils import infra_timeouts
+from miles.utils import infra_timeouts, weight_check_utils
 from miles.utils.ft_utils.api_server.models import CellCondition, CellStatus, TriState
 from miles.utils.ft_utils.health_checker import (
     ActiveAndEpoch,
@@ -275,7 +275,10 @@ class ServerCell:
 
     async def check_weights(self, action: str, allow_quant_error: bool, selector: str, skip_list: list[str] | None):
         return await self.api_client.check_weights(
-            action=action, allow_quant_error=allow_quant_error, selector=selector, skip_list=skip_list
+            action=action,
+            allow_quant_error=allow_quant_error,
+            selector=selector,
+            skip_list=weight_check_utils.skip_list_for_action(self.args, action, skip_list),
         )
 
 

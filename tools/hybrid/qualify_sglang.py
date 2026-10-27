@@ -121,9 +121,9 @@ def qualify(size, output):
             disable_cuda_graph=True,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
-            max_running_requests=8,
+            max_running_requests=4,
             context_length=4096,
-            mem_fraction_static=0.45,
+            mem_fraction_static=0.35,
             random_seed=1,
         )
         result["startup_seconds"] = time.monotonic() - started

@@ -184,6 +184,10 @@ def _private_hf_modules_cache():
 
 
 def _serving_command(spec, context):
+    # ServerArgs resolves the HF config in this manager process while rendering
+    # argv, before the serving child's own registration hook can run.
+    if spec.env_var(context).get("MILES_HYBRID_BRIDGE", os.environ.get("MILES_HYBRID_BRIDGE")) == "1":
+        importlib.import_module("transformers_plugin").register_config()
     command = shlex.split(spec.launch_command(context))
     module_index = command.index("-m") + 1
     if command[module_index] != "sglang.launch_server":

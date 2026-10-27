@@ -67,6 +67,29 @@ def test_hybrid_serving_environment_forwards_explicit_backbone_selection(monkeyp
     assert startup._serving_environment(args, override, None)["MILES_HYBRID_REFERENCE_BACKBONE"] == "0"
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_hybrid_registration_precedes_manager_server_args_resolution(monkeypatch, enabled):
+    monkeypatch.delenv("MILES_HYBRID_BRIDGE", raising=False)
+    registered = []
+    plugin = SimpleNamespace(register_config=lambda: registered.append(True))
+    importer = mock.Mock(return_value=plugin)
+    monkeypatch.setattr(startup.importlib, "import_module", importer)
+
+    def resolve_command(context):
+        assert bool(registered) is enabled
+        return "python -m sglang.launch_server --model-path /checkpoint"
+
+    spec = SimpleNamespace(
+        env_var=lambda context: {"MILES_HYBRID_BRIDGE": "1" if enabled else "0"},
+        launch_command=resolve_command,
+    )
+    assert "-m miles.utils.compiler_cache.serving" in startup._serving_command(spec, None)
+    if enabled:
+        importer.assert_called_once_with("transformers_plugin")
+    else:
+        importer.assert_not_called()
+
+
 def test_worker_restore_publish_and_rank_isolation(tmp_path, monkeypatch):
     descriptor = policy(tmp_path, restore=False)
     monkeypatch.setenv(startup.ENV, json.dumps(descriptor))

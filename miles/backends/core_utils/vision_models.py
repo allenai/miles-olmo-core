@@ -54,9 +54,11 @@ def read_hf_state(source):
         mapping, files = None, ["model.safetensors"]
     state = {}
     for name in files:
-        path = (source / name).resolve()
-        if path.parent != source.resolve():
-            raise ValueError("Checkpoint shards must live in the checkpoint directory")
+        if not isinstance(name, str) or Path(name).name != name or name in ("", ".", ".."):
+            raise ValueError("Checkpoint shard names must be plain filenames")
+        # The structured workflow stages immutable HF shards as symlinks.
+        # Validate index names without rejecting those trusted local references.
+        path = source / name
         shard = safetensors_torch.load_file(str(path))
         if state.keys() & shard.keys():
             raise ValueError("Duplicate checkpoint tensors across shards")

@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import signal
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -147,6 +148,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--size", choices=["all", *STEPS], default="all")
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--mirror-dir", type=Path)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.size == "all":
@@ -165,12 +167,16 @@ def main():
                     os.killpg(run.pid, signal.SIGKILL)
                     run.wait()
                     code = 124
+            if args.mirror_dir:
+                shutil.copytree(args.output_dir, args.mirror_dir, dirs_exist_ok=True)
             print(json.dumps({"size": size, "exit_code": code}), flush=True)
             if code:
                 failures.append(size)
         (args.output_dir / "summary.json").write_text(
             json.dumps({"failed": failures, "sizes": list(STEPS)}, indent=2) + "\n"
         )
+        if args.mirror_dir:
+            shutil.copytree(args.output_dir, args.mirror_dir, dirs_exist_ok=True)
         return bool(failures)
     output = args.output_dir / f"{args.size}.json"
     try:

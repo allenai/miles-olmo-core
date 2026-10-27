@@ -720,10 +720,14 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         ):
             tensor_count += 1
             byte_count += tensor.nbytes
-            if bucket and size + tensor.nbytes > self.args.update_weight_buffer_size:
+            if bucket and (
+                size + tensor.nbytes > self.args.update_weight_buffer_size or size % tensor.element_size()
+            ):
                 send(bucket)
                 bucket, size = [], 0
-            bucket.append((name, tensor.to(device="cuda", dtype=torch.bfloat16).contiguous()))
+            # KDA decay parameters are genuinely FP32, unlike BF16 model weights.
+            # Preserve their values and wire dtype; byte buckets support both.
+            bucket.append((name, tensor.to(device="cuda").contiguous()))
             size += tensor.nbytes
         if bucket:
             send(bucket)

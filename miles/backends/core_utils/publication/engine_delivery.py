@@ -71,15 +71,15 @@ def capture(actor):
         if name in names_seen or tensor.numel() == 0:
             raise ValueError(f"invalid snapshot tensor {name}")
         names_seen.add(name)
-        nbytes = tensor.numel() * 2
-        if size and size + nbytes > actor.args.update_weight_buffer_size:
+        nbytes = tensor.nbytes
+        if size and (size + nbytes > actor.args.update_weight_buffer_size or size % tensor.element_size()):
             actor._agree(flush)
             bucket, size = [], 0
         if dist.get_rank() == 0:
             # Exporters may reuse scratch storage on the next iteration. Own
             # each tensor immediately, but retain at most one GPU bucket rather
             # than a complete extra model. The packed CPU array is frozen by Ray.
-            bucket.append((name, tensor.detach().to(dtype=torch.bfloat16, copy=True).contiguous()))
+            bucket.append((name, tensor.detach().clone().contiguous()))
         size += nbytes
         total += nbytes
     if size:

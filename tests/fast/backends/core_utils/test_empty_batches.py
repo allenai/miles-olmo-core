@@ -12,6 +12,8 @@ from torch import multiprocessing as mp
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
+pytest.importorskip("olmo_core")
+
 from miles.backends.core_utils import actor, contract, metrics
 from miles.backends.core_utils.publication.state import PolicyClock
 

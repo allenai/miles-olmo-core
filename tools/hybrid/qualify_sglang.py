@@ -101,6 +101,7 @@ def qualify(size, output):
         "size": size,
         "source": source,
         "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "status": "RUNNING",
     }
     output.write_text(json.dumps(result, indent=2) + "\n")
@@ -147,13 +148,15 @@ def qualify(size, output):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--size", choices=["all", *STEPS], default="all")
+    parser.add_argument("--sizes", choices=list(STEPS), nargs="+")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--mirror-dir", type=Path)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.size == "all":
         failures = []
-        for size in STEPS:
+        selected = args.sizes or list(STEPS)
+        for size in selected:
             with (args.output_dir / f"{size}.log").open("w") as log:
                 try:
                     run = subprocess.Popen(
@@ -173,7 +176,7 @@ def main():
             if code:
                 failures.append(size)
         (args.output_dir / "summary.json").write_text(
-            json.dumps({"failed": failures, "sizes": list(STEPS)}, indent=2) + "\n"
+            json.dumps({"failed": failures, "sizes": selected}, indent=2) + "\n"
         )
         if args.mirror_dir:
             shutil.copytree(args.output_dir, args.mirror_dir, dirs_exist_ok=True)

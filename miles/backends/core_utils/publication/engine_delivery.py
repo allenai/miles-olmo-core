@@ -66,6 +66,7 @@ def capture(actor):
         actor.hf_config,
         stream_moe=actor.args.olmo_core.stream_moe_export,
         fused_experts=actor.args.olmo_core.expert_publication == "fused",
+        for_publication=True,
     ):
         if name in names_seen or tensor.numel() == 0:
             raise ValueError(f"invalid snapshot tensor {name}")

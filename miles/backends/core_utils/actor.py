@@ -222,7 +222,10 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         forward = getattr(module, "model_forward_no_pipeline", None) or module.model_forward
         boundaries = {key: batch[key] for key in ("doc_lens", "max_doc_lens") if key in batch}
         return forward(
-            batch["tokens"], loss_div_factor=batch.get("aux_loss_div_factor", batch["tokens"].numel()), **boundaries
+            batch["tokens"],
+            loss_div_factor=batch.get("aux_loss_div_factor", batch["tokens"].numel()),
+            **boundaries,
+            **models.conditioning_inputs(module, batch),
         )
 
     def _batch_steps(self, rollout):
@@ -688,6 +691,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             self.hf_config,
             stream_moe=self.args.olmo_core.stream_moe_export,
             fused_experts=self.args.olmo_core.expert_publication == "fused",
+            for_publication=True,
         ):
             tensor_count += 1
             byte_count += tensor.nbytes

@@ -36,7 +36,8 @@ def model_config_from_hf(hf: Any, options: Any):
         if not isinstance(config, transformer.TransformerConfig | transformer_config.OLMoDDPModelConfig):
             raise ValueError("core.model_config must describe a Core transformer")
     else:
-        config = _backend("moe" if hf.model_type == "olmo3moe" else "standard").model_config_from_hf(hf, options)
+        kind = {"olmo3moe": "moe", "olmo3moe_vision": "vision"}.get(hf.model_type, "standard")
+        config = _backend(kind).model_config_from_hf(hf, options)
     if getattr(options, "fp32_lm_head", False):
         if not hasattr(config.lm_head, "fp32_output"):
             raise ValueError("core.fp32_lm_head requires the updated OLMo-core runtime; rebuild the image")
@@ -69,11 +70,13 @@ def build_train_module(args, source=None):
     config = model_config_from_hf(hf, args.olmo_core)
     config.init_seed = args.seed
     kind = "moe" if isinstance(config, transformer_config.OLMoDDPModelConfig) else "standard"
+    if hf.model_type == "olmo3moe_vision":
+        kind = "vision"
     if getattr(args.olmo_core, "publication_mode", "barrier") == "engine_drain" and kind != "moe":
         raise ValueError("engine_drain currently requires the Core MoE trainer")
     backend = _backend(kind)
     backend.validate_training_options(args)
-    if kind == "moe":
+    if kind in ("moe", "vision"):
         backend.prepare_model_config(config, hf, args.olmo_core)
     model = config.build(init_device="meta")
     forward_capacity = args.olmo_core.packing_max_tokens or args.olmo_core.max_sequence_length
@@ -85,17 +88,15 @@ def build_train_module(args, source=None):
         device=torch.device("cuda", torch.cuda.current_device()),
         max_grad_norm=args.clip_grad,
     )
-    optim = dict(
-        lr=args.lr, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps, weight_decay=args.weight_decay
-    )
+    optim = dict(lr=args.lr, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps, weight_decay=args.weight_decay)
     with startup_stage(args, "hf_read"):
-        hf_model = transformers.AutoModelForCausalLM.from_pretrained(
-            source, trust_remote_code=True, torch_dtype=torch.bfloat16
-        )
+        if kind == "vision":
+            hf_state = backend.read_hf_state(source)
+        else:
+            hf_model = transformers.AutoModelForCausalLM.from_pretrained(source, trust_remote_code=True, torch_dtype=torch.bfloat16)
+            hf_state = hf_model.state_dict()
     with startup_stage(args, "native_model_optimizer_build", device=torch.cuda):
-        module = backend.build_train_module(
-            args, common=common, optim=optim, hf_config=hf, hf_state=hf_model.state_dict()
-        )
+        module = backend.build_train_module(args, common=common, optim=optim, hf_config=hf, hf_state=hf_state)
     router_objective.install(module.model, args.olmo_core)
     module._trainer = MetricSink()
     module._miles_model_backend = kind
@@ -103,18 +104,27 @@ def build_train_module(args, source=None):
     # exposes unsharded Parameters during scoring, then releases their storage
     # after backward. Diagnostics must retain the persistent local shards.
     module._miles_named_parameters = list(module.model.named_parameters())
-    del hf_model
     return module, hf, config
 
 
-def iter_export_state(module, hf, *, stream_moe=True, fused_experts=False):
+def iter_export_state(module, hf, *, stream_moe=True, fused_experts=False, for_publication=False):
     """Yield HF weights through the selected trainer's native conversion path.
 
     ``fused_experts`` yields routed experts stacked per layer in the serving
     engine's layout, for publication only; HF exports keep per-expert slices.
     """
     kind = getattr(module, "_miles_model_backend", "moe" if hf.model_type == "olmo3moe" else "standard")
-    yield from _backend(kind).iter_export_state(module, hf, stream_moe=stream_moe, fused_experts=fused_experts)
+    extra = {"for_publication": for_publication} if kind == "vision" else {}
+    yield from _backend(kind).iter_export_state(module, hf, stream_moe=stream_moe, fused_experts=fused_experts, **extra)
+
+
+def conditioning_inputs(module, batch):
+    """Build differentiable conditioning for the selected model backend."""
+    if getattr(module, "_miles_model_backend", None) == "vision":
+        return _backend("vision").conditioning_inputs(module, batch)
+    if batch.get("multimodal_train_inputs"):
+        raise ValueError("Image tensors require the vision trainer backend")
+    return {}
 
 
 def export_state(module, hf):

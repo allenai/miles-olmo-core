@@ -254,6 +254,7 @@ def main():
                             str(args.output_dir),
                             *(["--distribution-only"] if args.distribution_only else []),
                             *(["--fp32-logits"] if args.fp32_logits else []),
+                            *(["--reference-backbone"] if args.reference_backbone else []),
                         ],
                         stdout=log,
                         stderr=subprocess.STDOUT,

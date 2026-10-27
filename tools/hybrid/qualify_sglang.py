@@ -25,7 +25,7 @@ from transformers_plugin import register
 
 from miles.utils.processing_utils import load_tokenizer
 from miles_plugins.hybrid.qualification import align_logprobs
-from miles_plugins.hybrid.reference import FP32Head
+from miles_plugins.hybrid.reference import FP32Head, cached_logprobs
 
 register()
 os.environ["SGLANG_EXTERNAL_MODEL_PACKAGE"] = "miles_plugins.hybrid.models"
@@ -43,7 +43,8 @@ def compare_reference(model, prompt, generated, meta):
     with torch.inference_mode():
         logits = model(inputs, use_cache=False, logits_to_keep=len(tokens) - first + 1).logits[0].float()
     # The final logit predicts beyond the supplied sequence and has no target.
-    scores = logits[:-1].log_softmax(-1)
+    full_scores = logits[:-1].log_softmax(-1)
+    scores = cached_logprobs(model, prompt, generated, first_position=first)
     targets = torch.tensor([tokens[position] for position in positions], device="cuda")
     row_indices = torch.tensor([position - first for position in positions], device="cuda")
     expected = scores[row_indices].gather(-1, targets[:, None]).squeeze(-1).cpu()
@@ -57,7 +58,12 @@ def compare_reference(model, prompt, generated, meta):
     agreement = (gap <= 0.01).float().mean().item()
     if error > 0.08 or agreement < 0.95:
         raise AssertionError(f"HF parity failed: max logprob error={error}, greedy agreement={agreement}")
-    return {"max_logprob_error": error, "greedy_agreement_within_0.01": agreement}
+    full_expected = full_scores[row_indices].gather(-1, targets[:, None]).squeeze(-1).cpu()
+    return {
+        "max_logprob_error": error,
+        "greedy_agreement_within_0.01": agreement,
+        "full_sequence_max_logprob_error": (full_expected - actual).abs().max().item(),
+    }
 
 
 def generate_cases(engine, tokenizer, model, records):
@@ -76,9 +82,7 @@ def generate_cases(engine, tokenizer, model, records):
         start = time.monotonic()
         outputs = engine.generate(
             input_ids=batch,
-            sampling_params=[
-                {"temperature": 0, "max_new_tokens": count, "ignore_eos": True} for count in decode_lengths
-            ],
+            sampling_params=[{"temperature": 0, "max_new_tokens": count, "ignore_eos": True} for count in decode_lengths],
             return_logprob=True,
             logprob_start_len=[max(1, len(prompt) - 16) for prompt in batch],
         )
@@ -97,7 +101,7 @@ def generate_cases(engine, tokenizer, model, records):
 
 
 def probe_distributions(engine, tokenizer, model, records):
-    """Compare every vocabulary probability at prefill and one cached decode step."""
+    """Compare every vocabulary probability against HF cached decode and full evaluation."""
     vocab = list(range(model.config.vocab_size))
     unit = tokenizer.encode(
         "Question: Natalia sold 48 clips in April and half as many in May. How many in total? Answer:",
@@ -124,14 +128,19 @@ def probe_distributions(engine, tokenizer, model, records):
             reference = model(inputs, use_cache=False, logits_to_keep=decode_steps).logits[0].float().log_softmax(-1)
         if not torch.isfinite(served).all() or served.logsumexp(-1).abs().max().item() > 1e-4:
             raise AssertionError("Serving full-vocabulary probabilities are not finite and normalized")
-        kl = (served.exp() * (served - reference)).sum(-1).clamp_min(0)
-        tv = (served.exp() - reference.exp()).abs().sum(-1) / 2
+        cached = cached_logprobs(model, prompt, generated)
+        full_kl = (served.exp() * (served - reference)).sum(-1).clamp_min(0)
+        self_kl = (cached.exp() * (cached - reference)).sum(-1).clamp_min(0)
+        kl = (served.exp() * (served - cached)).sum(-1).clamp_min(0)
+        tv = (served.exp() - cached.exp()).abs().sum(-1) / 2
         record = {
             "prompt_tokens": length,
             "prefill_kl": kl[0].item(),
             "cached_decode_kl": kl[1:].max().item(),
             "decode_steps": decode_steps,
             "max_tv": tv.max().item(),
+            "full_sequence_max_kl": full_kl.max().item(),
+            "hf_cached_vs_full_max_kl": self_kl.max().item(),
         }
         records.append(record)
         if kl.max().item() > 0.001:
@@ -142,6 +151,7 @@ def qualify(size, output, distribution_only=False, fp32_logits=False):
     # Optional GPU dependency: import only in the model subprocess, after config registration.
     import sglang
 
+    torch.set_num_threads(4)
     source = f"{ROOT}/{size}/midtrain/step{STEPS[size]}"
     config_bytes = (Path(source) / "config.json").read_bytes()
     descriptor = json.loads(config_bytes)
@@ -153,9 +163,7 @@ def qualify(size, output, distribution_only=False, fp32_logits=False):
         "source": source,
         "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
         "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "adapter_sha256": hashlib.sha256(
-            (Path(__file__).resolve().parents[2] / "miles_plugins/hybrid/models/mainline_ladder.py").read_bytes()
-        ).hexdigest(),
+        "adapter_sha256": hashlib.sha256((Path(__file__).resolve().parents[2] / "miles_plugins/hybrid/models/mainline_ladder.py").read_bytes()).hexdigest(),
         "gpu": torch.cuda.get_device_name(),
         "torch": torch.__version__,
         "transformers": version("transformers"),
@@ -163,13 +171,12 @@ def qualify(size, output, distribution_only=False, fp32_logits=False):
         "throughput_includes_prefill": True,
         "qualification_mode": "distribution_only" if distribution_only else "complete",
         "fp32_logits": fp32_logits,
+        "reference_mode": "hf_cached_decode_with_full_sequence_diagnostic",
         "status": "RUNNING",
     }
     output.write_text(json.dumps(result, indent=2) + "\n")
     tokenizer = load_tokenizer(source)
-    model = (
-        AutoModelForCausalLM.from_pretrained(source, dtype=torch.bfloat16, attn_implementation="sdpa").cuda().eval()
-    )
+    model = AutoModelForCausalLM.from_pretrained(source, dtype=torch.bfloat16, attn_implementation="sdpa").cuda().eval()
     if fp32_logits:
         model.lm_head = FP32Head(model.lm_head)
     started = time.monotonic()
@@ -256,9 +263,7 @@ def main():
             print(json.dumps({"size": size, "exit_code": code}), flush=True)
             if code:
                 failures.append(size)
-        (args.output_dir / "summary.json").write_text(
-            json.dumps({"failed": failures, "sizes": selected}, indent=2) + "\n"
-        )
+        (args.output_dir / "summary.json").write_text(json.dumps({"failed": failures, "sizes": selected}, indent=2) + "\n")
         if args.mirror_dir:
             shutil.copytree(args.output_dir, args.mirror_dir, dirs_exist_ok=True)
         return bool(failures)

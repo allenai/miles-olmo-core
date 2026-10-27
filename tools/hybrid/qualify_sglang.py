@@ -95,7 +95,44 @@ def generate_cases(engine, tokenizer, model, records):
     return records
 
 
-def qualify(size, output):
+def probe_distributions(engine, tokenizer, model, records):
+    """Compare every vocabulary probability at prefill and one cached decode step."""
+    vocab = list(range(model.config.vocab_size))
+    unit = tokenizer.encode("Question: What is 12 plus 30? Answer:", add_special_tokens=False)
+    for length in (3, 511, 3071):
+        prompt = (unit * (length // len(unit) + 1))[:length]
+        output = engine.generate(
+            input_ids=prompt,
+            sampling_params={"temperature": 0, "max_new_tokens": 2, "ignore_eos": True},
+            return_logprob=True,
+            logprob_start_len=len(prompt) - 1,
+            token_ids_logprob=vocab,
+        )
+        metadata = output["meta_info"]
+        generated = [entry[1] for entry in metadata["output_token_logprobs"]]
+        dense = metadata["output_token_ids_logprobs"]
+        if len(dense) != 2 or any([entry[1] for entry in row] != vocab for row in dense):
+            raise AssertionError("Full-vocabulary logprobs must cover every token at both steps")
+        served = torch.tensor([[entry[0] for entry in row] for row in dense], device="cuda")
+        with torch.inference_mode():
+            inputs = torch.tensor([prompt + generated[:-1]], device="cuda")
+            reference = model(inputs, use_cache=False, logits_to_keep=2).logits[0].float().log_softmax(-1)
+        if not torch.isfinite(served).all() or served.logsumexp(-1).abs().max().item() > 1e-4:
+            raise AssertionError("Serving full-vocabulary probabilities are not finite and normalized")
+        kl = (served.exp() * (served - reference)).sum(-1).clamp_min(0)
+        tv = (served.exp() - reference.exp()).abs().sum(-1) / 2
+        record = {
+            "prompt_tokens": length,
+            "prefill_kl": kl[0].item(),
+            "cached_decode_kl": kl[1].item(),
+            "max_tv": tv.max().item(),
+        }
+        records.append(record)
+        if kl.max().item() > 0.001:
+            raise AssertionError(f"Full-vocabulary KL exceeds 0.001: {record}")
+
+
+def qualify(size, output, distribution_only=False):
     # Optional GPU dependency: import only in the model subprocess, after config registration.
     import sglang
 
@@ -118,6 +155,7 @@ def qualify(size, output):
         "transformers": version("transformers"),
         "sglang": version("sglang"),
         "throughput_includes_prefill": True,
+        "qualification_mode": "distribution_only" if distribution_only else "complete",
         "status": "RUNNING",
     }
     output.write_text(json.dumps(result, indent=2) + "\n")
@@ -143,13 +181,19 @@ def qualify(size, output):
             random_seed=1,
         )
         result["startup_seconds"] = time.monotonic() - started
+        result["distribution_probes"] = []
+        probe_distributions(engine, tokenizer, model, result["distribution_probes"])
         result["cases"] = []
-        generate_cases(engine, tokenizer, model, result["cases"])
+        if not distribution_only:
+            generate_cases(engine, tokenizer, model, result["cases"])
         updated = engine.update_weights_from_disk(source)
         if not updated[0]:
             raise AssertionError(f"Weight reload failed: {updated}")
         result["after_reload"] = []
-        generate_cases(engine, tokenizer, model, result["after_reload"])
+        if not distribution_only:
+            generate_cases(engine, tokenizer, model, result["after_reload"])
+        result["distribution_probes_after_reload"] = []
+        probe_distributions(engine, tokenizer, model, result["distribution_probes_after_reload"])
         result["status"] = "PASSED"
     finally:
         if engine is not None:
@@ -167,6 +211,7 @@ def main():
     parser.add_argument("--sizes", choices=list(STEPS), nargs="+")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--mirror-dir", type=Path)
+    parser.add_argument("--distribution-only", action="store_true")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.size == "all":
@@ -199,7 +244,7 @@ def main():
         return bool(failures)
     output = args.output_dir / f"{args.size}.json"
     try:
-        qualify(args.size, output)
+        qualify(args.size, output, distribution_only=args.distribution_only)
     except Exception:
         report = json.loads(output.read_text()) if output.exists() else {"size": args.size}
         report.update(status="FAILED", error=traceback.format_exc())

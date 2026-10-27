@@ -25,6 +25,7 @@ from transformers_plugin import register
 
 from miles.utils.processing_utils import load_tokenizer
 from miles_plugins.hybrid.qualification import align_logprobs
+from miles_plugins.hybrid.reference import FP32Head
 
 register()
 os.environ["SGLANG_EXTERNAL_MODEL_PACKAGE"] = "miles_plugins.hybrid.models"
@@ -137,7 +138,7 @@ def probe_distributions(engine, tokenizer, model, records):
             raise AssertionError(f"Full-vocabulary KL exceeds 0.001: {record}")
 
 
-def qualify(size, output, distribution_only=False):
+def qualify(size, output, distribution_only=False, fp32_logits=False):
     # Optional GPU dependency: import only in the model subprocess, after config registration.
     import sglang
 
@@ -161,6 +162,7 @@ def qualify(size, output, distribution_only=False):
         "sglang": version("sglang"),
         "throughput_includes_prefill": True,
         "qualification_mode": "distribution_only" if distribution_only else "complete",
+        "fp32_logits": fp32_logits,
         "status": "RUNNING",
     }
     output.write_text(json.dumps(result, indent=2) + "\n")
@@ -168,6 +170,8 @@ def qualify(size, output, distribution_only=False):
     model = (
         AutoModelForCausalLM.from_pretrained(source, dtype=torch.bfloat16, attn_implementation="sdpa").cuda().eval()
     )
+    if fp32_logits:
+        model.lm_head = FP32Head(model.lm_head)
     started = time.monotonic()
     engine = None
     try:
@@ -177,6 +181,7 @@ def qualify(size, output, distribution_only=False):
             tp_size=1,
             pp_size=1,
             attention_backend="triton",
+            enable_fp32_lm_head=fp32_logits,
             disable_cuda_graph=True,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
@@ -217,6 +222,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--mirror-dir", type=Path)
     parser.add_argument("--distribution-only", action="store_true")
+    parser.add_argument("--fp32-logits", action="store_true")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.size == "all":
@@ -234,6 +240,7 @@ def main():
                             "--output-dir",
                             str(args.output_dir),
                             *(["--distribution-only"] if args.distribution_only else []),
+                            *(["--fp32-logits"] if args.fp32_logits else []),
                         ],
                         stdout=log,
                         stderr=subprocess.STDOUT,
@@ -257,7 +264,7 @@ def main():
         return bool(failures)
     output = args.output_dir / f"{args.size}.json"
     try:
-        qualify(args.size, output, distribution_only=args.distribution_only)
+        qualify(args.size, output, distribution_only=args.distribution_only, fp32_logits=args.fp32_logits)
     except Exception:
         report = json.loads(output.read_text()) if output.exists() else {"size": args.size}
         report.update(status="FAILED", error=traceback.format_exc())

@@ -164,7 +164,8 @@ def build_train_module(args, *, common, optim, hf_config, hf_state, state_conver
         ),
     )
     native = (
-        state_converter(hf_config, hf_state) if state_converter is not None
+        state_converter(hf_config, hf_state)
+        if state_converter is not None
         else convert.convert_state_from_hf(hf_config, hf_state, model_type=hf_config.model_type)
     )
     distributed_state.set_model_state_dict(

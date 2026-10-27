@@ -98,12 +98,16 @@ def generate_cases(engine, tokenizer, model, records):
 def probe_distributions(engine, tokenizer, model, records):
     """Compare every vocabulary probability at prefill and one cached decode step."""
     vocab = list(range(model.config.vocab_size))
-    unit = tokenizer.encode("Question: What is 12 plus 30? Answer:", add_special_tokens=False)
-    for length in (3, 511, 3071):
+    unit = tokenizer.encode(
+        "Question: Natalia sold 48 clips in April and half as many in May. How many in total? Answer:",
+        add_special_tokens=False,
+    )
+    for length in (1, 3, 511, 3071):
+        decode_steps = 32 if length <= 3 else 2
         prompt = (unit * (length // len(unit) + 1))[:length]
         output = engine.generate(
             input_ids=prompt,
-            sampling_params={"temperature": 0, "max_new_tokens": 2, "ignore_eos": True},
+            sampling_params={"temperature": 0, "max_new_tokens": decode_steps, "ignore_eos": True},
             return_logprob=True,
             logprob_start_len=len(prompt) - 1,
             token_ids_logprob=vocab,
@@ -111,12 +115,12 @@ def probe_distributions(engine, tokenizer, model, records):
         metadata = output["meta_info"]
         generated = [entry[1] for entry in metadata["output_token_logprobs"]]
         dense = metadata["output_token_ids_logprobs"]
-        if len(dense) != 2 or any([entry[1] for entry in row] != vocab for row in dense):
+        if len(dense) != decode_steps or any([entry[1] for entry in row] != vocab for row in dense):
             raise AssertionError("Full-vocabulary logprobs must cover every token at both steps")
         served = torch.tensor([[entry[0] for entry in row] for row in dense], device="cuda")
         with torch.inference_mode():
             inputs = torch.tensor([prompt + generated[:-1]], device="cuda")
-            reference = model(inputs, use_cache=False, logits_to_keep=2).logits[0].float().log_softmax(-1)
+            reference = model(inputs, use_cache=False, logits_to_keep=decode_steps).logits[0].float().log_softmax(-1)
         if not torch.isfinite(served).all() or served.logsumexp(-1).abs().max().item() > 1e-4:
             raise AssertionError("Serving full-vocabulary probabilities are not finite and normalized")
         kl = (served.exp() * (served - reference)).sum(-1).clamp_min(0)
@@ -124,7 +128,8 @@ def probe_distributions(engine, tokenizer, model, records):
         record = {
             "prompt_tokens": length,
             "prefill_kl": kl[0].item(),
-            "cached_decode_kl": kl[1].item(),
+            "cached_decode_kl": kl[1:].max().item(),
+            "decode_steps": decode_steps,
             "max_tv": tv.max().item(),
         }
         records.append(record)
@@ -221,7 +226,15 @@ def main():
             with (args.output_dir / f"{size}.log").open("w") as log:
                 try:
                     run = subprocess.Popen(
-                        [sys.executable, __file__, "--size", size, "--output-dir", str(args.output_dir)],
+                        [
+                            sys.executable,
+                            __file__,
+                            "--size",
+                            size,
+                            "--output-dir",
+                            str(args.output_dir),
+                            *(["--distribution-only"] if args.distribution_only else []),
+                        ],
                         stdout=log,
                         stderr=subprocess.STDOUT,
                         start_new_session=True,

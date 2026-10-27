@@ -50,9 +50,7 @@ def native_to_hf_names(layer_types):
         if kind not in ("linear_attention", "full_attention"):
             raise ValueError(f"Unsupported hybrid layer type: {kind}")
         layer = dict(_HYBRID_SMALL_COMMON_LAYER_TO_HF)
-        layer.update(
-            _HYBRID_SMALL_GDN_LAYER_TO_HF if kind == "linear_attention" else _HYBRID_SMALL_FULL_ATTN_LAYER_TO_HF
-        )
+        layer.update(_HYBRID_SMALL_GDN_LAYER_TO_HF if kind == "linear_attention" else _HYBRID_SMALL_FULL_ATTN_LAYER_TO_HF)
         mapping.update({f"blocks.{index}.{native}": f"model.layers.{index}.{hf}" for native, hf in layer.items()})
     return mapping
 
@@ -66,7 +64,5 @@ def from_hf(config, state):
     missing = set(mapping.values()) - state.keys()
     unexpected = state.keys() - set(mapping.values())
     if missing or unexpected:
-        raise ValueError(
-            f"Hybrid checkpoint tensor mismatch: missing={sorted(missing)}, unexpected={sorted(unexpected)}"
-        )
+        raise ValueError(f"Hybrid checkpoint tensor mismatch: missing={sorted(missing)}, unexpected={sorted(unexpected)}")
     return {native: state[hf] for native, hf in mapping.items()}

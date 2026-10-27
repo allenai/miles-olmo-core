@@ -8,9 +8,7 @@ def align_logprobs(prompt, generated, metadata):
     outputs = metadata["output_token_logprobs"]
     offset = len(prompt) - len(inputs)
     if offset < 0 or [entry[1] for entry in inputs] != prompt[offset:]:
-        raise AssertionError(
-            f"Prompt logprob token IDs are not a prompt suffix: offset={offset}, entries={inputs[:3]}"
-        )
+        raise AssertionError(f"Prompt logprob token IDs are not a prompt suffix: offset={offset}, entries={inputs[:3]}")
     if [entry[1] for entry in outputs] != generated or any(entry[0] is None for entry in outputs):
         raise AssertionError("Decode logprobs must cover every generated token in order")
     positioned = [(offset + index, entry[0]) for index, entry in enumerate(inputs) if entry[0] is not None]

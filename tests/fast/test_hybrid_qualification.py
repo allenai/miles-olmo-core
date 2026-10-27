@@ -25,6 +25,4 @@ def test_single_token_prompt_has_only_decode_logprobs():
 
 def test_wrong_prompt_tokens_fail_instead_of_silently_shifting():
     with pytest.raises(AssertionError, match="prompt suffix"):
-        align_logprobs(
-            [11, 12], [21], {"input_token_logprobs": [(-1.0, 99, None)], "output_token_logprobs": [(-1.0, 21, None)]}
-        )
+        align_logprobs([11, 12], [21], {"input_token_logprobs": [(-1.0, 99, None)], "output_token_logprobs": [(-1.0, 21, None)]})

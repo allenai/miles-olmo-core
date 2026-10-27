@@ -55,6 +55,23 @@ def test_serving_module_cache_is_private_even_without_compiler_cache():
     assert original["HF_MODULES_CACHE"] == "/tmp/old-shared-modules"
 
 
+def test_vision_serving_environment_registers_processor_without_compiler_cache():
+    args = SimpleNamespace(
+        olmo_core_startup_cache=None, sglang_enable_multimodal=True,
+        custom_generate_function_path="open_instruct.miles.datasets.vision_rollout.generate",
+    )
+    spec = SimpleNamespace(env_var=lambda context: {})
+    environment = startup._serving_environment(args, spec, None)
+    assert environment["SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"] == "olmo_sglang.processors"
+    args.sglang_enable_multimodal = False
+    with pytest.raises(ValueError, match="multimodal mode"):
+        startup._serving_environment(args, spec, None)
+    args.sglang_enable_multimodal = True
+    spec.env_var = lambda context: {"SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE": "other.processors"}
+    with pytest.raises(ValueError, match="conflicts"):
+        startup._serving_environment(args, spec, None)
+
+
 def test_worker_restore_publish_and_rank_isolation(tmp_path, monkeypatch):
     descriptor = policy(tmp_path, restore=False)
     monkeypatch.setenv(startup.ENV, json.dumps(descriptor))

@@ -163,6 +163,13 @@ def _serving_environment(args, spec, context):
     env = dict(spec.env_var(context))
     env["HF_MODULES_CACHE"] = _private_hf_modules_cache()
     env["SGLANG_EXTERNAL_MODEL_PACKAGE"] = "olmo_sglang.models"
+    if getattr(args, "custom_generate_function_path", None) == "open_instruct.miles.datasets.vision_rollout.generate":
+        if not getattr(args, "sglang_enable_multimodal", False):
+            raise ValueError("The vision rollout hook requires SGLang multimodal mode")
+        key = "SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"
+        if env.get(key) not in (None, "", "olmo_sglang.processors"):
+            raise ValueError("The vision rollout hook conflicts with the selected multimodal processor package")
+        env[key] = "olmo_sglang.processors"
     if policy := getattr(args, "olmo_core_startup_cache", None):
         slot = f"{spec.name}-{context.cell_index}-{context.worker_in_cell_index}"
         env[ENV] = json.dumps({**policy, "slot": slot})

@@ -23,6 +23,7 @@ from transformers_plugin import modeling_mainline_ladder as release
 from transformers_plugin import register
 
 from miles.utils.processing_utils import load_tokenizer
+from miles_plugins.hybrid.qualification import align_logprobs
 
 register()
 os.environ["SGLANG_EXTERNAL_MODEL_PACKAGE"] = "miles_plugins.hybrid.models"
@@ -34,19 +35,17 @@ ROOT = "/weka/oe-training-default/yashasbls/hybridish-local/hf/v1"
 def compare_reference(model, prompt, generated, meta):
     """Compare teacher-forced HF probabilities on the actual served decode path."""
     tokens = prompt + generated
-    first = max(1, len(prompt) - 16)
+    positions, values = align_logprobs(prompt, generated, meta)
+    first = min(positions)
     inputs = torch.tensor([tokens], device="cuda")
     with torch.inference_mode():
         logits = model(inputs, use_cache=False, logits_to_keep=len(tokens) - first + 1).logits[0].float()
     # The final logit predicts beyond the supplied sequence and has no target.
     scores = logits[:-1].log_softmax(-1)
-    targets = torch.tensor(tokens[first:], device="cuda")
-    expected = scores.gather(-1, targets[:, None]).squeeze(-1).cpu()
-    observed = meta["input_token_logprobs"] + meta["output_token_logprobs"]
-    observed = [entry for entry in observed if entry[0] is not None]
-    if [entry[1] for entry in observed] != tokens[first:]:
-        raise AssertionError("SGLang logprob alignment differs from the teacher-forced sequence")
-    actual = torch.tensor([entry[0] for entry in observed])
+    targets = torch.tensor([tokens[position] for position in positions], device="cuda")
+    row_indices = torch.tensor([position - first for position in positions], device="cuda")
+    expected = scores[row_indices].gather(-1, targets[:, None]).squeeze(-1).cpu()
+    actual = torch.tensor(values)
     if not torch.isfinite(actual).all():
         raise AssertionError("Non-finite serving log probabilities")
     error = (expected - actual).abs().max().item()
@@ -59,14 +58,13 @@ def compare_reference(model, prompt, generated, meta):
     return {"max_logprob_error": error, "greedy_agreement_within_0.01": agreement}
 
 
-def generate_cases(engine, tokenizer, model):
+def generate_cases(engine, tokenizer, model, records):
     unit = tokenizer.encode(
         "Question: Natalia sold 48 clips in April and half as many in May. How many in total? Answer:",
         add_special_tokens=False,
     )
     lengths = [1, 3, 31, 127, 511, 2047, 3071]
     prompts = [(unit * ((length // len(unit)) + 1))[:length] for length in lengths]
-    records = []
     # Mixed sequence lengths exercise packed prefill, decode scheduling, and slot reuse.
     for batch in (prompts[:3], prompts[3:6], prompts[6:], prompts[:3]):
         start = time.monotonic()
@@ -128,11 +126,13 @@ def qualify(size, output):
             random_seed=1,
         )
         result["startup_seconds"] = time.monotonic() - started
-        result["cases"] = generate_cases(engine, tokenizer, model)
+        result["cases"] = []
+        generate_cases(engine, tokenizer, model, result["cases"])
         updated = engine.update_weights_from_disk(source)
         if not updated[0]:
             raise AssertionError(f"Weight reload failed: {updated}")
-        result["after_reload"] = generate_cases(engine, tokenizer, model)[:3]
+        result["after_reload"] = []
+        generate_cases(engine, tokenizer, model, result["after_reload"])
         result["status"] = "PASSED"
     finally:
         if engine is not None:

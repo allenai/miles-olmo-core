@@ -31,7 +31,7 @@ no positional embeddings. All checkpoint names/layouts remain unchanged.
 - GDN requests run separately within each packed forward; throughput will be lower
   than a purpose-built packed GDN backend. This is intentional for the initial port.
 
-Standalone server: `python -m miles_plugins.hybrid.serve --model-path CHECKPOINT
+Standalone server (qualified fallback): `MILES_HYBRID_REFERENCE_BACKBONE=1 python -m miles_plugins.hybrid.serve --model-path CHECKPOINT
 --dtype bfloat16 --tp-size 1 --disable-cuda-graph --disable-radix-cache
 --chunked-prefill-size -1 --attention-backend triton --max-running-requests 4
 --mem-fraction-static 0.35 --context-length 4096` (join as one command).
@@ -97,3 +97,28 @@ preemption recovery, and learning quality require separate end-to-end GPU checks
 
 CPU evidence: all 192 actual release tensor names/shapes are covered; unknown
 layers and missing tensors fail early. See the companion experiment log for GPU results and immutable report locations.
+
+
+## Rhea results (2026-10-27)
+
+The BF16 reference-backbone fallback passed all five final-midtrain sizes on one
+RTX A6000 48GB: 32 functional cases and eight dense probes per size, including
+reload, slot reuse, queued requests, and prompts through3071 tokens.
+Maximum selected-token logprob errors and warm batch throughput:
+
+| Size | Result | Max logprob error | Warm output tokens/s |
+| --- | --- | ---: | ---: |
+| 275m | PASSED | 1.23978e-05 | 62.1–67.1 |
+| 450m | PASSED | 3.00407e-05 | 42.2–45.0 |
+| 810m | PASSED | 0.000198603 | 39.2–45.0 |
+| 1.4b | PASSED | 0.000464261 | 28.9–32.0 |
+| 2.7b | PASSED | 9.9659e-05 | 19.8–22.4 |
+
+The columns above are size, result, maximum logprob error, and warm batch output
+tokens/s including prefill. Greedy agreement was100%. Report root:
+`/weka/oe-adapt-default/michaeln/open-instruct-hybrid/qualification/rhea-hf-bf16-8bb6da4a`.
+The tested adapter is SHA256
+`73e345ec258aded60a37bea5e93d70a5bc5f753199bc41b004c809a6ebf4df62`.
+The companion recipe selects this fallback and explicitly disables FP32 logits.
+The packed/RadixAttention path remains unqualified at all five scales.
+End-to-end native learner/publication/resume validation remains pending.

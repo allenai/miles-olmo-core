@@ -115,6 +115,35 @@ def probability_profile(rollout):
     }
 
 
+def probability_sequences(rollout):
+    """Exact local token evidence for a failed agreement gate, before weights change."""
+    rows = []
+    for index, (tokens, current, old, mask) in enumerate(
+        zip(rollout["tokens"], rollout["log_probs"], rollout["rollout_log_probs"], rollout["loss_masks"], strict=True)
+    ):
+        current = current.detach().float().cpu()
+        old = torch.as_tensor(old).detach().float().cpu()
+        mask = mask.detach().bool().cpu()
+        token_ids = torch.as_tensor(tokens).detach().cpu().tolist()
+        count = len(current)
+        prompt_length = len(token_ids) - count
+        difference = current - old
+        rows.append(
+            {
+                "sample_index": index,
+                "prompt_token_ids": token_ids[:prompt_length],
+                "response_token_ids": token_ids[prompt_length:],
+                "loss_mask": mask.tolist(),
+                "trainer_log_probs": current.tolist(),
+                "rollout_log_probs": old.tolist(),
+                "trainer_minus_rollout": difference.tolist(),
+                "active_mean_abs": float(difference[mask].abs().mean()) if mask.any() else None,
+                "active_max_abs": float(difference[mask].abs().max()) if mask.any() else None,
+            }
+        )
+    return rows
+
+
 SCORING_CHECK_EDGE = 1e-3
 
 

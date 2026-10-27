@@ -159,15 +159,34 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         self._agree(lambda: contract.validate_training_data(rollout))
         agreement = self._agree(lambda: data.score_agreement(rollout))
         dist.all_reduce(agreement)
-        difference = self._agree(
-            lambda: data.validate_score_agreement(agreement, self.args.olmo_core.max_train_rollout_logprob_abs_diff)
-        )
+        difference = data.validate_score_agreement(agreement, None)
         logger.info("Core behavior-policy agreement: mean_abs=%s active_tokens=%s", difference, int(agreement[1]))
         profile = contract.probability_profile(rollout)
         logger.info(
             "Core score contract: %s",
-            contract.record(self.args, {"event": "scores", "rollout_id": rollout_id, "source": source, **profile}),
+            contract.record(
+                self.args,
+                {"event": "scores", "rollout_id": rollout_id, "source": source, "mean_abs": difference, **profile},
+            ),
         )
+        limit = self.args.olmo_core.max_train_rollout_logprob_abs_diff
+        if limit is not None and difference > limit:
+            # Every rank participates after the global reduction. Persist the
+            # exact local evidence before the collective validation raises.
+            self._agree(
+                lambda: contract.record(
+                    self.args,
+                    {
+                        "event": "score_mismatch",
+                        "rollout_id": rollout_id,
+                        "source": source,
+                        "mean_abs": difference,
+                        "limit": limit,
+                        "sequences": contract.probability_sequences(rollout),
+                    },
+                )
+            )
+        self._agree(lambda: data.validate_score_agreement(agreement, limit))
         if self.args.olmo_core.publication_mode == "refresh":
             refresh_profile = policy_refresh.score_metrics(
                 rollout,
@@ -590,7 +609,13 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                     }
                 )
             logged = self._agree(
-                lambda losses=losses, summary=summary, lr_used=lr_used, gradient_stats=gradient_stats, difference=difference, agreement=agreement, profile=profile: training_metrics.log_step(
+                lambda losses=losses,
+                summary=summary,
+                lr_used=lr_used,
+                gradient_stats=gradient_stats,
+                difference=difference,
+                agreement=agreement,
+                profile=profile: training_metrics.log_step(
                     self.args,
                     losses=losses,
                     summary=summary,

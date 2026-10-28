@@ -48,8 +48,9 @@ async def watch(operation, *, previous_timeout=None, deadline=None):
         yield
     finally:
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        # Consume cancellation of our warning task, not cancellation of the
+        # caller while this cleanup await is in progress (e.g. a deadline).
+        await asyncio.gather(task, return_exceptions=True)
         elapsed = time.monotonic() - started
         if elapsed >= threshold:
             logger.warning(

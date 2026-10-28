@@ -1,7 +1,6 @@
 import asyncio
 import time
 from collections.abc import Sequence
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -271,32 +270,14 @@ class InferenceController:
             if isinstance(result, BaseException):
                 raise result
 
-    @lock_exempt
-    @asynccontextmanager
-    async def defer_weight_admission(self):
-        """Publish and validate before admitting newly initialized/restored cells.
-
-        Individual transfers keep their existing lock/health protocol. Capture
-        the identities they actually updated, then check them again while
-        holding the controller lock through registration confirmation.
-        """
-        await self._begin_deferred_admission()
-        try:
-            yield
-        except BaseException:
-            await self._finish_deferred_admission(admit=False)
-            raise
-        else:
-            await self._finish_deferred_admission(admit=True)
-
     @with_lock
-    async def _begin_deferred_admission(self):
+    async def begin_weight_admission(self) -> None:
         if self._deferred_admission is not None:
             raise RuntimeError("Overlapping weight admission windows")
         self._deferred_admission = {}
 
     @with_lock
-    async def _finish_deferred_admission(self, *, admit):
+    async def finish_weight_admission(self, *, admit: bool) -> None:
         identities = self._deferred_admission
         if identities is None:
             raise RuntimeError("No weight admission window is active")

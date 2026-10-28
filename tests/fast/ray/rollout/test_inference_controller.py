@@ -18,6 +18,7 @@ from miles.ray.rollout.inference_controller import (
 )
 from miles.ray.rollout.rollout_server import RolloutServer
 from miles.ray.rollout.server_cell import ServerCell, ServerCellMetadata
+from miles.ray.rollout.weight_admission import defer_weight_admission
 from miles.ray.specs.inference import compute_engine_pool_ids, compute_router_pool_id, specs_inference_engine
 from miles.utils.context_lock import ContextLock
 from miles.utils.ft_utils.health_checker import ActivenessTracker
@@ -1692,7 +1693,7 @@ async def test_admission_waits_for_validation_and_rejects_stale_workers(failure)
     controller = _make_controller({"default": srv})
 
     async def publish_and_validate():
-        async with controller.defer_weight_admission():
+        async with defer_weight_admission(controller):
             info = await controller.start_update_weights()
             await controller.end_update_weights(info.snapshot_cell_id_to_hashes)
             assert cell.marked_ready == 0

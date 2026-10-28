@@ -1,6 +1,5 @@
 import asyncio
 import dataclasses
-import logging
 import time
 from urllib.parse import quote
 
@@ -8,10 +7,11 @@ import httpx
 import sglang_router
 from packaging.version import parse
 
-from miles.utils import infra_timeouts
+from miles.backends.sglang_utils import router_registration
+from miles.utils import infra_timeouts, logger_utils
 from miles.utils.http_utils import GeneralHttpClientProvider
 
-logger = logging.getLogger(__name__)
+logger = logger_utils.setup_logger(__name__)
 
 _retry_sleep = asyncio.sleep
 
@@ -51,6 +51,10 @@ class SGLangRouterApiClient:
             }
             if worker_type == "prefill":
                 payload["bootstrap_port"] = bootstrap_port
+            if parse(sglang_router.__version__) >= parse("0.3.2"):
+                return await router_registration.register_worker(
+                    GeneralHttpClientProvider.client(), self.router_url, payload
+                )
             response = await infra_timeouts.request(
                 GeneralHttpClientProvider.client(),
                 "post",

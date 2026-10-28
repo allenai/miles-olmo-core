@@ -1,5 +1,4 @@
 import dataclasses
-import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -7,6 +6,7 @@ from typing import Any, Literal
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 
+from miles.backends.sglang_utils import router_registration
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient, probe_server_healthy
 from miles.backends.sglang_utils.sglang_engine import build_server_url
 from miles.backends.sglang_utils.sglang_router_api_client import SGLangRouterApiClient, use_legacy_router_api
@@ -20,7 +20,7 @@ from miles.ray.rollout.cell_state import (
     StateUninitialized,
 )
 from miles.ray.rollout.engine_env_reporter import EngineEnvReporter
-from miles.utils import infra_timeouts
+from miles.utils import infra_timeouts, logger_utils
 from miles.utils.ft_utils.api_server.models import CellCondition, CellStatus, TriState
 from miles.utils.ft_utils.health_checker import (
     ActiveAndEpoch,
@@ -33,7 +33,7 @@ from miles.utils.pydantic_utils import FrozenStrictBaseModel
 from miles.utils.workers.launch_gate import GATE_PORT_NAME, activate_launch_gate
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider
 
-logger = logging.getLogger(__name__)
+logger = logger_utils.setup_logger(__name__)
 
 SHUTDOWN_TIMEOUT = 30
 INITIALIZING_TIMEOUT_SECONDS = 1800.0
@@ -63,6 +63,7 @@ class ServerCell:
     _health_checker: BaseHealthChecker = dataclasses.field(init=False)
     _env_reporter: EngineEnvReporter = dataclasses.field(init=False)
     _state: CellState = dataclasses.field(default_factory=StateUninitialized)
+    _registration_attempted: bool = dataclasses.field(default=False, init=False)
 
     def __post_init__(self) -> None:
         self._env_reporter = EngineEnvReporter(interval_seconds=self.args.env_report_interval_seconds)
@@ -212,13 +213,21 @@ class ServerCell:
             self._mark_serving()
 
     async def _register_with_router(self, addr_info: CellAddrInfo, *, weights_ready: bool = False) -> None:
-        await self.router_api_client.add_worker(
-            worker_url=addr_info.server_url,
-            worker_type=self.meta.worker_type,
-            use_legacy_api=use_legacy_router_api(self.args),
-            bootstrap_port=addr_info.bootstrap_port,
-            **({"weights_ready": True} if weights_ready else {}),
-        )
+        self._registration_attempted = True
+        try:
+            await self.router_api_client.add_worker(
+                worker_url=addr_info.server_url,
+                worker_type=self.meta.worker_type,
+                use_legacy_api=use_legacy_router_api(self.args),
+                bootstrap_port=addr_info.bootstrap_port,
+                **({"weights_ready": True} if weights_ready else {}),
+            )
+        except BaseException:
+            try:
+                await self._unregister_from_router()
+            except BaseException:
+                logger.exception("Registration cleanup remains owned by cell %s", self.meta.cell_id)
+            raise
 
     async def dispose(self) -> None:
         self._health_checker.stop()
@@ -226,7 +235,10 @@ class ServerCell:
         match self._state:
             case StateServing():
                 await self._unregister_from_router()
-            case StateUninitialized() | StateInitializing() | StatePendingWeights() | StateDisposed():
+            case StateInitializing() | StatePendingWeights():
+                if self._registration_attempted:
+                    await self._unregister_from_router()
+            case StateUninitialized() | StateDisposed():
                 pass
             case _:
                 raise ValueError(f"{self._state=}")
@@ -247,8 +259,14 @@ class ServerCell:
                 timeout=SHUTDOWN_TIMEOUT,
                 operation=f"unregister engine {self.server_url}",
             )
+        except router_registration.RegistrationCleanupError:
+            # RolloutServer removes the cell only after dispose succeeds. Retain
+            # this owner so reconciliation cannot replace/reuse an unresolved URL.
+            raise
         except Exception as e:
             logger.warning(f"Unregistering cell {self.meta.cell_id} from the router failed, tearing down anyway ({e})")
+        else:
+            self._registration_attempted = False
 
     async def _compute_addr_info(self) -> CellAddrInfo:
         master_addrs = await self.provider.get_addrs(worker_name=self.meta.worker_name)

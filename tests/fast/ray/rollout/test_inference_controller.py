@@ -1070,7 +1070,9 @@ class TestUpdatableEnginesPayload:
     async def test_end_update_weights_skips_a_cell_from_a_different_worker_generation(self):
         """A cell relaunched during the update runs new processes that never received these weights."""
         relaunched, untouched = _FakeUpdatableCell("hash-new"), _FakeUpdatableCell("hash-b")
-        srv = _RecordingServer({"engine-0": relaunched, "engine-1": untouched}, model_name="actor", update_weights=True)
+        srv = _RecordingServer(
+            {"engine-0": relaunched, "engine-1": untouched}, model_name="actor", update_weights=True
+        )
         controller = _make_controller({"actor": srv})
 
         await controller.start_update_weights()

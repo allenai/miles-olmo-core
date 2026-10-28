@@ -1,6 +1,5 @@
 import asyncio
 import dataclasses
-import logging
 import time
 from urllib.parse import quote
 
@@ -8,10 +7,11 @@ import httpx
 import sglang_router
 from packaging.version import parse
 
-from miles.utils import infra_timeouts
+from miles.backends.sglang_utils import router_registration
+from miles.utils import infra_timeouts, logger_utils
 from miles.utils.http_utils import GeneralHttpClientProvider
 
-logger = logging.getLogger(__name__)
+logger = logger_utils.setup_logger(__name__)
 
 _retry_sleep = asyncio.sleep
 
@@ -25,6 +25,9 @@ def use_legacy_router_api(args) -> bool:
 @dataclasses.dataclass(frozen=True)
 class SGLangRouterApiClient:
     router_url: str
+    _registrations: dict[str, router_registration.Registration] = dataclasses.field(
+        default_factory=dict, compare=False, repr=False
+    )
 
     async def add_worker(
         self,
@@ -51,6 +54,13 @@ class SGLangRouterApiClient:
             }
             if worker_type == "prefill":
                 payload["bootstrap_port"] = bootstrap_port
+            if parse(sglang_router.__version__) >= parse("0.3.2"):
+                return await router_registration.register_worker(
+                    GeneralHttpClientProvider.client(),
+                    self.router_url,
+                    payload,
+                    state=self._registrations.setdefault(worker_url, router_registration.Registration()),
+                )
             response = await infra_timeouts.request(
                 GeneralHttpClientProvider.client(),
                 "post",
@@ -96,6 +106,15 @@ class SGLangRouterApiClient:
                 return
 
     async def remove_worker(self, worker_url: str, use_legacy_api: bool):
+        if not use_legacy_api and worker_url in self._registrations:
+            await router_registration.unregister_worker(
+                GeneralHttpClientProvider.client(),
+                self.router_url,
+                worker_url,
+                state=self._registrations[worker_url],
+            )
+            del self._registrations[worker_url]
+            return
         response = None
         if use_legacy_api:
             response = await infra_timeouts.request(

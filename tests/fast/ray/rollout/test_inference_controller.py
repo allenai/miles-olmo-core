@@ -18,6 +18,7 @@ from miles.ray.rollout.inference_controller import (
 )
 from miles.ray.rollout.rollout_server import RolloutServer
 from miles.ray.rollout.server_cell import ServerCell, ServerCellMetadata
+from miles.ray.rollout.weight_admission import defer_weight_admission
 from miles.ray.specs.inference import compute_engine_pool_ids, compute_router_pool_id, specs_inference_engine
 from miles.utils.context_lock import ContextLock
 from miles.utils.ft_utils.health_checker import ActivenessTracker
@@ -255,6 +256,7 @@ def _make_controller(
         offload_rollout_level=["kv_cache", "weight"],
         run_uuid=_RUN_UUID,
     )
+    controller._deferred_admission = None
     controller.servers = servers
     controller.context_lock = ContextLock("InferenceController")
     controller._engine_provider = engines
@@ -738,12 +740,7 @@ class TestEngineMetaContract:
         """The engine spec's meta dict and the driver-side reader share one key set, pinned end to end."""
         config_path: Path = tmp_path / "sglang.yaml"
         config_path.write_text(
-            "sglang:\n"
-            "  - name: default\n"
-            "    server_groups:\n"
-            "      - worker_type: decode\n"
-            "        num_gpus: 4\n"
-            "        num_gpus_per_engine: 2\n"
+            "sglang:\n  - name: default\n    server_groups:\n      - worker_type: decode\n        num_gpus: 4\n        num_gpus_per_engine: 2\n"
         )
         args = make_args(sglang_config=str(config_path), rollout_num_gpus=4, sglang_api_key="from-args")
         (spec,) = specs_inference_engine(args)
@@ -1688,3 +1685,38 @@ class TestRegistrationSnapshotEndpoint:
 
         with pytest.raises(AssertionError, match="serves model 'other'"):
             await controller.registration_ingest(snapshot=_registration_snapshot(model_id="other"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "diagnostic", "replacement", "removed"])
+async def test_admission_waits_for_validation_and_rejects_stale_workers(failure):
+    cell = _FakeUpdatableCell("incarnation-1")
+    srv = _RecordingServer({"engine": cell}, update_weights=True)
+    controller = _make_controller({"default": srv})
+
+    async def publish_and_validate():
+        async with defer_weight_admission(controller):
+            info = await controller.start_update_weights()
+            await controller.end_update_weights(info.snapshot_cell_id_to_hashes)
+            assert cell.marked_ready == 0
+            # A reset/resync is still part of the same validation window.
+            info = await controller.start_update_weights()
+            await controller.end_update_weights(info.snapshot_cell_id_to_hashes)
+            assert cell.marked_ready == 0
+            if failure == "diagnostic":
+                raise ValueError("weight mismatch")
+            if failure == "replacement":
+                srv.server_cells["engine"] = _FakeUpdatableCell("incarnation-2")
+            if failure == "removed":
+                srv.server_cells.clear()
+
+    if failure:
+        with pytest.raises((ValueError, RuntimeError), match="weight mismatch|Workers changed"):
+            await publish_and_validate()
+        assert cell.marked_ready == 0
+        assert all(c.marked_ready == 0 for c in srv.server_cells.values())
+    else:
+        await publish_and_validate()
+        assert cell.marked_ready == 1
+    assert controller._deferred_admission is None
+    assert not controller.context_lock.locked

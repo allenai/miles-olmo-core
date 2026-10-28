@@ -61,7 +61,10 @@ def recorder(monkeypatch):
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
+    # These request-shape tests cover the synchronous modern API. Async 0.3.2
+    # admission has dedicated contract and real-router tests.
+    monkeypatch.setattr(sglang_router, "__version__", "0.3.1")
     return SGLangRouterApiClient(router_url=ROUTER_URL)
 
 

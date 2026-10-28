@@ -175,6 +175,7 @@ class _Harness:
 
         self.args = make_args(colocate=True, use_fault_tolerance=True, ft_components=["rollout"])
         self.controller = InferenceController.__new__(InferenceController)
+        self.controller._deferred_admission = None
         self.controller.args = self.args
         self.controller.context_lock = ContextLock("InferenceController")
         self.controller._watcher_disposers = []

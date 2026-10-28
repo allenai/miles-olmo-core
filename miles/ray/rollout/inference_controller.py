@@ -1,5 +1,4 @@
 import asyncio
-import logging
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -13,7 +12,7 @@ from miles.ray.rollout.eval_fleet import EvalFleetInfo, EvalFleetPin, InferenceC
 from miles.ray.rollout.rollout_server import RolloutServer, create_rollout_servers
 from miles.ray.rollout.router_manager import resolve_router_addrs
 from miles.ray.rollout.server_cell import ServerCell, ServerCellMetadata
-from miles.utils import async_utils, infra_timeouts
+from miles.utils import async_utils, infra_timeouts, logger_utils
 from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 from miles.utils.context_lock import (
     ContextLock,
@@ -34,7 +33,7 @@ from miles.utils.workers.registration.models import RegistrationSnapshot
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider, CellInfo, StopWatchFn
 from miles.utils.workers.worker_provider.utils import apply_cell_observation
 
-logger = logging.getLogger(__name__)
+logger = logger_utils.setup_logger(__name__)
 
 TICK_INTERVAL_SECONDS = 5.0
 CELL_TICK_TIMEOUT_SECONDS = 120.0
@@ -61,6 +60,7 @@ class InferenceController:
         self._eval_fleet: InferenceControllerEvalFleet | None = None
         self._watcher_disposers: list[StopWatchFn] = []
         self._ticker: SimpleTicker | None = None
+        self._deferred_admission: dict[str, str] | None = None
 
     @lock_exempt
     @init_once
@@ -239,7 +239,21 @@ class InferenceController:
 
     @releases_lock
     async def end_update_weights(self, snapshot_cell_id_to_hashes: dict[str, str]) -> None:
-        await asyncio.gather(
+        if self._deferred_admission is not None:
+            self._deferred_admission.update(snapshot_cell_id_to_hashes)
+            return
+        await self._admit_updated_cells(snapshot_cell_id_to_hashes)
+
+    @requires_lock
+    async def _admit_updated_cells(self, snapshot_cell_id_to_hashes: dict[str, str], *, strict=False):
+        if strict:
+            current = {
+                cid: cell.meta.workers_hash for srv in self.servers.values() for cid, cell in srv.server_cells.items()
+            }
+            changed = [cid for cid, identity in snapshot_cell_id_to_hashes.items() if current.get(cid) != identity]
+            if changed:
+                raise RuntimeError(f"Workers changed during weight validation; refusing admission: {changed}")
+        results = await asyncio.gather(
             *[
                 cell.mark_weights_ready()
                 for srv in self.servers.values()
@@ -247,8 +261,31 @@ class InferenceController:
                 if cell_id in snapshot_cell_id_to_hashes
                 and snapshot_cell_id_to_hashes[cell_id] == cell.meta.workers_hash
                 and (cell.is_pending_weights or (self.args.use_miles_router and cell.is_serving))
-            ]
+            ],
+            return_exceptions=True,
         )
+        # Join all admissions before releasing the lifecycle lock on failure.
+        # Otherwise siblings could mark themselves serving after cleanup began.
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    @with_lock
+    async def begin_weight_admission(self) -> None:
+        if self._deferred_admission is not None:
+            raise RuntimeError("Overlapping weight admission windows")
+        self._deferred_admission = {}
+
+    @with_lock
+    async def finish_weight_admission(self, *, admit: bool) -> None:
+        identities = self._deferred_admission
+        if identities is None:
+            raise RuntimeError("No weight admission window is active")
+        try:
+            if admit:
+                await self._admit_updated_cells(identities, strict=True)
+        finally:
+            self._deferred_admission = None
 
     @releases_lock
     async def abort_update_weights(self) -> None:
@@ -268,8 +305,7 @@ class InferenceController:
                 return
             if time.monotonic() >= deadline:
                 raise TimeoutError(
-                    f"Timed out after {infra_timeouts.seconds(CELLS_READY_TIMEOUT_SECONDS):g}s waiting for "
-                    f"{len(pending)}/{len(cells)} cells to become ready"
+                    f"Timed out after {infra_timeouts.seconds(CELLS_READY_TIMEOUT_SECONDS):g}s waiting for {len(pending)}/{len(cells)} cells to become ready"
                 )
             if time.monotonic() >= next_warning:
                 logger.warning(

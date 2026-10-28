@@ -78,7 +78,12 @@ async def register_worker(client, router_url, payload):
                     )
                     logger.info("Router admission confirmed: worker=%s attempt=%s", worker_url, attempt)
                     return
-                except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError, RegistrationFailed) as error:
+                except (
+                    httpx.TimeoutException,
+                    httpx.NetworkError,
+                    httpx.HTTPStatusError,
+                    RegistrationFailed,
+                ) as error:
                     if (
                         isinstance(error, httpx.HTTPStatusError)
                         and error.response.status_code < 500

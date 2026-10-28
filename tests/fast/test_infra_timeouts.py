@@ -80,3 +80,32 @@ async def test_caller_cancellation_propagates_and_joins_watchdog():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert asyncio.all_tasks() == baseline
+
+
+async def test_cancellation_during_watchdog_cleanup_is_not_swallowed(monkeypatch):
+    entered_cleanup = asyncio.Event()
+    original_create_task = asyncio.create_task
+
+    async def watchdog():
+        try:
+            await asyncio.Future()
+        finally:
+            entered_cleanup.set()
+            await asyncio.Future()
+
+    def create_watchdog(coro):
+        coro.close()
+        return original_create_task(watchdog())
+
+    monkeypatch.setattr(infra_timeouts.asyncio, "create_task", create_watchdog)
+
+    async def watched():
+        async with infra_timeouts.watch("cleanup cancellation"):
+            await asyncio.sleep(0)
+        pytest.fail("Caller cancellation was swallowed")
+
+    task = original_create_task(watched())
+    await entered_cleanup.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

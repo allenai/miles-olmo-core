@@ -419,7 +419,7 @@ class TestTick:
         await cell.tick()
 
         assert isinstance(cell._state, StateServing)
-        assert [name for name, _kwargs in router.calls] == ["add_worker"]
+        assert [name for name, _kwargs in router.calls] == ["remove_worker", "add_worker"]
 
     @pytest.mark.parametrize(
         ("failing_operation", "error_message"),

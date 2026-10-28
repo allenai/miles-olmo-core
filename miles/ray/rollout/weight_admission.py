@@ -2,6 +2,10 @@
 
 from contextlib import asynccontextmanager
 
+from miles.utils import logger_utils
+
+logger = logger_utils.setup_logger(__name__)
+
 
 @asynccontextmanager
 async def defer_weight_admission(controller):
@@ -16,7 +20,10 @@ async def defer_weight_admission(controller):
     try:
         yield
     except BaseException:
-        await controller.finish_weight_admission(admit=False)
+        try:
+            await controller.finish_weight_admission(admit=False)
+        except Exception:
+            logger.exception("Admission abort failed; preserving the original publication failure")
         raise
     else:
         await controller.finish_weight_admission(admit=True)

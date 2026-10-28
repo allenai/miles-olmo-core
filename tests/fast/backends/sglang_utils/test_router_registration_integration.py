@@ -16,7 +16,12 @@ import httpx
 import pytest
 import sglang_router
 
+from tests.fast.ray.rollout.test_server_cell_dispose import _make_cell
+
 from miles.backends.sglang_utils import router_registration
+from miles.backends.sglang_utils.sglang_router_api_client import SGLangRouterApiClient
+from miles.ray.rollout.cell_state import CellAddrInfo, StateDisposed, StatePendingWeights
+from miles.utils.http_utils import GeneralHttpClientProvider
 
 
 class Worker:
@@ -139,9 +144,11 @@ class LostReceiptTransport(httpx.AsyncHTTPTransport):
 async def test_real_router_recovers_lost_receipt_without_duplicate_workers(router, worker):
     transport = LostReceiptTransport()
     async with httpx.AsyncClient(transport=transport) as client:
-        await router_registration.register_worker(client, router, {"url": worker.url, "worker_type": "regular"})
+        await router_registration.register_worker(
+            client, router, {"url": worker.url, "worker_type": "regular"}, state=router_registration.Registration()
+        )
         registered = (await client.get(router + "/workers")).json()["workers"]
-    assert len(transport.worker_ids) == 2
+    assert len(transport.worker_ids) == 1
     assert len(set(transport.worker_ids)) == 1
     assert len(registered) == 1 and registered[0]["is_healthy"]
 
@@ -153,7 +160,9 @@ async def test_real_metadata_delay_blocks_admission_and_failed_job_recovers(rout
     transport = LostReceiptTransport(lose_first=False)
     async with httpx.AsyncClient(transport=transport) as client:
         task = asyncio.create_task(
-            router_registration.register_worker(client, router, {"url": worker.url, "worker_type": "regular"})
+            router_registration.register_worker(
+                client, router, {"url": worker.url, "worker_type": "regular"}, state=router_registration.Registration()
+            )
         )
         try:
             assert await asyncio.to_thread(worker.metadata_requested.wait, 20)
@@ -178,3 +187,41 @@ async def test_real_metadata_delay_blocks_admission_and_failed_job_recovers(rout
             if not task.done():
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lost_receipt", [False, True])
+async def test_cancelled_admission_removes_a_late_worker_before_disposal(router, worker, monkeypatch, lost_receipt):
+    worker.release_metadata.clear()
+    transport = LostReceiptTransport(lose_first=lost_receipt)
+    async with httpx.AsyncClient(transport=transport) as client:
+        monkeypatch.setattr(GeneralHttpClientProvider, "client", lambda: client)
+        api = SGLangRouterApiClient(router)
+        cell = _make_cell(router_api_client=api)
+        cell._state = StatePendingWeights(
+            addr_info=CellAddrInfo(server_url=worker.url, bootstrap_port=None, gate_url=None)
+        )
+        task = asyncio.create_task(cell.mark_weights_ready())
+        try:
+            assert await asyncio.to_thread(worker.metadata_requested.wait, 20)
+            task.cancel()
+            async with asyncio.timeout(5):
+                while not api._registrations[worker.url].retiring:
+                    await asyncio.sleep(0)
+            assert not task.done()
+            assert (await client.get(router + "/workers")).json()["workers"] == []
+            worker.release_metadata.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 15)
+            assert not cell.is_serving
+            await cell.dispose()
+            assert isinstance(cell._state, StateDisposed)
+            assert (await client.get(router + "/workers")).json()["workers"] == []
+            assert worker.url not in api._registrations
+            assert len(transport.worker_ids) == 1
+        finally:
+            worker.release_metadata.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await cell.dispose()

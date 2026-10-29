@@ -11,7 +11,7 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 from argparse import ArgumentParser, Namespace
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config

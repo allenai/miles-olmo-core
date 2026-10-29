@@ -435,13 +435,13 @@ class TestSampleBudget:
         fn = object.__new__(FullyAsyncRolloutFn)
         fn.args, fn._sample_filter = args, None
         fn._handle_unused = lambda prompt_group, **_: None  # the Core producer wraps the handler
-        fn._output = Namespace(get_metrics=lambda: {})
+        fn._output = Namespace(get_metrics=lambda trainer_model_id=None: {})
 
-        async def next_group(_version):
+        async def next_group(*, current_version, trainer_model_id=None):
             return DataBufferInput(prompt_group=[], group=entries.pop(0))
 
         fn._next_group = next_group
-        output = asyncio.run(fn._drain(Namespace(weight_version=6)))
+        output = asyncio.run(fn._drain(Namespace(weight_version=6, trainer_model_id=None)))
 
         assert sum(map(len, output.samples)) == 3 * GROUP_SIZE
         assert [len(group) // GROUP_SIZE for group in output.samples] == [1, 2]  # both kept attempts survive

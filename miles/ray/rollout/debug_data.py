@@ -166,7 +166,8 @@ def save_debug_rollout_data(
     save_debug_trajectory_data(args, samples, rollout_id, evaluation, trainer_model_id=trainer_model_id)
     save_dashboard_columns(samples, path.parent.parent / "dashboard_columns" / f"rollout_{stem}.parquet")
     dump_data = dict(samples=[sample.to_dict() for sample in samples])
-    torch.save(dict(rollout_id=rollout_id, metadata=metadata or {}, **dump_data), path)
+    # Protocol 5 stores NumPy routing arrays without protocol 2's byte-string encoding.
+    torch.save(dict(rollout_id=rollout_id, metadata=metadata or {}, **dump_data), path, pickle_protocol=5)
 
 
 def _format_dump_path(path_template: str, *, stem: str) -> Path:

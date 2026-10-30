@@ -108,7 +108,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         timing = sibling_timing.sample_record(sample)
         if timing is not None:
             timing["request_id"] = payload["rid"]
-        # With the qualified MILES router the complete response metadata survives.
+        # With the pinned Rust or MILES router the complete response metadata survives.
         # Do not retry a request in place. On recognized transport loss, the
         # producer discards the whole group and requeues its pristine prompts.
         url = f"http://{input.args.sglang_router_ip}:{input.args.sglang_router_port}/generate"
@@ -145,7 +145,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
                 )
         except httpx.HTTPError as error:
             logger.exception(
-                "Policy refresh HTTP failure: request=%s group=%s sample=%s url=%s elapsed_seconds=%.3f error=%s status=%s attempts=1 delivery=unknown; correlate request with miles_router logs. No HTTP-level retry; passing failure to the producer for bounded group recovery.",
+                "Policy refresh HTTP failure: request=%s group=%s sample=%s url=%s elapsed_seconds=%.3f error=%s status=%s attempts=1 delivery=unknown; correlate request with router/engine logs. No HTTP-level retry; passing failure to the producer for bounded group recovery.",
                 payload["rid"],
                 sample.group_index,
                 sample.index,

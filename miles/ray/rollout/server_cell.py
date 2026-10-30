@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 
+from miles.backends.sglang_utils import rust_router_membership
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient, probe_server_healthy
 from miles.backends.sglang_utils.sglang_engine import build_server_url
 from miles.backends.sglang_utils.sglang_router_api_client import SGLangRouterApiClient, use_legacy_router_api
@@ -61,6 +62,10 @@ class ServerCell:
     provider: BaseWorkerProvider
     health_checker_activeness: Callable[[], ActiveAndEpoch] = lambda: ActiveAndEpoch(active=True, epoch=0)
     _health_checker: BaseHealthChecker = dataclasses.field(init=False)
+    _rust_membership: rust_router_membership.RustRouterMembership | None = dataclasses.field(default=None, init=False)
+    _router_health_failures: int = dataclasses.field(default=0, init=False)
+    _router_quarantining: bool = dataclasses.field(default=False, init=False)
+    _router_health_next: float = dataclasses.field(default=0.0, init=False)
     _env_reporter: EngineEnvReporter = dataclasses.field(init=False)
     _state: CellState = dataclasses.field(default_factory=StateUninitialized)
 
@@ -166,7 +171,45 @@ class ServerCell:
     async def tick(self) -> None:
         if isinstance(self._state, StateInitializing):
             await self._tick_when_initializing()
+        if rust_router_membership.controller_manages_router(self.args):
+            await self._check_router_membership_health()
         await self._report_env_if_due()
+
+    async def _check_router_membership_health(self) -> None:
+        # The controller lock serializes this probe with publication and cell
+        # replacement. Paused/offloaded engines must not accumulate failures.
+        if not self.health_checker_activeness().active:
+            self._router_health_failures = 0
+            return
+        serve_without_publication = not self.meta.update_weights or self.args.debug_rollout_only
+        if self.is_pending_weights and serve_without_publication and self._rust_membership is not None:
+            if await rust_router_membership.engine_healthy(
+                self.server_url, api_key=self.meta.sglang_api_key, timeout=self.args.rollout_health_check_timeout
+            ):
+                await self._register_with_router(self.addr_info)
+                self._mark_serving()
+                self._router_health_failures = 0
+            return
+        if not self.is_serving:
+            return
+        if not self._router_quarantining:
+            if time.monotonic() < self._router_health_next:
+                return
+            self._router_health_next = time.monotonic() + self.args.rollout_health_check_interval
+            healthy = await rust_router_membership.engine_healthy(
+                self.server_url, api_key=self.meta.sglang_api_key, timeout=self.args.rollout_health_check_timeout
+            )
+            self._router_health_failures = 0 if healthy else self._router_health_failures + 1
+            if self._router_health_failures < self.args.miles_router_health_check_failure_threshold:
+                return
+        assert self._rust_membership is not None
+        self._router_quarantining = True
+        await self._rust_membership.remove()
+        self._router_quarantining = False
+        self._change_state("quarantine", StateServing, StatePendingWeights(addr_info=self.addr_info))
+        logger.warning(
+            "Router worker quarantined until weight publication: cell=%s worker=%s", self.meta.cell_id, self.server_url
+        )
 
     async def _report_env_if_due(self) -> None:
         if not self.is_pending_weights_or_serving:
@@ -207,11 +250,25 @@ class ServerCell:
 
     async def mark_weights_ready(self) -> None:
         assert isinstance(self._state, (StatePendingWeights, StateServing)), f"{self._state=}"
-        await self._register_with_router(addr_info=self._state.addr_info, weights_ready=self.args.use_miles_router)
+        await self._register_with_router(addr_info=self._state.addr_info, weights_ready=True)
+        self._router_health_failures = 0
+        self._router_quarantining = False
         if self.is_pending_weights:
             self._mark_serving()
 
     async def _register_with_router(self, addr_info: CellAddrInfo, *, weights_ready: bool = False) -> None:
+        if rust_router_membership.controller_manages_router(self.args):
+            if self.meta.update_weights and not self.args.debug_rollout_only and not weights_ready:
+                raise RuntimeError("Rust router registration requires confirmed weights")
+            if self._rust_membership is None:
+                self._rust_membership = rust_router_membership.RustRouterMembership(
+                    router_url=self.router_api_client.router_url,
+                    worker_url=addr_info.server_url,
+                    worker_type=self.meta.worker_type,
+                    bootstrap_port=addr_info.bootstrap_port,
+                )
+            await self._rust_membership.ensure_registered()
+            return
         await self.router_api_client.add_worker(
             worker_url=addr_info.server_url,
             worker_type=self.meta.worker_type,
@@ -223,9 +280,14 @@ class ServerCell:
     async def dispose(self) -> None:
         self._health_checker.stop()
 
+        if self._rust_membership is not None:
+            # Also settle pending registration after cancellation/failure. A
+            # removal failure must prevent a new cell from reusing this URL.
+            await self._rust_membership.remove(retire=True)
         match self._state:
             case StateServing():
-                await self._unregister_from_router()
+                if self._rust_membership is None:
+                    await self._unregister_from_router()
             case StateUninitialized() | StateInitializing() | StatePendingWeights() | StateDisposed():
                 pass
             case _:

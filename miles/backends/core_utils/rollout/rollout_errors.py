@@ -33,13 +33,25 @@ def recovery_category(error: BaseException) -> str | None:
         return None
     if error.response.status_code == 429:
         return "overload"
-    if error.response.status_code != 503:
+    if error.response.status_code not in (500, 503):
         return None
     try:
         body = error.response.json()
     except ValueError:
         return None
     if not isinstance(body, dict):
+        return None
+    # Rust's no-worker response means no engine accepted this attempt. Keep
+    # unknown router errors fatal instead of retrying every 503 blindly.
+    router_error = body.get("error")
+    if isinstance(router_error, dict) and isinstance(router_error.get("code"), str):
+        category = {
+            (503, "no_available_workers"): "unavailable",
+            (500, "call_upstream_request_error"): "transport",
+        }.get((error.response.status_code, router_error.get("code")))
+        if category is not None:
+            return category
+    if error.response.status_code != 503:
         return None
     # MILES uses detail; SGLang's /generate error envelope uses message.
     message = body.get("detail", body.get("message"))

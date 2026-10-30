@@ -7,6 +7,7 @@ from typing import Any
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
+from miles.backends.sglang_utils.rust_router_membership import controller_manages_router
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.eval_fleet import EvalFleetInfo, EvalFleetPin, InferenceControllerEvalFleet
@@ -137,9 +138,7 @@ class InferenceController:
             f"(reporter {snapshot.reporter_id})"
         )
         for cell in snapshot.cells:
-            assert (
-                model_id := cell.info.meta.get("model_id")
-            ) in self.servers, (
+            assert (model_id := cell.info.meta.get("model_id")) in self.servers, (
                 f"cell {cell.info.cell_id} serves model {model_id!r}, this run serves {sorted(self.servers)}"
             )
         await provider.ingest(snapshot)
@@ -239,16 +238,25 @@ class InferenceController:
 
     @releases_lock
     async def end_update_weights(self, snapshot_cell_id_to_hashes: dict[str, str]) -> None:
-        await asyncio.gather(
+        results = await asyncio.gather(
             *[
                 cell.mark_weights_ready()
                 for srv in self.servers.values()
                 for cell_id, cell in srv.server_cells.items()
                 if cell_id in snapshot_cell_id_to_hashes
                 and snapshot_cell_id_to_hashes[cell_id] == cell.meta.workers_hash
-                and (cell.is_pending_weights or (self.args.use_miles_router and cell.is_serving))
-            ]
+                and (
+                    cell.is_pending_weights
+                    or ((self.args.use_miles_router or controller_manages_router(self.args)) and cell.is_serving)
+                )
+            ],
+            return_exceptions=True,
         )
+        # Keep the publication lock until every membership operation settles;
+        # gather's default can otherwise leave registrations racing disposal.
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
     @releases_lock
     async def abort_update_weights(self) -> None:
@@ -318,9 +326,9 @@ class InferenceController:
 
     @lock_exempt
     async def pin_eval_fleet(self, checkpoint_dir: str, weight_version: str) -> EvalFleetPin:
-        assert (
-            self._eval_fleet is not None
-        ), "this run deploys no eval fleet, so nothing asked this controller to pin one"
+        assert self._eval_fleet is not None, (
+            "this run deploys no eval fleet, so nothing asked this controller to pin one"
+        )
         return await self._eval_fleet.pin(checkpoint_dir=checkpoint_dir, weight_version=weight_version)
 
     # -------------------------- misc APIs -----------------------------

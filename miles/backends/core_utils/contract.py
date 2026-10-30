@@ -26,8 +26,12 @@ class StepNormalization:
         return loss * self.world_size / self.token_denominator
 
 
-def step_normalization(batches, global_batch_size):
-    """Match MILES' clamped per-sample token denominator and Core rank averaging."""
+def step_normalization(batches, global_batch_size, *, allow_empty=False):
+    """Match MILES' clamped per-sample denominator and Core rank averaging.
+
+    ``allow_empty`` lets the actor identify globally excluded steps before any
+    forward or optimizer work. A locally empty rank must still join active steps.
+    """
     masks = [mask for batch in batches for mask in batch["loss_masks"]]
     counts = torch.tensor(
         [
@@ -41,7 +45,7 @@ def step_normalization(batches, global_batch_size):
     )
     dist.all_reduce(counts)
     samples, active, denominator, model_tokens = counts.tolist()
-    if samples != global_batch_size or active == 0 or model_tokens < active:
+    if samples != global_batch_size or (active == 0 and not allow_empty) or model_tokens < active:
         raise ValueError(f"Invalid optimizer batch counts: {counts.tolist()}, expected {global_batch_size} samples")
     return StepNormalization(samples, active, denominator, model_tokens, dist.get_world_size())
 

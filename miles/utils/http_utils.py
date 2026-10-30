@@ -212,7 +212,7 @@ def _next_actor():
     return actor
 
 
-async def _post(client, url, payload, max_retries=60, action="post", headers=None):
+async def _post(client, url, payload, max_retries=60, action="post", headers=None, *, return_bytes=False):
     retry_count = 0
     while retry_count < max_retries:
         try:
@@ -222,6 +222,8 @@ async def _post(client, url, payload, max_retries=60, action="post", headers=Non
             else:
                 response = await getattr(client, action)(url, json=payload or {}, headers=headers)
             response.raise_for_status()
+            if return_bytes:
+                return response.content
             try:
                 output = response.json()
             except json.JSONDecodeError:
@@ -295,7 +297,7 @@ def init_http_client(args):
     _client_concurrency = max(_client_concurrency, args.sglang_server_concurrency)
     if _http_client is None:
         _http_client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=_client_concurrency),
+            limits=_rollout_client_limits(_client_concurrency),
             timeout=httpx.Timeout(None),
         )
 
@@ -303,6 +305,15 @@ def init_http_client(args):
     if args.use_distributed_post:
         _init_ray_distributed_post(args)
         _distributed_post_enabled = True
+
+
+def _rollout_client_limits(concurrency):
+    # Large generation responses can stall the consumer after HTTPX chooses an
+    # idle socket but before it writes. The server can close that socket in the
+    # meantime, losing a whole prompt group to ReadError. New connections avoid
+    # this idle-reuse race without retrying potentially delivered generations.
+    # General/control clients owned by other providers retain their own pools.
+    return httpx.Limits(max_connections=max(1, concurrency), max_keepalive_connections=0)
 
 
 def _init_ray_distributed_post(args):
@@ -329,12 +340,14 @@ def _init_ray_distributed_post(args):
         def __init__(self, *, concurrency: int):
             # Lazy creation to this actor's event loop
             self._client = httpx.AsyncClient(
-                limits=httpx.Limits(max_connections=max(1, concurrency)),
+                limits=_rollout_client_limits(concurrency),
                 timeout=httpx.Timeout(None),
             )
 
-        async def do_post(self, url, payload, max_retries=60, action="post", headers=None):
-            return await _post(self._client, url, payload, max_retries, action=action, headers=headers)
+        async def do_post(self, url, payload, max_retries=60, action="post", headers=None, *, return_bytes=False):
+            return await _post(
+                self._client, url, payload, max_retries, action=action, headers=headers, return_bytes=return_bytes
+            )
 
     # Create actors per node
     created = []
@@ -364,18 +377,22 @@ def _rollout_client() -> httpx.AsyncClient:
 
 
 # TODO may generalize the name since it now contains http DELETE/GET etc (with retries and remote-execution)
-async def post(url, payload, max_retries=60, action="post", headers=None):
+async def post(url, payload, max_retries=60, action="post", headers=None, *, return_bytes=False):
     # If distributed mode is enabled and actors exist, dispatch via Ray.
     if _distributed_post_enabled and _post_actors:
         try:
             actor = _next_actor()
             if actor is not None:
-                return await actor.do_post.remote(url, payload, max_retries, action=action, headers=headers)
+                return await actor.do_post.remote(
+                    url, payload, max_retries, action=action, headers=headers, return_bytes=return_bytes
+                )
         except Exception as e:
             logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
             # fall through to local
 
-    return await _post(_rollout_client(), url, payload, max_retries, action=action, headers=headers)
+    return await _post(
+        _rollout_client(), url, payload, max_retries, action=action, headers=headers, return_bytes=return_bytes
+    )
 
 
 # TODO unify w/ `post` to add retries and remote-execution

@@ -7,10 +7,11 @@ import uuid
 from typing import cast
 
 import httpx
+import orjson
 
 from miles.backends.core_utils import infra_timeouts
 from miles.backends.core_utils.publication import policy_refresh
-from miles.backends.core_utils.rollout import pipeline_observer, sibling_timing
+from miles.backends.core_utils.rollout import opener_branches, pipeline_observer, response_seed, sibling_timing
 from miles.backends.core_utils.rollout.async_rollout import ManagedFullyAsyncRolloutFn
 from miles.backends.core_utils.rollout.errors import GenerationRequestTimeout
 from miles.backends.core_utils.rollout.generation_admission import GenerationAdmission
@@ -75,6 +76,12 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         records = sibling_timing.start_group(prompt_group) if observed else None
         outcome = "completed"
         try:
+            if opener_branches.settings(self.args) is not None:
+                try:
+                    await self._branch_openers(prompt_group)
+                except BaseException:
+                    self._return_unstarted_slots(prompt_group)
+                    raise
             return await super()._generate_group(prompt_group)
         except BaseException as error:
             outcome = type(error).__name__
@@ -82,6 +89,18 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         finally:
             if records is not None:
                 sibling_timing.write_group(self.args, records, outcome)
+
+    def _return_unstarted_slots(self, prompt_group):
+        """Free the sample slots charged at submission for a group that never started generating.
+
+        Slots are normally freed by each sample's completion callback; a group that fails
+        before its samples start has no callbacks, so its slots would stay charged until
+        the producer next went idle.
+        """
+        done = self._scheduler.sample_done_callback
+        if done is not None:
+            for _ in prompt_group:
+                done()
 
     async def _generate_response(self, input):
         sibling_timing.admitted(input.sample)
@@ -94,13 +113,71 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         finally:
             sibling_timing.finished(input.sample, outcome)
 
+    async def _prefill(self, payload, purpose):
+        """Send one prefill-only request; a timeout is recoverable like a generation timeout."""
+        payload = {**payload, "rid": uuid.uuid4().hex}
+        url = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}/generate"
+        timeout = self.args.olmo_core.refresh_request_timeout
+        try:
+            return await infra_timeouts.wait_for(
+                post(url, payload, max_retries=1, headers={"x-miles-request-id": payload["rid"]}),
+                timeout,
+                operation=f"{purpose} request {payload['rid']}",
+            )
+        except TimeoutError as error:
+            # The producer requeues the group, as for a generation timeout.
+            raise GenerationRequestTimeout(
+                f"{purpose.capitalize()} request {payload['rid']} exceeded "
+                f"core.refresh_request_timeout={timeout:g}s. Check engine progress and admission pressure."
+            ) from error
+
+    async def _score_response_seed(self, input, prompt_ids, seed_ids):
+        """Score requested opening tokens under the serving policy before generating."""
+        payload = response_seed.scoring_payload(prompt_ids, seed_ids, input.sampling_params)
+        output = await self._prefill(payload, "response seed scoring")
+        return response_seed.parse_scores(output, seed_ids)
+
+    async def _branch_openers(self, prompt_group):
+        """Probe the prompt's likely openers and seed the group's samples with a uniform draw.
+
+        A retried or resumed group reuses its persisted assignment. Probes take a
+        generation-admission slot, so admission pauses park them and lifecycle drains
+        wait for them like any generation request.
+        """
+        if opener_branches.assigned(prompt_group):
+            return
+        branches, pool = opener_branches.settings(self.args)
+        first = prompt_group[0]
+        prompt_ids = compute_prompt_ids_from_sample(self.state, first)
+
+        async def probe(ids, top):
+            async with self._generation_admission:
+                return await self._prefill(opener_branches.probe_payload(ids, top), "opener probe")
+
+        mode = getattr(self.args.olmo_core, "opener_mode", "visible")
+        result = await opener_branches.candidates(probe, self.state.tokenizer, prompt_ids, pool, mode=mode)
+        key = f"{getattr(self.args, 'rollout_seed', 0)}:{first.group_index}:{first.index}"
+        result["anchor_top1"] = getattr(self.args.olmo_core, "opener_anchor_top1", False)
+        chosen = opener_branches.choose(result["found"], branches, key, anchor_top1=result["anchor_top1"])
+        opener_branches.assign(prompt_group, chosen, result)
+        persist = getattr(self.data_source, "persist_group_metadata", None)
+        if persist is None:
+            raise RuntimeError("Opener branches require a data source that persists group metadata for retries")
+        persist(prompt_group, (response_seed.REQUEST_KEY, opener_branches.RECORD_KEY))
+
     async def _generate_response_impl(self, input):
         sample = input.sample
-        payload, halt = compute_request_payload(
-            input.args,
-            input_ids=compute_prompt_ids_from_sample(input.state, sample),
-            sampling_params=input.sampling_params,
-        )
+        input_ids = compute_prompt_ids_from_sample(input.state, sample)
+        sampling_params = input.sampling_params
+        # Optional opening tokens chosen by the data source; absent for ordinary samples.
+        seed = response_seed.requested(sample)
+        if seed is not None:
+            seed_ids, seed_text = response_seed.tokenize(input.state, sample, input_ids, seed)
+            scores, version = await self._score_response_seed(input, input_ids, seed_ids)
+            response_seed.apply(sample, input_ids, seed_ids, seed_text, scores, version)
+            sampling_params = response_seed.remaining_sampling_params(input.args, sampling_params, len(seed_ids))
+            input_ids = sample.tokens
+        payload, halt = compute_request_payload(input.args, input_ids=input_ids, sampling_params=sampling_params)
         if payload is None:
             raise ValueError(f"Policy refresh prompt has no response-token budget ({halt}); increase context length")
         payload["rid"] = uuid.uuid4().hex
@@ -122,11 +199,16 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             len(payload.get("input_ids", [])),
         )
         try:
-            output = await infra_timeouts.wait_for(
-                post(url, payload, max_retries=1, headers={"x-miles-request-id": payload["rid"]}),
-                timeout,
-                operation=f"generation request {payload['rid']}",
+            # Long generations are normal. Per-request 30s watchdog logs scale
+            # with fleet concurrency and compete with response delivery. Keep
+            # the deadline; driver/queue diagnostics report aggregate progress.
+            response = await asyncio.wait_for(
+                post(url, payload, max_retries=1, headers={"x-miles-request-id": payload["rid"]}, return_bytes=True),
+                timeout=infra_timeouts.seconds(timeout),
             )
+            # Routing replay makes responses large. Decode UTF-8 bytes directly
+            # rather than building an intermediate string in HTTPX/stdlib JSON.
+            output = orjson.loads(response)
         except httpx.HTTPError as error:
             logger.exception(
                 "Policy refresh HTTP failure: request=%s group=%s sample=%s url=%s elapsed_seconds=%.3f "
@@ -152,7 +234,8 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         if output.get("meta_info", {}).get("finish_reason", {}).get("type") not in ("stop", "length"):
             raise RuntimeError("Policy refresh request did not finish; refusing a partial training sample")
         await update_sample_from_response(input.args, sample, payload, output)
-        record = policy_refresh.record_response(sample, output["meta_info"])
+        meta = output["meta_info"] if seed is None else response_seed.merged_meta_info(sample, output["meta_info"])
+        record = policy_refresh.record_response(sample, meta)
         logger.info(
             "Policy refresh response: request=%s tokens=%d spans=%s replay_version=%d",
             payload["rid"],

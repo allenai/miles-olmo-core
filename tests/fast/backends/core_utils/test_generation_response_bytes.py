@@ -8,9 +8,9 @@ import struct
 import httpx
 import orjson
 import pytest
+from tests.ci.ci_register import register_cpu_ci
 
 from miles.utils import http_utils
-from tests.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="stage-a-cpu", labels=[])
 

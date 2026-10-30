@@ -17,7 +17,9 @@ def test_ready_stages_exclude_already_buffered_entries():
             args=SimpleNamespace(sglang_server_concurrency=512, rollout_num_gpus=19, rollout_num_gpus_per_engine=1),
             state=SimpleNamespace(generate_fn_semaphore=asyncio.Semaphore(9728)),
             _output=SimpleNamespace(_buffer=[entries[0]], _capacity=256),
-            _ready_completion_counts={id(entry): pipeline_observer.completion_counts([entry]) for entry in entries[:2]},
+            _ready_completion_counts={
+                id(entry): pipeline_observer.completion_counts([entry]) for entry in entries[:2]
+            },
             _active_tasks={completed},
             _producing_groups={1: [], 2: [], 3: []},
             _producer_resumed=resumed,

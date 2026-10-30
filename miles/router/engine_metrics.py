@@ -22,7 +22,9 @@ async def fetch_engine_metrics(client: httpx.AsyncClient, url: str) -> tuple[str
 def render_engine_metrics(responses: list[tuple[str, str | None]]) -> bytes:
     """Preserve worker labels and expose missing scrapes instead of zero values."""
     families = {}
-    availability = core.GaugeMetricFamily("miles_router_engine_metrics_up", "Whether the engine metrics scrape succeeded", labels=["worker_addr"])
+    availability = core.GaugeMetricFamily(
+        "miles_router_engine_metrics_up", "Whether the engine metrics scrape succeeded", labels=["worker_addr"]
+    )
     for url, text in responses:
         try:
             parsed = list(parser.text_string_to_metric_families(text)) if text is not None else None
@@ -33,7 +35,9 @@ def render_engine_metrics(responses: list[tuple[str, str | None]]) -> bytes:
             key = (metric.name, metric.type, metric.unit)
             if key not in families:
                 families[key] = core.Metric(metric.name, metric.documentation, metric.type, metric.unit)
-            families[key].samples.extend(sample._replace(labels={**sample.labels, "worker_addr": url}) for sample in metric.samples)
+            families[key].samples.extend(
+                sample._replace(labels={**sample.labels, "worker_addr": url}) for sample in metric.samples
+            )
 
     class Collector:
         def collect(self):

@@ -138,7 +138,9 @@ class InferenceController:
             f"(reporter {snapshot.reporter_id})"
         )
         for cell in snapshot.cells:
-            assert (model_id := cell.info.meta.get("model_id")) in self.servers, (
+            assert (
+                model_id := cell.info.meta.get("model_id")
+            ) in self.servers, (
                 f"cell {cell.info.cell_id} serves model {model_id!r}, this run serves {sorted(self.servers)}"
             )
         await provider.ingest(snapshot)
@@ -326,9 +328,9 @@ class InferenceController:
 
     @lock_exempt
     async def pin_eval_fleet(self, checkpoint_dir: str, weight_version: str) -> EvalFleetPin:
-        assert self._eval_fleet is not None, (
-            "this run deploys no eval fleet, so nothing asked this controller to pin one"
-        )
+        assert (
+            self._eval_fleet is not None
+        ), "this run deploys no eval fleet, so nothing asked this controller to pin one"
         return await self._eval_fleet.pin(checkpoint_dir=checkpoint_dir, weight_version=weight_version)
 
     # -------------------------- misc APIs -----------------------------

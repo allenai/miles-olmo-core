@@ -176,7 +176,9 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
 
     async def _abort_engine_requests(self, timeout: float) -> None:
         """Ask every engine to abort its in-flight requests; unreachable engines are logged."""
-        urls = await infra_timeouts.wait_for(get_worker_urls(self.args), timeout, operation="discover engines to abort")
+        urls = await infra_timeouts.wait_for(
+            get_worker_urls(self.args), timeout, operation="discover engines to abort"
+        )
 
         async def abort(url):
             try:

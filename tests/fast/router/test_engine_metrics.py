@@ -73,12 +73,18 @@ def test_metrics_endpoint_uses_current_workers_without_changing_routing_load():
         router.dead_workers.add("http://quarantined")
         router._retired.add("http://retired")
         try:
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=router.app), base_url="http://router") as client:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=router.app), base_url="http://router"
+            ) as client:
                 response = await client.get("/engine_metrics")
                 assert response.status_code == 200
                 assert response.headers["content-type"].startswith("text/plain; version=0.0.4")
                 assert set(seen) == {"http://active/metrics", "http://quarantined/metrics"}
-                assert router.worker_request_counts == {"http://active": 2, "http://quarantined": 0, "http://retired": 1}
+                assert router.worker_request_counts == {
+                    "http://active": 2,
+                    "http://quarantined": 0,
+                    "http://retired": 1,
+                }
                 router.worker_request_counts.clear()
                 seen.clear()
                 assert (await client.get("/engine_metrics")).status_code == 200
@@ -99,7 +105,9 @@ def test_worker_http_error_and_deadline_leave_explicit_gaps(monkeypatch):
 
         monkeypatch.setattr(engine_metrics, "SCRAPE_TIMEOUT_SECONDS", 0.02)
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            results = await asyncio.gather(*(engine_metrics.fetch_engine_metrics(client, url) for url in ["http://slow", "http://failed"]))
+            results = await asyncio.gather(
+                *(engine_metrics.fetch_engine_metrics(client, url) for url in ["http://slow", "http://failed"])
+            )
         assert results == [("http://slow", None), ("http://failed", None)]
 
     asyncio.run(exercise())
@@ -138,7 +146,9 @@ def test_busy_generation_does_not_block_metrics_or_health():
         generation = asyncio.create_task(router.client.post(url + "/generate", json={}))
         try:
             assert await asyncio.to_thread(entered.wait, 2)
-            metrics, health = await asyncio.wait_for(asyncio.gather(router.get_engine_metrics(), router._check_worker_health(url)), timeout=2)
+            metrics, health = await asyncio.wait_for(
+                asyncio.gather(router.get_engine_metrics(), router._check_worker_health(url)), timeout=2
+            )
             assert health == (url, True)
             assert any(s.value == 224 for s in samples(metrics.body.decode()))
             assert not generation.done() and router.worker_request_counts[url] == 1

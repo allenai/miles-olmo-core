@@ -11,6 +11,7 @@ import time
 import httpx
 
 from miles.utils import logger_utils
+from miles.utils.http_post_errors import HTTPPostFailure
 from miles.utils.http_post_observer import PostObserver
 from miles.utils.logging_utils import configure_logger_raw
 
@@ -354,6 +355,8 @@ def _init_ray_distributed_post(args):
                     self._client, url, payload, max_retries, action=action, headers=headers, return_bytes=return_bytes
                 )
                 return result
+            except httpx.HTTPError as error:
+                return HTTPPostFailure.capture(error, method=action, url=url)
             finally:
                 self._observer.finish(observation, result)
 
@@ -406,9 +409,12 @@ async def post(url, payload, max_retries=60, action="post", headers=None, *, ret
         # the rollout's bounded whole-group recovery owns retries, not this layer.
         actor = _next_actor()
         if actor is not None:
-            return await actor.do_post.remote(
+            result = await actor.do_post.remote(
                 url, payload, max_retries, action=action, headers=headers, return_bytes=return_bytes
             )
+            if isinstance(result, HTTPPostFailure):
+                raise result.exception()
+            return result
 
     return await _post(
         _rollout_client(), url, payload, max_retries, action=action, headers=headers, return_bytes=return_bytes

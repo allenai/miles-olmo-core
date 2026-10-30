@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 import sys
 from contextlib import suppress
 
@@ -13,11 +12,11 @@ from starlette.responses import Response
 
 from miles.router import engine_metrics
 from miles.router.config import MilesRouterConfig
-from miles.utils import infra_timeouts
+from miles.utils import infra_timeouts, logger_utils
 from miles.utils.logging_utils import configure_logger_raw
 from miles.utils.workers.argv_utils import parse_config_argv
 
-logger = logging.getLogger(__name__)
+logger = logger_utils.setup_logger(__name__)
 
 
 def run_router(config: MilesRouterConfig):
@@ -59,7 +58,9 @@ class MilesRouter:
         self.engine_metrics = engine_metrics.EngineMetrics()
 
         self.client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=config.max_connections),
+            # Avoid idle-socket reuse races while large generation bodies stall
+            # this event loop. Health/control traffic retains its separate pool.
+            limits=httpx.Limits(max_connections=config.max_connections, max_keepalive_connections=0),
             timeout=infra_timeouts.http_timeout(config.timeout),
         )
 

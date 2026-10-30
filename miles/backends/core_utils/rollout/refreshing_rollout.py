@@ -132,12 +132,20 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             )
             # Routing replay makes responses large. Decode UTF-8 bytes directly
             # rather than building an intermediate string in HTTPX/stdlib JSON.
+            bytes_ready_unix = time.time()
+            decode_start = time.monotonic()
+            decode_cpu_start = time.thread_time()
             output = orjson.loads(response)
+            if timing is not None:
+                timing.update(
+                    response_bytes=len(response),
+                    response_bytes_ready_unix=bytes_ready_unix,
+                    json_decode_seconds=time.monotonic() - decode_start,
+                    json_decode_thread_cpu_seconds=time.thread_time() - decode_cpu_start,
+                )
         except httpx.HTTPError as error:
             logger.exception(
-                "Policy refresh HTTP failure: request=%s group=%s sample=%s url=%s elapsed_seconds=%.3f "
-                "error=%s status=%s attempts=1 delivery=unknown; correlate request with miles_router logs. "
-                "No HTTP-level retry; passing failure to the producer for bounded group recovery.",
+                "Policy refresh HTTP failure: request=%s group=%s sample=%s url=%s elapsed_seconds=%.3f error=%s status=%s attempts=1 delivery=unknown; correlate request with miles_router logs. No HTTP-level retry; passing failure to the producer for bounded group recovery.",
                 payload["rid"],
                 sample.group_index,
                 sample.index,
@@ -157,8 +165,11 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         sibling_timing.response_received(sample, payload["rid"], output.get("meta_info", {}))
         if output.get("meta_info", {}).get("finish_reason", {}).get("type") not in ("stop", "length"):
             raise RuntimeError("Policy refresh request did not finish; refusing a partial training sample")
+        conversion_start = time.monotonic()
         await update_sample_from_response(input.args, sample, payload, output)
         record = policy_refresh.record_response(sample, output["meta_info"])
+        if timing is not None:
+            timing["sample_conversion_seconds"] = time.monotonic() - conversion_start
         logger.info(
             "Policy refresh response: request=%s tokens=%d spans=%s replay_version=%d",
             payload["rid"],

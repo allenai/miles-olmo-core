@@ -214,7 +214,9 @@ def _next_actor():
     return actor
 
 
-async def _post(client, url, payload, max_retries=60, action="post", headers=None, *, return_bytes=False):
+async def _post(
+    client, url, payload, max_retries=60, action="post", headers=None, *, return_bytes=False, observation=None
+):
     retry_count = 0
     while retry_count < max_retries:
         try:
@@ -224,12 +226,21 @@ async def _post(client, url, payload, max_retries=60, action="post", headers=Non
             else:
                 response = await getattr(client, action)(url, json=payload or {}, headers=headers)
             response.raise_for_status()
+            if observation is not None:
+                observation.update(response_bytes=len(response.content), response_body_ready_unix=time.time())
             if return_bytes:
                 return response.content
+            decode_start, decode_cpu_start = time.monotonic(), time.thread_time()
             try:
                 output = response.json()
             except json.JSONDecodeError:
                 output = response.text
+            finally:
+                if observation is not None:
+                    observation.update(
+                        json_decode_seconds=time.monotonic() - decode_start,
+                        json_decode_thread_cpu_seconds=time.thread_time() - decode_cpu_start,
+                    )
         except Exception as e:
             retry_count += 1
 
@@ -352,7 +363,14 @@ def _init_ray_distributed_post(args):
             result = None
             try:
                 result = await _post(
-                    self._client, url, payload, max_retries, action=action, headers=headers, return_bytes=return_bytes
+                    self._client,
+                    url,
+                    payload,
+                    max_retries,
+                    action=action,
+                    headers=headers,
+                    return_bytes=return_bytes,
+                    observation=observation,
                 )
                 return result
             except httpx.HTTPError as error:

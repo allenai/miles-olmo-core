@@ -46,7 +46,8 @@ def test_generation_bytes_preserve_complete_payload_and_float_bits():
 
 
 @pytest.mark.parametrize("failure", ["status", "read"])
-def test_byte_response_mode_preserves_single_attempt_transport_errors(failure):
+@pytest.mark.parametrize("return_bytes", [False, True])
+def test_response_modes_preserve_single_attempt_transport_errors(failure, return_bytes):
     calls = []
 
     def handler(request):
@@ -58,13 +59,14 @@ def test_byte_response_mode_preserves_single_attempt_transport_errors(failure):
     async def scenario():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             with pytest.raises(httpx.ReadError if failure == "read" else httpx.HTTPStatusError):
-                await http_utils._post(client, "http://engine/generate", {}, max_retries=1, return_bytes=True)
+                await http_utils._post(client, "http://engine/generate", {}, max_retries=1, return_bytes=return_bytes)
         assert len(calls) == 1
 
     asyncio.run(scenario())
 
 
-def test_byte_response_mode_joins_cancellation():
+@pytest.mark.parametrize("return_bytes", [False, True])
+def test_response_modes_join_cancellation(return_bytes):
     async def scenario():
         started, finalized = asyncio.Event(), asyncio.Event()
 
@@ -77,7 +79,7 @@ def test_byte_response_mode_joins_cancellation():
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             task = asyncio.create_task(
-                http_utils._post(client, "http://engine/generate", {}, max_retries=1, return_bytes=True)
+                http_utils._post(client, "http://engine/generate", {}, max_retries=1, return_bytes=return_bytes)
             )
             await started.wait()
             task.cancel()

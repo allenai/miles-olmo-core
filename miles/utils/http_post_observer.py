@@ -35,7 +35,7 @@ class PostObserver:
         record.update(
             response_ready_unix=time.time(),
             request_seconds=time.monotonic() - record.pop("started"),
-            response_bytes=len(result) if isinstance(result, bytes) else None,
+            response_bytes=record.get("response_bytes", len(result) if isinstance(result, bytes) else None),
             succeeded=result is not None,
             worker_active_requests=self._active,
             worker_process_cpu_seconds=time.process_time(),

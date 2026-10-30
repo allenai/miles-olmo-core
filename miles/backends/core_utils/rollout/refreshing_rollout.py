@@ -7,7 +7,6 @@ import uuid
 from typing import cast
 
 import httpx
-import orjson
 
 from miles.backends.core_utils import infra_timeouts
 from miles.backends.core_utils.publication import policy_refresh
@@ -126,23 +125,15 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             # Long generations are normal. Per-request 30s watchdog logs scale
             # with fleet concurrency and compete with response delivery. Keep
             # the deadline; driver/queue diagnostics report aggregate progress.
-            response = await asyncio.wait_for(
-                post(url, payload, max_retries=1, headers={"x-miles-request-id": payload["rid"]}, return_bytes=True),
+            # Keep MILES' parsed-response contract: distributed HTTP actors own
+            # JSON decoding, so large replay responses do not stall the producer
+            # event loop that admits requests and fills the trainer queue.
+            output = await asyncio.wait_for(
+                post(url, payload, max_retries=1, headers={"x-miles-request-id": payload["rid"]}),
                 timeout=infra_timeouts.seconds(timeout),
             )
-            # Routing replay makes responses large. Decode UTF-8 bytes directly
-            # rather than building an intermediate string in HTTPX/stdlib JSON.
-            bytes_ready_unix = time.time()
-            decode_start = time.monotonic()
-            decode_cpu_start = time.thread_time()
-            output = orjson.loads(response)
             if timing is not None:
-                timing.update(
-                    response_bytes=len(response),
-                    response_bytes_ready_unix=bytes_ready_unix,
-                    json_decode_seconds=time.monotonic() - decode_start,
-                    json_decode_thread_cpu_seconds=time.thread_time() - decode_cpu_start,
-                )
+                timing["response_decoded_ready_unix"] = time.time()
         except httpx.HTTPError as error:
             logger.exception(
                 "Policy refresh HTTP failure: request=%s group=%s sample=%s url=%s elapsed_seconds=%.3f error=%s status=%s attempts=1 delivery=unknown; correlate request with router/engine logs. No HTTP-level retry; passing failure to the producer for bounded group recovery.",

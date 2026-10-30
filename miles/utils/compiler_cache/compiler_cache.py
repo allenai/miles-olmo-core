@@ -3,6 +3,7 @@
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -24,6 +25,7 @@ FAMILIES = {
 }
 HEX = re.compile(r"[0-9a-f]{64}")
 SOURCE_SUFFIXES = {".py", ".c", ".cpp", ".h", ".hpp", ".cu", ".cuh", ".so"}
+CORE_TRITON_SCOPE = "core-triton-v2"
 NON_COMPILE_MILES = {
     "hf_checkpoint",
     "save",
@@ -108,10 +110,17 @@ def sha256(path):
     return result.hexdigest()
 
 
-def source_identity(root):
+def source_identity(root, *, excluded_paths=(), exclude_tests=False):
     files = {}
     for path in sorted(root.rglob("*")):
-        if any(part in {".git", "__pycache__", ".venv"} for part in path.relative_to(root).parts):
+        relative = path.relative_to(root)
+        if any(part in {".git", "__pycache__", ".venv"} for part in relative.parts):
+            continue
+        if any(relative.is_relative_to(excluded) for excluded in excluded_paths):
+            continue
+        if exclude_tests and (
+            "tests" in relative.parts or path.name.startswith("test_") or path.name.endswith("_test.py")
+        ):
             continue
         if path.is_symlink():
             raise ValueError(f"Source code symlink requires an explicit resolved source root: {path}")
@@ -122,7 +131,60 @@ def source_identity(root):
     return {"sha256": digest(files), "files": len(files)}
 
 
-def fingerprint(*, image, runtime_lock, sources, model_config, run_config, toolchain, compiler_env):
+def core_application_source(root):
+    """Keep Core's application code; omit standalone evaluation, OPD and tests."""
+    return source_identity(root, excluded_paths=("miles/evaluation", "miles/distillation"), exclude_tests=True)
+
+
+def _core_triton_inputs(runtime_lock, settings, toolchain):
+    """Normalize proven non-kernel differences only for the Core Triton path.
+
+    Triton's own entry keys still distinguish compiled specializations. Preserve
+    unknown fields, trainer ranks, parallel geometry and compiler/environment
+    controls; this is not a compatibility policy for the experimental families.
+    """
+    lock = json.loads(encoded(runtime_lock))
+    hardware = json.loads(encoded(toolchain))
+    unused_sources = {"megatron-lm", "megatron-bridge", "olmo-megatron"}
+    if "source_patches" in lock:
+        lock["source_patches"] = [
+            patch
+            for patch in lock["source_patches"]
+            if not (patch.get("source") in unused_sources and patch.get("target") in unused_sources)
+        ]
+        if not lock["source_patches"]:
+            del lock["source_patches"]
+    referenced_sources = {
+        patch.get(field) for patch in lock.get("source_patches", []) for field in ("source", "target")
+    }
+    for name in unused_sources - referenced_sources:
+        lock.get("sources", {}).pop(name, None)
+    for key in ("max_policy_lag", "max_run_seconds"):
+        settings.get("core", {}).pop(key, None)
+    miles = settings.get("miles", {})
+    for key in (
+        "global_batch_size",
+        "rollout_batch_size",
+        "n_samples_per_prompt",
+        "rollout_num_gpus",
+        "sglang_server_concurrency",
+        "async_max_concurrent_samples",
+    ):
+        miles.pop(key, None)
+    # Only known single-GPU serving workers share a role key. Physical slot IDs
+    # and other visible identical GPUs do not change that engine's kernels.
+    slot = settings.get("worker_slot", "")
+    if miles.get("rollout_num_gpus_per_engine") == 1 and re.fullmatch(
+        r"inference-engine-(?:all-)?\d+-\d+-\d+-\d+", slot
+    ):
+        devices = hardware.get("torch_hardware", {}).get("gpus", [])
+        if devices and all(device == devices[0] for device in devices):
+            settings["worker_slot"] = "inference-engine-tp1"
+            hardware["torch_hardware"]["gpus"] = devices[:1]
+    return lock, settings, hardware
+
+
+def fingerprint(*, image, runtime_lock, sources, model_config, run_config, toolchain, compiler_env, scope="strict"):
     if not re.fullmatch(r"(?:sha256:[0-9a-f]{64}|[0-9A-HJKMNP-TV-Z]{26})", image):
         raise ValueError("Use an immutable Docker SHA256 or Beaker image ID")
     required = {"olmo-core", "miles", "open-instruct", "olmo-sglang"}
@@ -135,6 +197,10 @@ def fingerprint(*, image, runtime_lock, sources, model_config, run_config, toolc
         settings.get("miles", {}).pop(key, None)
     for key in NON_COMPILE_CORE:
         settings.get("core", {}).pop(key, None)
+    if scope == CORE_TRITON_SCOPE:
+        runtime_lock, settings, toolchain = _core_triton_inputs(runtime_lock, settings, toolchain)
+    elif scope != "strict":
+        raise ValueError(f"Unknown compiler-cache compatibility scope: {scope}")
     identity = {
         "schema_version": SCHEMA,
         "backend": "open-instruct-miles-olmo-core",
@@ -147,6 +213,8 @@ def fingerprint(*, image, runtime_lock, sources, model_config, run_config, toolc
         "compiler_env": compiler_env,
         "cache_families": FAMILIES,
     }
+    if scope != "strict":
+        identity["compatibility_scope"] = scope
     return digest(identity), identity
 
 
@@ -404,6 +472,35 @@ def metadata_signature(root):
     return digest(files)
 
 
+def _same_autotune_candidates(existing, incoming):
+    """Allow timing noise for identical Triton tuning keys and candidates.
+
+    Keep the first published measurements. A different candidate set, unknown
+    format or malformed timing remains a conflict rather than an implicit repair.
+    """
+
+    def candidates(path):
+        data = json.loads(path.read_text())
+        if set(data) != {"key", "configs_timings"} or not isinstance(data["key"], list) or not data["key"]:
+            raise ValueError("Unknown autotune record")
+        if not isinstance(data["configs_timings"], list) or not data["configs_timings"]:
+            raise ValueError("Missing autotune candidates")
+        configs = []
+        for config, timing in data["configs_timings"]:
+            if not isinstance(config, dict) or not config:
+                raise ValueError("Invalid autotune candidate")
+            values = timing if isinstance(timing, list) else [timing]
+            if not values or any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in values):
+                raise ValueError("Invalid autotune timing")
+            configs.append(config)
+        return data["key"], configs
+
+    try:
+        return candidates(existing) == candidates(incoming)
+    except (ValueError, TypeError, KeyError, OSError):
+        return False
+
+
 def publish(shared, local, key, family, *, progress=None, max_storage_bytes=DEFAULT_MAX_STORAGE_BYTES):
     """Publish a verified snapshot, bounded across all families of this key.
 
@@ -414,6 +511,7 @@ def publish(shared, local, key, family, *, progress=None, max_storage_bytes=DEFA
         raise ValueError("max_storage_bytes must be a nonnegative integer")
     started = time.monotonic()
     phases = {}
+    reused_autotune_records = 0
     phase = "prepare"
     phase_started = started
 
@@ -460,6 +558,14 @@ def publish(shared, local, key, family, *, progress=None, max_storage_bytes=DEFA
                 incoming = inventory(incoming_root)
                 for name, record in incoming.items():
                     if name in existing and existing[name] != record:
+                        if (
+                            family == "triton"
+                            and name.endswith(".autotune.json")
+                            and existing[name]["executable"] == record["executable"]
+                            and _same_autotune_candidates(stage / name, incoming_root / name)
+                        ):
+                            reused_autotune_records += 1
+                            continue
                         raise ValueError(f"Conflicting compiler-cache key: {family}/{name}")
                     if name not in existing:
                         target = stage / name
@@ -528,6 +634,7 @@ def publish(shared, local, key, family, *, progress=None, max_storage_bytes=DEFA
                 "storage_bytes": storage_bytes(key_root),
                 "max_storage_bytes": max_storage_bytes,
                 "recency_recorded": recency_recorded,
+                "reused_autotune_records": reused_autotune_records,
                 "phase_seconds": phases,
                 "seconds": time.monotonic() - started,
             }

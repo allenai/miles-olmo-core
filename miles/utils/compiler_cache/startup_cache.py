@@ -52,7 +52,7 @@ def prepare(args, *, application_root):
     if not lock_path.exists():
         lock_path = root / "runtime/miles/runtime.lock.json"
     lock = json.loads(lock_path.read_text())
-    sources = {"open-instruct": cache.source_identity(root / "open_instruct")}
+    sources = {"open-instruct": cache.core_application_source(root / "open_instruct")}
     for name, package in [("olmo-core", "olmo_core"), ("miles", "miles"), ("olmo-sglang", "olmo_sglang")]:
         spec = util.find_spec(package)
         if spec is None or not spec.submodule_search_locations:
@@ -242,6 +242,7 @@ def setup_worker():
             run_config=settings,
             toolchain=hardware,
             compiler_env=probes.compiler_environment(os.environ),
+            scope=cache.CORE_TRITON_SCOPE,
         )
         report.update(fingerprint=key, identity=identity)
         report["restore"] = (

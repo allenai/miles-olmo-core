@@ -17,8 +17,8 @@ The application driver calls:
 - `startup_cache.prepare(args, application_root=...)` before creating workers.
   The explicit root contains `open_instruct/` and the runtime lock at
   `build/runtime/miles/runtime.lock.json` (image) or `runtime/miles/runtime.lock.json`
-  (checkout). This preserves the original source identity without importing the
-  application package.
+  (checkout). This fingerprints the Core application source without importing the
+  application package; exclusions are described below.
 - `startup_cache.configure_specs(args, specs)` through the worker manager's spec
   transform. Trainer setup hooks and the serving entrypoint install caches before
   loading the training/inference stack. Serving also primes private Hugging Face
@@ -45,5 +45,30 @@ a specific image, model, and topology. Moving source files changes fingerprints:
 compare cold/warm runs of the same new revision, rather than forcing old entries
 to match.
 
-This is a direct relocation. Existing lifecycle state and the large publication
-function are retained to avoid changing storage behavior during the move.
+## Core Triton compatibility
+
+Ordinary startup uses the versioned `core-triton-v2` identity. It excludes only
+audited non-kernel differences; unknown settings continue to invalidate:
+
+| Input | Core Triton behavior |
+| --- | --- |
+| Admission budget, HTTP concurrency, global/rollout batch size, samples per prompt, rollout fleet size, policy lag and run deadline | Do not invalidate existing artifacts. Triton's own keys still distinguish any newly encountered kernel specialization. |
+| Known single-GPU serving workers | Share a role key across engine slots. Repeated identical visible GPU descriptions collapse to one; mixed hardware remains distinct. Mutable caches stay private to each worker. |
+| Trainer ranks, expert/tensor parallelism, microbatch size, packing, precision, kernel backends, compiler controls and unknown settings | Remain part of compatibility. Trainer ranks remain separate. |
+| Open Instruct source | Omit tests and the standalone `miles/evaluation` and `miles/distillation` trees. Other source changes, including new modules, still invalidate. |
+| Runtime lock | Omit the unused Megatron source entries and patches wholly between those sources. Core/MILES/SGLang pins, unknown sources and patches targeting Core remain significant. |
+| Base image, model configuration, GPU architecture/properties, driver and toolchain | Remain significant. |
+
+The separate experimental multi-family wrapper retains its strict identity and
+full source fingerprint. Versioning deliberately prevents automatic adoption of
+old worker-specific cache keys: the first run of this revision may be cold. A
+new runtime image and Open Instruct runtime-pin update are required to deploy it.
+CPU tests establish identity and publication behavior; GPU reuse still requires
+qualification before treating the draft as a measured startup improvement.
+
+Triton autotuning can record different timing measurements for the same key and
+candidate configurations on different workers. Publication retains the first
+valid record when only those measurements differ, and continues merging new
+kernel artifacts. The receipt counts `reused_autotune_records`. Different tuning
+keys, candidates, unknown record formats and conflicting compiled binaries still
+reject publication and preserve the last published generation.

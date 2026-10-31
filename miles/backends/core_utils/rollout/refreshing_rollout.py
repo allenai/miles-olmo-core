@@ -104,7 +104,9 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             sampling_params=input.sampling_params,
         )
         if payload is None:
-            raise ValueError(f"Policy refresh prompt has no response-token budget ({halt}); increase context length")
+            raise ValueError(
+                f"Policy refresh prompt has no response-token budget ({halt}); increase context length"
+            )
         payload["rid"] = uuid.uuid4().hex
         timing = sibling_timing.sample_record(sample)
         if timing is not None:
@@ -128,10 +130,16 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             # with fleet concurrency and compete with response delivery. Keep
             # the deadline; driver/queue diagnostics report aggregate progress.
             # Keep MILES' parsed-response contract: distributed HTTP actors own
-            # JSON decoding, so large replay responses do not stall the producer
-            # event loop that admits requests and fills the trainer queue.
+            # JSON and routing-blob decoding. Ray transports the decoded replay
+            # array; the producer retains shape and policy-provenance checks.
             output = await asyncio.wait_for(
-                post(url, payload, max_retries=1, headers={"x-miles-request-id": payload["rid"]}),
+                post(
+                    url,
+                    payload,
+                    max_retries=1,
+                    headers={"x-miles-request-id": payload["rid"]},
+                    decode_routed_experts=payload.get("return_routed_experts", False),
+                ),
                 timeout=infra_timeouts.seconds(timeout),
             )
             if timing is not None:

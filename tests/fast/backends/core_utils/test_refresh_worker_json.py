@@ -14,6 +14,7 @@ import ray
 
 from miles.backends.core_utils.rollout import refreshing_rollout, sibling_timing
 from miles.rollout.base_types import GenerateFnInput
+from miles.rollout.generate_utils import generate_endpoint_utils
 from miles.utils import http_utils
 from miles.utils.types import Sample
 
@@ -80,6 +81,15 @@ def test_refresh_uses_worker_parsing_and_preserves_replay(monkeypatch, tmp_path)
     state = SimpleNamespace(args=args, processor=None, tokenizer=SimpleNamespace(encode=lambda *a, **kw: [1]))
     samples = [Sample(index=i, group_index=0, prompt="question") for i in range(4)]
     sibling_timing.start_group(samples)
+    native_decode = generate_endpoint_utils.decode_int32_buffer
+    received_arrays = []
+
+    def require_worker_decoded(value):
+        assert isinstance(value, np.ndarray), "Producer must not receive base64 replay"
+        received_arrays.append(value)
+        return native_decode(value)
+
+    monkeypatch.setattr(generate_endpoint_utils, "decode_int32_buffer", require_worker_decoded)
     ray.init(
         address="local",
         num_cpus=2,
@@ -102,11 +112,14 @@ def test_refresh_uses_worker_parsing_and_preserves_replay(monkeypatch, tmp_path)
             )
 
         results = asyncio.run(exercise())
+        assert len(received_arrays) == 4
         assert len(set(requests)) == len(requests) == 4
         paths = list(tmp_path.glob("http_post_worker_*.jsonl"))
         assert len(paths) == 2
         assert all(not p.stem.endswith(f"_{os.getpid()}") for p in paths)
-        observations = {r["request_id"]: r for p in paths for r in map(json.loads, p.read_text().splitlines())}
+        observations = {
+            r["request_id"]: r for p in paths for r in map(json.loads, p.read_text().splitlines())
+        }
         for result in results:
             sample = result.samples
             np.testing.assert_array_equal(sample.rollout_routed_experts, routes)
@@ -118,6 +131,9 @@ def test_refresh_uses_worker_parsing_and_preserves_replay(monkeypatch, tmp_path)
             assert worker["response_bytes"] == len(body)
             assert worker["json_decode_seconds"] >= 0
             assert worker["json_decode_thread_cpu_seconds"] >= 0
+            assert worker["replay_decode_seconds"] >= 0
+            assert worker["replay_decode_thread_cpu_seconds"] >= 0
+            assert worker["replay_decoded_bytes"] == routes.nbytes
             assert (
                 worker["response_body_ready_unix"]
                 <= worker["response_ready_unix"]

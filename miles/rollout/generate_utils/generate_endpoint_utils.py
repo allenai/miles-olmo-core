@@ -6,7 +6,6 @@ from copy import deepcopy
 from typing import Any
 
 import numpy as np
-import pybase64
 
 from miles.rollout.generate_utils.rollout_topk_logprobs import (
     append_rollout_topk_logprobs,
@@ -15,6 +14,7 @@ from miles.rollout.generate_utils.rollout_topk_logprobs import (
 from miles.rollout.generate_utils.sampling_mask import append_sampling_metadata, should_return_sampling_mask
 from miles.utils.lora.utils import LORA_ADAPTER_NAME, lora_rollout_enabled
 from miles.utils.processing_utils import encode_image_for_rollout_engine, extract_multimodal_train_inputs
+from miles.utils.rollout_replay import decode_int32_buffer
 from miles.utils.types import Sample
 
 
@@ -141,8 +141,8 @@ async def update_sample_from_response(
     sample.update_from_meta_info(args, output["meta_info"])
 
 
-def _decode_topk_buffer(info: str, num_tokens: int, num_layers: int, topk: int) -> np.ndarray:
-    x = np.frombuffer(pybase64.b64decode(info.encode("ascii")), dtype=np.int32)
+def _decode_topk_buffer(info: str | np.ndarray, num_tokens: int, num_layers: int, topk: int) -> np.ndarray:
+    x = decode_int32_buffer(info)
     if num_tokens <= 0:
         return np.empty((0, num_layers, max(0, topk)), dtype=np.int32)
     if topk == -1:  # indexer: topk dim recovered from buffer length

@@ -90,6 +90,23 @@ in checkpoint templates: they describe training spans. The fix avoids the
 unnecessary parsing; it does not add support for those tags to MiniJinja.
 The manual router test fails with the old wheel and passes with the replacement.
 
+## Core refresh response decoding
+
+Core refresh requests with routing replay ask the distributed HTTP actor to
+decode the base64 routing blob before returning the response through Ray. It
+returns a flat `int32` array; the producer reshapes it using the accumulated
+token count and model layers, retaining nonzero and policy-provenance checks.
+Ordinary POST callers keep their existing response contract unless they opt in,
+and raw-byte responses bypass decoding. The local HTTP fallback remains supported.
+
+Worker observations include `replay_decode_seconds`,
+`replay_decode_thread_cpu_seconds`, and `replay_decoded_bytes`. Decoding occurs
+after the HTTP retry loop, so malformed replay cannot cause a delivered request
+to be resent. It is synchronous within each HTTP actor; this change does not add
+a background decoding executor, bounded payload fetching, or compact token/logprob
+transport. Ray reconstruction and producer batch preparation still need separate
+measurement. CPU transport tests do not establish GPU throughput gains.
+
 ## Recorded validation, October 22, 2026
 
 These results are historical evidence at specific revisions. They do not make

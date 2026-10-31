@@ -14,6 +14,7 @@ from miles.utils import logger_utils
 from miles.utils.http_post_errors import HTTPPostFailure
 from miles.utils.http_post_observer import PostObserver
 from miles.utils.logging_utils import configure_logger_raw
+from miles.utils.rollout_replay import decode_response_routes
 
 logger = logger_utils.setup_logger(__name__)
 
@@ -358,11 +359,21 @@ def _init_ray_distributed_post(args):
                 timeout=httpx.Timeout(None),
             )
 
-        async def do_post(self, url, payload, max_retries=60, action="post", headers=None, *, return_bytes=False):
+        async def do_post(
+            self,
+            url,
+            payload,
+            max_retries=60,
+            action="post",
+            headers=None,
+            *,
+            return_bytes=False,
+            decode_routed_experts=False,
+        ):
             observation = self._observer.start(payload)
             result = None
             try:
-                result = await _post(
+                response = await _post(
                     self._client,
                     url,
                     payload,
@@ -371,6 +382,13 @@ def _init_ray_distributed_post(args):
                     headers=headers,
                     return_bytes=return_bytes,
                     observation=observation,
+                )
+                # Decode after the HTTP retry loop: malformed replay is not a
+                # transport failure and must never replay a delivered request.
+                result = (
+                    decode_response_routes(response, observation=observation)
+                    if decode_routed_experts and not return_bytes
+                    else response
                 )
                 return result
             except httpx.HTTPError as error:
@@ -420,7 +438,16 @@ def _rollout_client() -> httpx.AsyncClient:
 
 
 # TODO may generalize the name since it now contains http DELETE/GET etc (with retries and remote-execution)
-async def post(url, payload, max_retries=60, action="post", headers=None, *, return_bytes=False):
+async def post(
+    url,
+    payload,
+    max_retries=60,
+    action="post",
+    headers=None,
+    *,
+    return_bytes=False,
+    decode_routed_experts=False,
+):
     # If distributed mode is enabled and actors exist, dispatch via Ray.
     if _distributed_post_enabled and _post_actors:
         # A remote failure can follow successful request delivery. Propagate it;
@@ -428,15 +455,28 @@ async def post(url, payload, max_retries=60, action="post", headers=None, *, ret
         actor = _next_actor()
         if actor is not None:
             result = await actor.do_post.remote(
-                url, payload, max_retries, action=action, headers=headers, return_bytes=return_bytes
+                url,
+                payload,
+                max_retries,
+                action=action,
+                headers=headers,
+                return_bytes=return_bytes,
+                decode_routed_experts=decode_routed_experts,
             )
             if isinstance(result, HTTPPostFailure):
                 raise result.exception()
             return result
 
-    return await _post(
-        _rollout_client(), url, payload, max_retries, action=action, headers=headers, return_bytes=return_bytes
+    response = await _post(
+        _rollout_client(),
+        url,
+        payload,
+        max_retries,
+        action=action,
+        headers=headers,
+        return_bytes=return_bytes,
     )
+    return decode_response_routes(response) if decode_routed_experts and not return_bytes else response
 
 
 # TODO unify w/ `post` to add retries and remote-execution

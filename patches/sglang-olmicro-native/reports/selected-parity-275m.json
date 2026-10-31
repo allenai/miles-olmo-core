@@ -1,0 +1,50 @@
+{
+  "passed": false,
+  "cases": [
+    {
+      "tokens": 7,
+      "max_logprob_error": 0.06197166442871094,
+      "passed": true
+    },
+    {
+      "tokens": 9,
+      "max_logprob_error": 0.011226654052734375,
+      "passed": true
+    },
+    {
+      "tokens": 37,
+      "max_logprob_error": 3.5390257835388184e-07,
+      "passed": true
+    },
+    {
+      "tokens": 133,
+      "max_logprob_error": 0.03870999813079834,
+      "passed": true
+    },
+    {
+      "tokens": 517,
+      "max_logprob_error": 0.03870999813079834,
+      "passed": true
+    },
+    {
+      "tokens": 2053,
+      "max_logprob_error": 0.06236457824707031,
+      "passed": true
+    },
+    {
+      "tokens": 3077,
+      "max_logprob_error": 0.1250019073486328,
+      "passed": false
+    }
+  ],
+  "greedy_exact_matches": [
+    true,
+    true,
+    false,
+    true,
+    true,
+    true,
+    true
+  ],
+  "note": "Selected-token parity gate; greedy branches reported separately, not hidden. Not a full-vocabulary KL test."
+}

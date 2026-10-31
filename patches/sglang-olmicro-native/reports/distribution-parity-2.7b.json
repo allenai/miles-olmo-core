@@ -1,0 +1,308 @@
+{
+  "passed": true,
+  "max_sglang_to_vllm_kl": 0.0007549054901826962,
+  "max_vllm_to_sglang_kl": 0.0007593905110123435,
+  "max_total_variation": 0.017237671462476376,
+  "cases": [
+    {
+      "tokens": 1,
+      "forward_kl": 6.973603619690738e-05,
+      "reverse_kl": 6.804518325221178e-05,
+      "total_variation": 0.002083034194069901
+    },
+    {
+      "tokens": 2,
+      "forward_kl": 0.00034648081928777806,
+      "reverse_kl": 0.0003493917501355593,
+      "total_variation": 0.010399616122510492
+    },
+    {
+      "tokens": 3,
+      "forward_kl": 0.0002044200474954523,
+      "reverse_kl": 0.00020555471573177782,
+      "total_variation": 0.00860294113856343
+    },
+    {
+      "tokens": 4,
+      "forward_kl": 0.0004099319405537292,
+      "reverse_kl": 0.00041632274094534696,
+      "total_variation": 0.011308373315404683
+    },
+    {
+      "tokens": 5,
+      "forward_kl": 0.00023813292884196152,
+      "reverse_kl": 0.0002379219752445317,
+      "total_variation": 0.008777189306519483
+    },
+    {
+      "tokens": 6,
+      "forward_kl": 0.00041492793206835766,
+      "reverse_kl": 0.00041150244523772105,
+      "total_variation": 0.013038940058422675
+    },
+    {
+      "tokens": 7,
+      "forward_kl": 0.0007549054901826962,
+      "reverse_kl": 0.0007593905110123435,
+      "total_variation": 0.017237671462476376
+    },
+    {
+      "tokens": 3,
+      "forward_kl": 0.0,
+      "reverse_kl": 0.0,
+      "total_variation": 0.0
+    },
+    {
+      "tokens": 4,
+      "forward_kl": 0.0,
+      "reverse_kl": 0.0,
+      "total_variation": 0.0
+    },
+    {
+      "tokens": 5,
+      "forward_kl": 0.0,
+      "reverse_kl": 0.0,
+      "total_variation": 0.0
+    },
+    {
+      "tokens": 6,
+      "forward_kl": 0.0,
+      "reverse_kl": 0.0,
+      "total_variation": 0.0
+    },
+    {
+      "tokens": 7,
+      "forward_kl": 0.0003503281503683571,
+      "reverse_kl": 0.0003503329103225045,
+      "total_variation": 0.011273512604231727
+    },
+    {
+      "tokens": 8,
+      "forward_kl": 0.00036684498389384645,
+      "reverse_kl": 0.00036370719129314236,
+      "total_variation": 0.012076672997921556
+    },
+    {
+      "tokens": 9,
+      "forward_kl": 0.00045542390625930907,
+      "reverse_kl": 0.00045527857977188907,
+      "total_variation": 0.008858310815756689
+    },
+    {
+      "tokens": 31,
+      "forward_kl": 4.633804523522856e-06,
+      "reverse_kl": 4.692637217469805e-06,
+      "total_variation": 0.0002844487581917032
+    },
+    {
+      "tokens": 32,
+      "forward_kl": 0.00035567537669331864,
+      "reverse_kl": 0.00035329541163493664,
+      "total_variation": 0.012093147316266808
+    },
+    {
+      "tokens": 33,
+      "forward_kl": 0.00018887388336905498,
+      "reverse_kl": 0.00019032974804576632,
+      "total_variation": 0.007830652398018244
+    },
+    {
+      "tokens": 34,
+      "forward_kl": 6.693604340917282e-05,
+      "reverse_kl": 6.596490778525805e-05,
+      "total_variation": 0.0027029940781923252
+    },
+    {
+      "tokens": 35,
+      "forward_kl": 0.0003627728102191599,
+      "reverse_kl": 0.0003659194523166834,
+      "total_variation": 0.010511605632162635
+    },
+    {
+      "tokens": 36,
+      "forward_kl": 0.0001413227091954948,
+      "reverse_kl": 0.00013929998713022794,
+      "total_variation": 0.0051270195618020285
+    },
+    {
+      "tokens": 37,
+      "forward_kl": 0.0006504143825397887,
+      "reverse_kl": 0.0006576899913116633,
+      "total_variation": 0.015900789116335266
+    },
+    {
+      "tokens": 127,
+      "forward_kl": 4.5045550887975143e-07,
+      "reverse_kl": 4.4535579273818047e-07,
+      "total_variation": 3.56938900693977e-05
+    },
+    {
+      "tokens": 128,
+      "forward_kl": 0.00039318960773084867,
+      "reverse_kl": 0.0003920567383529929,
+      "total_variation": 0.012936712341101313
+    },
+    {
+      "tokens": 129,
+      "forward_kl": 1.5861485755764567e-05,
+      "reverse_kl": 1.5893562721706036e-05,
+      "total_variation": 0.0006307007383775134
+    },
+    {
+      "tokens": 130,
+      "forward_kl": 6.036419859128706e-05,
+      "reverse_kl": 6.0057086080395766e-05,
+      "total_variation": 0.002217899068054282
+    },
+    {
+      "tokens": 131,
+      "forward_kl": 0.00035990621119745894,
+      "reverse_kl": 0.00035774674806686793,
+      "total_variation": 0.012329002214264462
+    },
+    {
+      "tokens": 132,
+      "forward_kl": 0.00013063124096685541,
+      "reverse_kl": 0.00013026603625917213,
+      "total_variation": 0.007570408628581037
+    },
+    {
+      "tokens": 133,
+      "forward_kl": 0.0002959691681996817,
+      "reverse_kl": 0.00029876095700864016,
+      "total_variation": 0.010291173829194707
+    },
+    {
+      "tokens": 511,
+      "forward_kl": 5.041679721919845e-06,
+      "reverse_kl": 5.174205740786816e-06,
+      "total_variation": 0.00013052942317914773
+    },
+    {
+      "tokens": 512,
+      "forward_kl": 0.0004002123688242813,
+      "reverse_kl": 0.0003979439196278669,
+      "total_variation": 0.012300399287141873
+    },
+    {
+      "tokens": 513,
+      "forward_kl": 0.0001240862489561307,
+      "reverse_kl": 0.00012458527310171223,
+      "total_variation": 0.007140618700816514
+    },
+    {
+      "tokens": 514,
+      "forward_kl": 7.885854424929972e-05,
+      "reverse_kl": 7.90727096439067e-05,
+      "total_variation": 0.0032139841272473234
+    },
+    {
+      "tokens": 515,
+      "forward_kl": 0.0002638348249716276,
+      "reverse_kl": 0.00026394601244501565,
+      "total_variation": 0.009369488911848321
+    },
+    {
+      "tokens": 516,
+      "forward_kl": 0.00018135395014570754,
+      "reverse_kl": 0.00017971793575371077,
+      "total_variation": 0.008069224096457687
+    },
+    {
+      "tokens": 517,
+      "forward_kl": 0.0002784317501000771,
+      "reverse_kl": 0.0002773067476883953,
+      "total_variation": 0.008911533496188515
+    },
+    {
+      "tokens": 2047,
+      "forward_kl": 5.86352075139737e-06,
+      "reverse_kl": 5.707486310132612e-06,
+      "total_variation": 0.00014395491188996345
+    },
+    {
+      "tokens": 2048,
+      "forward_kl": 0.0004132412534126953,
+      "reverse_kl": 0.0004146431258498294,
+      "total_variation": 0.013072590551749324
+    },
+    {
+      "tokens": 2049,
+      "forward_kl": 2.9460498171391108e-05,
+      "reverse_kl": 2.9644365409645592e-05,
+      "total_variation": 0.0013465695801123437
+    },
+    {
+      "tokens": 2050,
+      "forward_kl": 0.000314812558640155,
+      "reverse_kl": 0.0003192895493914563,
+      "total_variation": 0.01020041782122281
+    },
+    {
+      "tokens": 2051,
+      "forward_kl": 0.00017710690347325477,
+      "reverse_kl": 0.00017665763999867579,
+      "total_variation": 0.007587828026771148
+    },
+    {
+      "tokens": 2052,
+      "forward_kl": 0.00011343126780289216,
+      "reverse_kl": 0.00011420150335964224,
+      "total_variation": 0.004362645409587439
+    },
+    {
+      "tokens": 2053,
+      "forward_kl": 0.0005702292695691498,
+      "reverse_kl": 0.0005724994584035861,
+      "total_variation": 0.014015193039516944
+    },
+    {
+      "tokens": 3071,
+      "forward_kl": 3.967239017289042e-07,
+      "reverse_kl": 4.0214632692302927e-07,
+      "total_variation": 4.168337699863879e-05
+    },
+    {
+      "tokens": 3072,
+      "forward_kl": 0.00045346726050299714,
+      "reverse_kl": 0.0004520588663994643,
+      "total_variation": 0.011223394662967762
+    },
+    {
+      "tokens": 3073,
+      "forward_kl": 0.00015634219198754854,
+      "reverse_kl": 0.0001565987114667518,
+      "total_variation": 0.008110678190328948
+    },
+    {
+      "tokens": 3074,
+      "forward_kl": 0.00044372991529582624,
+      "reverse_kl": 0.0004417252959795443,
+      "total_variation": 0.007444413942166009
+    },
+    {
+      "tokens": 3075,
+      "forward_kl": 0.0002131697625530019,
+      "reverse_kl": 0.00021287411919773441,
+      "total_variation": 0.008371651787558738
+    },
+    {
+      "tokens": 3076,
+      "forward_kl": 0.0005090953696148268,
+      "reverse_kl": 0.0005128250057071819,
+      "total_variation": 0.014307394563521491
+    },
+    {
+      "tokens": 3077,
+      "forward_kl": 0.0005887653666728498,
+      "reverse_kl": 0.000579692290996481,
+      "total_variation": 0.012170048128610757
+    },
+    {
+      "tokens": 26,
+      "forward_kl": 0.00014148576216884388,
+      "reverse_kl": 0.0001428011579114206,
+      "total_variation": 0.0059399803241450035
+    }
+  ]
+}

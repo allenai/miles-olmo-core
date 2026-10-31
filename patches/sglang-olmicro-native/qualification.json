@@ -1,0 +1,202 @@
+{
+  "date_utc": "2026-10-31",
+  "status": "NATIVE_FUNCTIONAL_PASSED_STRICT_VLLM_PARITY_NOT_QUALIFIED",
+  "native_functional_passes": 5,
+  "full_distribution_gate_passes": 4,
+  "selected_token_gate_passes": 0,
+  "sglang_upstream_base": "3145136dcd1238754e0ea2b2ffd546532119c71c",
+  "native_source_commit": "986877f4cd38b090ce2338e685f914cd65c18e8c",
+  "patch_sha256": "845f980958e89e2987158c78437ebe0de7b37fb15e6aa998152b80683ee4346c",
+  "model_source_sha256": "5548a7101b08a4f62358d836ec291c5a2e44d29e6cd3b053a1f940e7970d071d",
+  "gpu": "NVIDIA L40S",
+  "native_image": "01M607Z48PYPNN0KHVZ5PGYJEG",
+  "reference_image": "01M64G5M526S9HNF960NP3QRVB",
+  "native_torch": "2.13.0+cu130",
+  "reference_torch": "2.10.0+cu128",
+  "reference_vllm": "0.19.1",
+  "gpu_sessions": [
+    "https://beaker.org/job/01M675BCQ9F5G11AP6DEAAMAAW",
+    "https://beaker.org/job/01M682TSK1EBFADEBFQB9XWGSG"
+  ],
+  "focused_tests": {
+    "passed": 35,
+    "seconds": 16.06,
+    "command": "python -m pytest -q test/manual/olmicro"
+  },
+  "scope": {
+    "dtype": "bfloat16",
+    "recurrent_state_dtype": "float32",
+    "tensor_parallel": 1,
+    "pipeline_parallel": 1,
+    "full_attention_backend": "fa3",
+    "linear_attention_backend": "triton",
+    "cuda_graphs": false,
+    "prefix_cache": false,
+    "running_slots": 16,
+    "queued_requests": 19,
+    "prompt_lengths": [
+      1,
+      3,
+      31,
+      127,
+      511,
+      2047,
+      3071
+    ],
+    "greedy_decode_tokens": 32,
+    "full_vocabulary_prefixes_per_size": 50
+  },
+  "gates": {
+    "max_bidirectional_kl": 0.001,
+    "max_selected_token_logprob_error": 0.08,
+    "same_backend_greedy_queue_reuse_reload": "exact"
+  },
+  "notes": [
+    "No Transformers model forward is invoked by native serving.",
+    "Full-vocabulary passes do not waive failed selected-token or exact greedy checks.",
+    "Reference 810m slot reuse and 2.7b queueing changed exact greedy outputs; selected comparisons are blocked for those references.",
+    "The two engines use different pinned Torch/CUDA stacks; remaining differences have not all been root-caused.",
+    "Decode rates are from one synthetic mixed-length batch, include its prefill, and are not a production throughput benchmark.",
+    "All GPU distributions were saved before preemption. The final 2.7b KL was computed locally on CPU after retrieving the saved vectors.",
+    "No RL optimizer update or cross-process learner publication was qualified, and existing training images/recipes still select the old HF bridge."
+  ],
+  "sizes": [
+    {
+      "size": "275m",
+      "checkpoint": "/weka/oe-training-default/yashasbls/hybridish-local/hf/v1/275m/midtrain/step0038147",
+      "config_sha256": "3efb6821a38625211b8aef0eb0db4b18fcd507720df48851eb1ddfbda0262d2b",
+      "native_functional_status": "PASSED",
+      "reference_functional_status": "PASSED",
+      "reference_error": null,
+      "distribution": {
+        "passed": true,
+        "max_sglang_to_vllm_kl": 0.0008479872197074394,
+        "max_vllm_to_sglang_kl": 0.0008568323330979482,
+        "max_total_variation": 0.01885589747080531
+      },
+      "selected_token_gate": {
+        "passed": false,
+        "max_logprob_error": 0.1250019073486328,
+        "greedy_exact_matches": [
+          true,
+          true,
+          false,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "synthetic_batch_decode_tokens_per_second": {
+        "native": 410.2886111366889,
+        "reference": 50.63273880189995
+      }
+    },
+    {
+      "size": "450m",
+      "checkpoint": "/weka/oe-training-default/yashasbls/hybridish-local/hf/v1/450m/midtrain/step0038147",
+      "config_sha256": "a95be8ab405291b0f3b7a643848eb72dbf637abfbc9a84b316cb5b986d301e22",
+      "native_functional_status": "PASSED",
+      "reference_functional_status": "PASSED",
+      "reference_error": null,
+      "distribution": {
+        "passed": true,
+        "max_sglang_to_vllm_kl": 0.0007880038805285509,
+        "max_vllm_to_sglang_kl": 0.0007720320851610117,
+        "max_total_variation": 0.017526916919873455
+      },
+      "selected_token_gate": {
+        "passed": false,
+        "max_logprob_error": 0.15621185302734375,
+        "greedy_exact_matches": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "synthetic_batch_decode_tokens_per_second": {
+        "native": 253.8210116026185,
+        "reference": 64.49666671918379
+      }
+    },
+    {
+      "size": "810m",
+      "checkpoint": "/weka/oe-training-default/yashasbls/hybridish-local/hf/v1/810m/midtrain/step0023842",
+      "config_sha256": "653062f3528fb65584e2321dd7698141d4b945dfa57b19f0188b3e12b653ed58",
+      "native_functional_status": "PASSED",
+      "reference_functional_status": "FAILED",
+      "reference_error": "Greedy generation changed after request-slot reuse",
+      "distribution": {
+        "passed": false,
+        "max_sglang_to_vllm_kl": 0.0013801406361103816,
+        "max_vllm_to_sglang_kl": 0.0013780841261973554,
+        "max_total_variation": 0.02141947899149895
+      },
+      "selected_token_gate": {
+        "status": "BLOCKED_REFERENCE_FAILURE",
+        "reason": "Greedy generation changed after request-slot reuse"
+      },
+      "synthetic_batch_decode_tokens_per_second": {
+        "native": 261.1428113242479,
+        "reference": 40.00210050314051
+      }
+    },
+    {
+      "size": "1.4b",
+      "checkpoint": "/weka/oe-training-default/yashasbls/hybridish-local/hf/v1/1.4b/midtrain/step0011921",
+      "config_sha256": "132c7259b6f484b8a658af9fcd5f3bfc2f00ca476ac99f6d390d44424723c1e1",
+      "native_functional_status": "PASSED",
+      "reference_functional_status": "PASSED",
+      "reference_error": null,
+      "distribution": {
+        "passed": true,
+        "max_sglang_to_vllm_kl": 0.000995357814998028,
+        "max_vllm_to_sglang_kl": 0.0009859445956097966,
+        "max_total_variation": 0.018123980542050222
+      },
+      "selected_token_gate": {
+        "passed": false,
+        "max_logprob_error": 0.09558749198913574,
+        "greedy_exact_matches": [
+          false,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "synthetic_batch_decode_tokens_per_second": {
+        "native": 201.41776690074522,
+        "reference": 109.00473672525497
+      }
+    },
+    {
+      "size": "2.7b",
+      "checkpoint": "/weka/oe-training-default/yashasbls/hybridish-local/hf/v1/2.7b/midtrain/step0011921",
+      "config_sha256": "5fe6cee2a1a96738974bb5de1d7461e23e02c7013ff911cedaae55115dc572f1",
+      "native_functional_status": "PASSED",
+      "reference_functional_status": "FAILED",
+      "reference_error": "Queued scheduling changed greedy outputs",
+      "distribution": {
+        "passed": true,
+        "max_sglang_to_vllm_kl": 0.0007549054901826962,
+        "max_vllm_to_sglang_kl": 0.0007593905110123435,
+        "max_total_variation": 0.017237671462476376
+      },
+      "selected_token_gate": {
+        "status": "BLOCKED_REFERENCE_FAILURE",
+        "reason": "Queued scheduling changed greedy outputs"
+      },
+      "synthetic_batch_decode_tokens_per_second": {
+        "native": 134.0252845007107,
+        "reference": 84.4581797994582
+      }
+    }
+  ]
+}

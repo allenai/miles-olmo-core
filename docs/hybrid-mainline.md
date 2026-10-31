@@ -1,4 +1,20 @@
-# Temporary MainlineLadder bridge
+# Olmicro hybrid integration
+
+## Native SGLang implementation
+
+The native serving implementation and its regression/compatibility probes are
+vendored as a reproducible [SGLang patch](../patches/sglang-olmicro-native/README.md)
+on this repository's pushed `codex/hybrid-mainline` branch. Apply it to the pinned
+upstream SGLang checkout specified there. It uses batched native GDN kernels,
+SGLang-managed recurrent state, and paged full attention, without a Transformers
+model forward. The patch guide records the tested scope and numerical gates.
+
+Existing training recipes and images still select the legacy reference bridge.
+Installing the patch does not switch an existing experiment. A native MILES
+training smoke must remove that selection and verify live learner publication,
+completed optimizer updates, and checkpoint restoration separately.
+
+## Legacy reference bridge
 
 This branch adds Yasha's released Olmo Hybrid (`mainline_ladder`) to the Core
 learner and SGLang. It is a temporary correctness bridge with qualification reports described below.

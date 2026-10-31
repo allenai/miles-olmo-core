@@ -1,0 +1,2 @@
+# Unified diff context blank lines intentionally contain a space.
+patches/sglang-olmicro-native/sglang.patch -whitespace

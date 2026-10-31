@@ -181,12 +181,14 @@ class DefaultDataBuffer(DataBuffer):
             return False
         return True
 
-    async def get(self, current_version: int | None = None, **_) -> DataBufferInput:
+    async def get(self, current_version: int | None = None, *, wait: bool = True, **_) -> DataBufferInput | None:
         if current_version is not None:
             self._current_version = current_version
         async with self._cond:
             while True:
                 while not self._buffer:
+                    if not wait:
+                        return None
                     await self._cond.wait()
                 entry = self._buffer.pop(0)
                 self._cond.notify_all()  # wake producers blocked on a full buffer

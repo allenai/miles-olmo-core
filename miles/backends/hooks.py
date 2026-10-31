@@ -16,6 +16,10 @@ def _configure_rollout(args, user_eval_path: str | None) -> None:
     pass
 
 
+def _diagnostic_writer(args):
+    return None
+
+
 def _shutdown_rollout(producer) -> None:
     pass
 
@@ -28,6 +32,7 @@ async def _finalize_checkpoint(actor, rollout_id: int) -> None:
 class BackendHooks:
     # Called after generic path resolution, before checkpoint-eval validation.
     configure_rollout: Callable[[Any, str | None], None] = _configure_rollout
+    diagnostic_writer: Callable[[Any], Any] = _diagnostic_writer
     # Runs synchronously before the executor disposes shared resources.
     shutdown_rollout: Callable[[Any], None] = _shutdown_rollout
     # Awaited after both training and rollout state have been saved.

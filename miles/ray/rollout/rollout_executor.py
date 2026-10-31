@@ -40,7 +40,9 @@ from miles.utils.http_utils import init_http_client
 from miles.utils.init_once import InitOnce, init_once
 from miles.utils.logging_utils import configure_logger
 from miles.utils.metric_checker import MetricChecker
+from miles.utils.metric_utils import compute_rollout_step
 from miles.utils.timer import timer
+from miles.utils.tracking_utils import tracking
 from miles.utils.tracking_utils.tracking import finish_tracking, init_tracking
 from miles.utils.weight_version import assert_samples_weight_version_sane, assert_weight_version_is_published
 from miles.utils.workers.rpc.common.metadata import rpc
@@ -125,6 +127,7 @@ class RolloutExecutor:
         self._eval_fleet: RolloutExecutorEvalFleet | None = None
 
         self._metric_checker = MetricChecker.maybe_create(args)
+        self._diagnostic_writer = get_backend_hooks(getattr(args, "train_backend", None)).diagnostic_writer(args)
 
     async def get_init_state(self) -> str:
         return self._init_once.state.value
@@ -140,6 +143,8 @@ class RolloutExecutor:
         )
 
     async def dispose(self) -> None:
+        if getattr(self, "_diagnostic_writer", None) is not None:
+            await self._diagnostic_writer.close()
         await asyncio.to_thread(
             get_backend_hooks(getattr(self.args, "train_backend", None)).shutdown_rollout,
             getattr(self, "generate_rollout", None),
@@ -171,17 +176,24 @@ class RolloutExecutor:
             data, metadata, metrics = await self._get_rollout_data(
                 rollout_id=rollout_id, trainer_model_id=trainer_model_id
             )
-        save_debug_rollout_data(
-            self.args,
-            data,
-            rollout_id=rollout_id,
-            evaluation=False,
-            metadata=metadata,
-            trainer_model_id=trainer_model_id,
-        )
+        diagnostic_started = time.perf_counter()
+        if getattr(self, "_diagnostic_writer", None) is not None:
+            metrics = dict(metrics or {})
+            metrics.update(await self._diagnostic_writer.submit(data, rollout_id, metadata, trainer_model_id))
+        else:
+            save_debug_rollout_data(
+                self.args,
+                data,
+                rollout_id=rollout_id,
+                evaluation=False,
+                metadata=metadata,
+                trainer_model_id=trainer_model_id,
+            )
+        metrics_started = time.perf_counter()
         log_rollout_data(
             rollout_id, self.args, data, metrics, time.time() - start_time, trainer_model_id=trainer_model_id
         )
+        conversion_started = time.perf_counter()
         data = convert_samples_to_train_data(
             self.args,
             data,
@@ -189,12 +201,30 @@ class RolloutExecutor:
             custom_convert_samples_to_train_data_func=self.custom_convert_samples_to_train_data_func,
             custom_reward_post_process_func=self.custom_reward_post_process_func,
         )
+        converted_at = time.perf_counter()
         sample_indices = data.get("sample_indices")
         if self.args.delay_split_train_data_by_dp:
             data_ref = object_store.get_instance().put(value=data, value_spec=ROLLOUT_DATA_VALUE_SPEC)
         else:
             data_ref = split_train_data_by_dp(
                 self.args, data, self._train_parallel_configs_of_model_id[trainer_model_id]
+            )
+        handoff = {
+            "rollout_id": rollout_id,
+            "diagnostic_submit_seconds": metrics_started - diagnostic_started,
+            "metrics_seconds": conversion_started - metrics_started,
+            "conversion_seconds": converted_at - conversion_started,
+            "shard_store_seconds": time.perf_counter() - converted_at,
+        }
+        logger.info("Rollout handoff timing: %s", handoff)
+        if getattr(self, "_diagnostic_writer", None) is not None:
+            tracking.log(
+                self.args,
+                {
+                    "rollout/step": compute_rollout_step(self.args, rollout_id),
+                    **{f"rollout/handoff/{key}": value for key, value in handoff.items() if key != "rollout_id"},
+                },
+                step_key="rollout/step",
             )
         return RolloutDataPack(sample_indices=sample_indices, data_ref=data_ref)
 

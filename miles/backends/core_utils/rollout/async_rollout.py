@@ -79,6 +79,7 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         self._draining_groups: list[Any] | None = None
         self._interrupted_groups: list[int] = []
         self._publication_paused = False
+        self._drain_yield_at = 0.0
         if getattr(self.args, "async_unused_samples_handler", None) == "drop":
             self._handle_unused = lambda group: self.data_source.acknowledge_groups([group])
 
@@ -114,6 +115,19 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
     async def _next_group(self, current_version: int | None, trainer_model_id: str | None = None) -> Any:
         if trainer_model_id is not None:
             raise ValueError("Core rollout does not support multi-policy training")
+        # Ready work must not queue a task behind unrelated payload callbacks for
+        # every prompt. Bound the uninterrupted drain to 8 ms for producer fairness.
+        if (get_ready := getattr(self._output, "get_ready", None)) is not None:
+            if time.monotonic() >= getattr(self, "_drain_yield_at", 0.0):
+                await asyncio.sleep(0)
+                self._drain_yield_at = time.monotonic() + 0.008
+            if self._worker.done():
+                self._worker.result()
+                raise RuntimeError("fully-async worker exited unexpectedly")
+            entry = await get_ready(current_version=current_version)
+            if entry is not None:
+                self._record_dequeued(entry)
+                return entry
         # Own both outcomes: if the worker fails just as a dequeue succeeds,
         # that prompt must remain part of the interrupted batch's retry ledger.
         queue_get = asyncio.create_task(self._output.get(current_version=current_version))
@@ -128,10 +142,7 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                     raise RuntimeError("fully-async worker exited unexpectedly")
                 if queue_get in done:
                     entry = queue_get.result()
-                    if self._draining_groups is None:
-                        self.data_source.acknowledge_groups([entry.prompt_group])
-                    else:
-                        self._draining_groups.append(entry.prompt_group)
+                    self._record_dequeued(entry)
                     recorded = True
                     return entry
                 logger.warning("No completed async rollout groups for 30 seconds")
@@ -141,6 +152,12 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
             await asyncio.gather(queue_get, return_exceptions=True)
             if not recorded and not queue_get.cancelled() and queue_get.exception() is None:
                 self._interrupted_groups.append(queue_get.result().prompt_group[0].group_index)
+
+    def _record_dequeued(self, entry):
+        if self._draining_groups is None:
+            self.data_source.acknowledge_groups([entry.prompt_group])
+        else:
+            self._draining_groups.append(entry.prompt_group)
 
     def _submit_managed_group(self) -> asyncio.Task:
         [group] = self.data_source.get_samples(1)

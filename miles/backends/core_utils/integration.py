@@ -66,12 +66,17 @@ def shutdown_rollout(producer) -> None:
         run(producer.shutdown())
 
 
+def diagnostic_writer(args):
+    return load_function("miles.backends.core_utils.rollout.diagnostic_writer.create_writer")(args)
+
+
 async def finalize_checkpoint(actor, rollout_id: int) -> None:
     await actor.finalize_checkpoint(rollout_id)
 
 
 _HOOKS = BackendHooks(
     configure_rollout=configure_rollout,
+    diagnostic_writer=diagnostic_writer,
     shutdown_rollout=shutdown_rollout,
     finalize_checkpoint=finalize_checkpoint,
 )

@@ -371,4 +371,16 @@ def realized_measurements(local, ep_degree):
     gathered = [torch.empty_like(local) for _ in range(world)]
     dist.all_gather(gathered, local)
     loads = torch.stack(gathered).reshape(world // ep_degree, ep_degree, *local.shape).sum(dim=1)
-    return measurements(loads.cpu().numpy())
+    loads = loads.cpu().numpy()
+    result = measurements(loads)
+    result["layers"] = [
+        {
+            "selected_layer_index": layer,
+            "max_pack_destination_assignments": int(loads[:, :, layer].max()),
+            "max_pack_destination_skew": float(
+                (loads[:, :, layer].max(axis=-1) / loads[:, :, layer].mean(axis=-1).clip(min=1)).max()
+            ),
+        }
+        for layer in range(loads.shape[2])
+    ]
+    return result

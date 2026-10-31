@@ -35,7 +35,11 @@ def configure_rollout(args, user_eval_path: str | None) -> None:
         args.eval_function_path = args.rollout_function_path
 
 
-async def publication_boundary(producer, begin: bool, *, refresh: bool = False):
+async def publication_boundary(producer, begin: bool, *, refresh: bool = False, abort: bool = False):
+    if abort:
+        if not begin or refresh:
+            raise ValueError("Abort is a terminal lifecycle boundary, not a refresh or resume")
+        return await asyncio.to_thread(run, producer.shutdown(abort=True))
     if refresh:
         method = "begin_refresh" if begin else "end_refresh"
         if not hasattr(producer, method):

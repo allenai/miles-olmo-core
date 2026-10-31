@@ -29,7 +29,7 @@ logger = logger_utils.setup_logger(__name__)
 
 
 class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
-    """Publication gates new groups; lifecycle boundaries park queued generation.
+    """Engine publication preserves requests; lifecycle boundaries park generation.
 
     SGLang owns request retraction, state invalidation and continuation. Core's
     actor publishes while source weights are fixed and reopens engines only
@@ -48,6 +48,8 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         self._refresh_started = None
 
     async def begin_refresh(self):
+        # Compatibility for older Core drivers. New drivers publish without
+        # producer round trips and explicitly abort on terminal failure.
         if self._refreshing or self._publication_paused or self._stopping or self._interrupted():
             raise RuntimeError("Cannot start policy refresh while paused, stopping, or recovering")
         self._refreshing = True
@@ -216,7 +218,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             await asyncio.gather(idle, return_exceptions=True)
 
     async def finish_publication(self):
-        if self._refreshing or self._interrupted():
+        if self._refreshing or self._stopping or self._interrupted():
             raise RuntimeError("Cannot resume generation before successful publication")
         if self._worker is not None and self._worker.done():
             self._worker.result()
@@ -269,21 +271,26 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         await self.finish_publication()
         return RolloutFnEvalOutput(data=results)
 
-    async def shutdown(self):
+    async def shutdown(self, *, abort=False):
         if self._shutdown_complete:
             return
         pipeline_observer.write_lifecycle(self, "shutdown_start")
         quiesced = False
         try:
-            await self.prepare_publication()
-            quiesced = True
+            if not abort:
+                await self.prepare_publication()
+                quiesced = True
         finally:
             # On failed publication, cancel HTTP ownership without reopening any
             # engine. Driver teardown terminates servers after transport cleanup.
             self._stopping = True
+            self._publication_paused = True
+            self._producer_resumed.clear()
+            self._generation_admission.pause()
             self._stop_requested.set()
             if self._worker is not None:
                 self._worker.cancel()
                 await asyncio.gather(self._worker, return_exceptions=True)
             self._shutdown_complete = True
-            pipeline_observer.write_lifecycle(self, "shutdown_complete" if quiesced else "shutdown_incomplete")
+            outcome = "shutdown_aborted" if abort else "shutdown_complete" if quiesced else "shutdown_incomplete"
+            pipeline_observer.write_lifecycle(self, outcome)

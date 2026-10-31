@@ -104,9 +104,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             sampling_params=input.sampling_params,
         )
         if payload is None:
-            raise ValueError(
-                f"Policy refresh prompt has no response-token budget ({halt}); increase context length"
-            )
+            raise ValueError(f"Policy refresh prompt has no response-token budget ({halt}); increase context length")
         payload["rid"] = uuid.uuid4().hex
         timing = sibling_timing.sample_record(sample)
         if timing is not None:

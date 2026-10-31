@@ -23,7 +23,7 @@ def test_transport_failure_roundtrip(error_type, category):
     assert isinstance(restored, error_type)
 
 
-def test_real_ray_post_preserves_errors_without_local_resend(monkeypatch):
+def test_real_ray_post_preserves_errors_without_local_resend(monkeypatch, ray_local_mode):
     requests = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -50,14 +50,6 @@ def test_real_ray_post_preserves_errors_without_local_resend(monkeypatch):
     monkeypatch.setattr(http_utils, "_client_concurrency", 2)
     monkeypatch.setattr(http_utils, "_distributed_post_enabled", True)
     monkeypatch.setattr(http_utils, "_post_actor_idx", 0)
-    ray.init(
-        address="local",
-        num_cpus=2,
-        num_gpus=0,
-        include_dashboard=False,
-        object_store_memory=128 * 1024**2,
-        _memory=512 * 1024**2,
-    )
     try:
         http_utils._init_ray_distributed_post(
             SimpleNamespace(num_gpus_per_node=1, http_post_actors_per_node=1, http_post_num_cpus=1)
@@ -82,7 +74,6 @@ def test_real_ray_post_preserves_errors_without_local_resend(monkeypatch):
     finally:
         for actor in http_utils._post_actors:
             ray.kill(actor)
-        ray.shutdown()
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)

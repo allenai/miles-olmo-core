@@ -107,7 +107,11 @@ def test_sample_conversion_and_refresh_provenance_match_legacy(length):
     compact = rollout_replay.compact_token_logprobs(nested)
     expected, expected_provenance = converted_sample(nested, length)
     actual, provenance = converted_sample(compact, length)
-    assert actual.tokens == expected.tokens == [1, 2, 3, *(item[1] for item in nested["meta_info"]["output_token_logprobs"])]
+    assert (
+        actual.tokens
+        == expected.tokens
+        == [1, 2, 3, *(item[1] for item in nested["meta_info"]["output_token_logprobs"])]
+    )
     assert actual.response_length == expected.response_length == length
     assert actual.rollout_log_probs == expected.rollout_log_probs
     assert all(isinstance(value, float) for value in actual.rollout_log_probs)

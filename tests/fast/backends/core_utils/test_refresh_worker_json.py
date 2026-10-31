@@ -19,7 +19,7 @@ from miles.utils import http_utils, rollout_replay
 from miles.utils.types import Sample
 
 
-def test_refresh_uses_worker_parsing_and_preserves_replay(monkeypatch, tmp_path):
+def test_refresh_uses_worker_parsing_and_preserves_replay(monkeypatch, tmp_path, ray_local_mode):
     length, layers, experts = 2048, 16, 16
     score = -0.12345678901234567
     routes = np.full((length, layers, experts), 7, dtype=np.int32)
@@ -100,14 +100,6 @@ def test_refresh_uses_worker_parsing_and_preserves_replay(monkeypatch, tmp_path)
         return await native_update(args, sample, payload, output)
 
     monkeypatch.setattr(refreshing_rollout, "update_sample_from_response", require_worker_compacted)
-    ray.init(
-        address="local",
-        num_cpus=2,
-        num_gpus=0,
-        include_dashboard=False,
-        object_store_memory=128 * 1024**2,
-        _memory=512 * 1024**2,
-    )
     try:
         http_utils._init_ray_distributed_post(args)
 
@@ -128,9 +120,7 @@ def test_refresh_uses_worker_parsing_and_preserves_replay(monkeypatch, tmp_path)
         paths = list(tmp_path.glob("http_post_worker_*.jsonl"))
         assert len(paths) == 2
         assert all(not p.stem.endswith(f"_{os.getpid()}") for p in paths)
-        observations = {
-            r["request_id"]: r for p in paths for r in map(json.loads, p.read_text().splitlines())
-        }
+        observations = {r["request_id"]: r for p in paths for r in map(json.loads, p.read_text().splitlines())}
         for result in results:
             sample = result.samples
             np.testing.assert_array_equal(sample.rollout_routed_experts, routes)
@@ -157,7 +147,6 @@ def test_refresh_uses_worker_parsing_and_preserves_replay(monkeypatch, tmp_path)
     finally:
         for actor in http_utils._post_actors:
             ray.kill(actor)
-        ray.shutdown()
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)

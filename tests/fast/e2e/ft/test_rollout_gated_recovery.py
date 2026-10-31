@@ -40,7 +40,13 @@ class _FakeRouter:
         self.worker_urls: list[str] = []
 
     async def add_worker(
-        self, *, worker_url: str, worker_type: str, use_legacy_api: bool, bootstrap_port: int | None
+        self,
+        *,
+        worker_url: str,
+        worker_type: str,
+        use_legacy_api: bool,
+        bootstrap_port: int | None,
+        weights_ready: bool = False,
     ) -> None:
         self.worker_urls.append(worker_url)
 

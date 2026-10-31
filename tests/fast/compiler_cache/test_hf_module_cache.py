@@ -7,16 +7,13 @@ import sys
 from concurrent import futures
 
 from tokenizers import Tokenizer, models
-from transformers import PreTrainedTokenizerFast, dynamic_module_utils
-
-from miles.utils.compiler_cache import hf_module_cache
+from transformers import PreTrainedTokenizerFast
 
 
-def test_primed_custom_modules_need_no_copy_in_concurrent_children(tmp_path, monkeypatch):
+def test_primed_custom_modules_need_no_copy_in_concurrent_children(tmp_path):
     model = tmp_path / "model"
     model.mkdir()
     cache = tmp_path / "modules"
-    monkeypatch.setattr(dynamic_module_utils, "HF_MODULES_CACHE", str(cache))
     source = (
         "from transformers import PretrainedConfig\n"
         "class CacheProbeConfig(PretrainedConfig):\n"
@@ -35,7 +32,20 @@ def test_primed_custom_modules_need_no_copy_in_concurrent_children(tmp_path, mon
         tokenizer_object=Tokenizer(models.WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]")), unk_token="[UNK]"
     )
     tokenizer.save_pretrained(model)
-    hf_module_cache.prime_serving_modules(["--model-path", str(model), "--trust-remote-code"])
+    env = dict(os.environ, HF_MODULES_CACHE=str(cache), HF_HUB_OFFLINE="1", TOKENIZERS_PARALLELISM="false")
+    # Importing custom modules changes sys.path and the transformers_modules
+    # package's search path. Isolate priming too, so this temporary cache cannot
+    # leak into later tokenizer tests in the same CI shard.
+    prime_script = """
+import sys
+from miles.utils.compiler_cache import hf_module_cache
+
+hf_module_cache.prime_serving_modules(['--model-path', sys.argv[1], '--trust-remote-code'])
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", prime_script, str(model)], env=env, capture_output=True, text=True, timeout=90
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
     assert [p.read_text() for p in cache.rglob("configuration_cache_probe.py")] == [source]
     # A fresh interpreter is essential: in-process module reuse would hide a
     # missing priming step. Refuse copies so this checks the read-only child path.
@@ -50,7 +60,6 @@ with mock.patch.object(dynamic_module_utils.shutil, 'copyfile', side_effect=Asse
     tokenizer = AutoTokenizer.from_pretrained(sys.argv[1], trust_remote_code=True)
     assert tokenizer.encode('hello', add_special_tokens=False) == [1]
 """
-    env = dict(os.environ, HF_MODULES_CACHE=str(cache), HF_HUB_OFFLINE="1", TOKENIZERS_PARALLELISM="false")
 
     def child(_):
         result = subprocess.run(

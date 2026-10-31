@@ -17,6 +17,7 @@ from miles.backends.core_utils import checkpoint, contract, data, expert_schedul
 from miles.backends.core_utils import metrics as training_metrics
 from miles.backends.core_utils import (
     models,
+    observability,
     packing,
     performance,
     replay_diagnostics,
@@ -62,6 +63,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         with startup_stage(args, "distributed_init"):
             super()._init_common(args, role, with_ref=with_ref, with_opd_teacher=False)
         self._agree(lambda: training_metrics.init_tracking(args))
+        self._observed_response_tokens = 0
         torch.manual_seed(args.seed)
         world = dist.get_world_size()
         rank = dist.get_rank()
@@ -176,6 +178,13 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             contract.record(self.args, {"event": "scores", "rollout_id": rollout_id, "source": source, **profile}),
         )
         if self.args.olmo_core.publication_mode == "refresh":
+            self._agree(lambda: policy_refresh.validate_batch(rollout))
+            profile["behavior_metrics"] = observability.behavior_metrics(
+                rollout,
+                current_version=self.clock.completed_steps,
+                clip_low=self.args.tis_clip_low,
+                clip_high=self.args.tis_clip,
+            )
             refresh_profile = policy_refresh.score_metrics(
                 rollout,
                 current_version=self.clock.completed_steps,
@@ -372,6 +381,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             probe = contract.ParameterProbe(self.train_module._miles_named_parameters) if diagnostic else None
             lr_used = self.lr_scheduler.get_last_lr()
             self._agree(lambda: contract.validate_schedule(self.clock, self.lr_scheduler))
+            allocator_before = torch.cuda.memory_stats()
             torch.cuda.reset_peak_memory_stats()
             started = time.perf_counter()
             contract.auxiliary_metrics(self.model, reset=True)
@@ -559,7 +569,14 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                     normalization.world_size,
                 )
             )
-            summary.update(model_tokens=normalization.model_tokens, active_response_tokens=normalization.active_tokens)
+            if self._observed_response_tokens is not None:
+                self._observed_response_tokens += normalization.active_tokens
+                summary["run_consumed_response_tokens"] = self._observed_response_tokens
+            summary.update(
+                model_tokens=normalization.model_tokens,
+                active_response_tokens=normalization.active_tokens,
+            )
+            summary.update(observability.allocator_metrics(allocator_before, device=step_batches[0]["tokens"].device))
 
             if self.args.olmo_core.sequence_packing:
                 summary.update(

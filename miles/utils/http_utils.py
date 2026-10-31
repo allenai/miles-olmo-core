@@ -1,7 +1,6 @@
 import asyncio
 import ipaddress
 import json
-import logging
 import multiprocessing
 import os
 import random
@@ -11,9 +10,14 @@ import time
 
 import httpx
 
+from miles.utils import logger_utils
+from miles.utils.http_post_errors import HTTPPostFailure
+from miles.utils.http_post_observer import PostObserver
 from miles.utils.logging_utils import configure_logger_raw
+from miles.utils.rollout_replay import compact_token_logprobs as compact_token_logprobs_response
+from miles.utils.rollout_replay import decode_response_routes
 
-logger = logging.getLogger(__name__)
+logger = logger_utils.setup_logger(__name__)
 
 MILES_HOST_IP_ENV = "MILES_HOST_IP"
 MILES_PREFER_IPV6_ENV = "MILES_PREFER_IPV6"
@@ -212,7 +216,9 @@ def _next_actor():
     return actor
 
 
-async def _post(client, url, payload, max_retries=60, action="post", headers=None):
+async def _post(
+    client, url, payload, max_retries=60, action="post", headers=None, *, return_bytes=False, observation=None
+):
     retry_count = 0
     while retry_count < max_retries:
         try:
@@ -222,10 +228,21 @@ async def _post(client, url, payload, max_retries=60, action="post", headers=Non
             else:
                 response = await getattr(client, action)(url, json=payload or {}, headers=headers)
             response.raise_for_status()
+            if observation is not None:
+                observation.update(response_bytes=len(response.content), response_body_ready_unix=time.time())
+            if return_bytes:
+                return response.content
+            decode_start, decode_cpu_start = time.monotonic(), time.thread_time()
             try:
                 output = response.json()
             except json.JSONDecodeError:
                 output = response.text
+            finally:
+                if observation is not None:
+                    observation.update(
+                        json_decode_seconds=time.monotonic() - decode_start,
+                        json_decode_thread_cpu_seconds=time.thread_time() - decode_cpu_start,
+                    )
         except Exception as e:
             retry_count += 1
 
@@ -295,7 +312,7 @@ def init_http_client(args):
     _client_concurrency = max(_client_concurrency, args.sglang_server_concurrency)
     if _http_client is None:
         _http_client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=_client_concurrency),
+            limits=_rollout_client_limits(_client_concurrency),
             timeout=httpx.Timeout(None),
         )
 
@@ -305,11 +322,20 @@ def init_http_client(args):
         _distributed_post_enabled = True
 
 
+def _rollout_client_limits(concurrency):
+    # Large generation responses can stall the consumer after HTTPX chooses an
+    # idle socket but before it writes. The server can close that socket in the
+    # meantime, losing a whole prompt group to ReadError. New connections avoid
+    # this idle-reuse race without retrying potentially delivered generations.
+    # General/control clients owned by other providers retain their own pools.
+    return httpx.Limits(max_connections=max(1, concurrency), max_keepalive_connections=0)
+
+
 def _init_ray_distributed_post(args):
     """Initialize one or more Ray async actors per node for HTTP POST.
 
     Uses NodeAffinitySchedulingStrategy to place actors on distinct nodes.
-    Controlled by MILES_HTTP_POST_ACTORS_PER_NODE.
+    Controlled by --http-post-actors-per-node and --http-post-num-cpus.
     """
     global _post_actors
     if _post_actors:
@@ -326,33 +352,85 @@ def _init_ray_distributed_post(args):
     # Define the async actor
     @ray.remote
     class _HttpPosterActor:
-        def __init__(self, *, concurrency: int):
+        def __init__(self, *, concurrency: int, observation_dir=None):
+            self._observer = PostObserver(observation_dir)
             # Lazy creation to this actor's event loop
             self._client = httpx.AsyncClient(
-                limits=httpx.Limits(max_connections=max(1, concurrency)),
+                limits=_rollout_client_limits(concurrency),
                 timeout=httpx.Timeout(None),
             )
 
-        async def do_post(self, url, payload, max_retries=60, action="post", headers=None):
-            return await _post(self._client, url, payload, max_retries, action=action, headers=headers)
+        async def do_post(
+            self,
+            url,
+            payload,
+            max_retries=60,
+            action="post",
+            headers=None,
+            *,
+            return_bytes=False,
+            decode_routed_experts=False,
+            compact_token_logprobs=False,
+        ):
+            observation = self._observer.start(payload)
+            result = None
+            try:
+                response = await _post(
+                    self._client,
+                    url,
+                    payload,
+                    max_retries,
+                    action=action,
+                    headers=headers,
+                    return_bytes=return_bytes,
+                    observation=observation,
+                )
+                # Decode after the HTTP retry loop: malformed replay is not a
+                # transport failure and must never replay a delivered request.
+                processed = response
+                if not return_bytes:
+                    if decode_routed_experts:
+                        processed = decode_response_routes(processed, observation=observation)
+                    if compact_token_logprobs:
+                        processed = compact_token_logprobs_response(processed, observation=observation)
+                result = processed
+                return result
+            except httpx.HTTPError as error:
+                return HTTPPostFailure.capture(error, method=action, url=url)
+            finally:
+                self._observer.finish(observation, result)
 
     # Create actors per node
     created = []
-    # Distribute client concurrency across actors (at least 1 per actor)
-    per_actor_conc = (_client_concurrency + len(nodes)) // len(nodes)
+    workers_per_node = getattr(args, "http_post_actors_per_node", None)
+    workers_per_node = args.num_gpus_per_node if workers_per_node is None else workers_per_node
+    worker_cpus = getattr(args, "http_post_num_cpus", 0.001)
+    if workers_per_node < 1 or worker_cpus <= 0:
+        raise ValueError("HTTP worker count and CPU reservation must be positive")
+    total_workers = len(nodes) * workers_per_node
+    per_actor_conc = max(1, (_client_concurrency + total_workers - 1) // total_workers)
+    observed = getattr(getattr(args, "olmo_core", None), "pipeline_observation_interval", 0) > 0
+    observation_dir = getattr(args, "save", None) if observed else None
+    logger.info(
+        "Distributed HTTP: nodes=%d workers_per_node=%d total_workers=%d cpus_per_worker=%g concurrency_per_worker=%d",
+        len(nodes),
+        workers_per_node,
+        total_workers,
+        worker_cpus,
+        per_actor_conc,
+    )
 
     for node in nodes:
         node_id = node["NodeID"]
         scheduling = NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
-        for _ in range(args.num_gpus_per_node):
+        for _ in range(workers_per_node):
             actor = _HttpPosterActor.options(
                 name=None,
                 lifetime="detached",
                 scheduling_strategy=scheduling,
                 max_concurrency=per_actor_conc,
-                # Use tiny CPU to schedule
-                num_cpus=0.001,
-            ).remote(concurrency=per_actor_conc)
+                num_cpus=worker_cpus,
+            ).remote(concurrency=per_actor_conc, observation_dir=observation_dir)
             created.append(actor)
 
     _post_actors = created
@@ -364,18 +442,60 @@ def _rollout_client() -> httpx.AsyncClient:
 
 
 # TODO may generalize the name since it now contains http DELETE/GET etc (with retries and remote-execution)
-async def post(url, payload, max_retries=60, action="post", headers=None):
+async def post(
+    url,
+    payload,
+    max_retries=60,
+    action="post",
+    headers=None,
+    *,
+    return_bytes=False,
+    decode_routed_experts=False,
+    compact_token_logprobs=False,
+):
+    """POST ``payload`` and return the parsed response.
+
+    ``decode_routed_experts`` turns the base64 routing blob into an int32 array
+    and ``compact_token_logprobs`` turns per-token logprob records into flat
+    arrays. Both run where the JSON was parsed, so a distributed HTTP worker
+    ships buffers to the producer instead of nested Python objects.
+    """
     # If distributed mode is enabled and actors exist, dispatch via Ray.
     if _distributed_post_enabled and _post_actors:
-        try:
-            actor = _next_actor()
-            if actor is not None:
-                return await actor.do_post.remote(url, payload, max_retries, action=action, headers=headers)
-        except Exception as e:
-            logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
-            # fall through to local
+        # A remote failure can follow successful request delivery. Propagate it;
+        # the rollout's bounded whole-group recovery owns retries, not this layer.
+        actor = _next_actor()
+        if actor is not None:
+            result = await actor.do_post.remote(
+                url,
+                payload,
+                max_retries,
+                action=action,
+                headers=headers,
+                return_bytes=return_bytes,
+                decode_routed_experts=decode_routed_experts,
+                compact_token_logprobs=compact_token_logprobs,
+            )
+            if isinstance(result, HTTPPostFailure):
+                raise result.exception()
+            return result
 
-    return await _post(_rollout_client(), url, payload, max_retries, action=action, headers=headers)
+    response = await _post(
+        _rollout_client(),
+        url,
+        payload,
+        max_retries,
+        action=action,
+        headers=headers,
+        return_bytes=return_bytes,
+    )
+    if return_bytes:
+        return response
+    if decode_routed_experts:
+        response = decode_response_routes(response)
+    if compact_token_logprobs:
+        response = compact_token_logprobs_response(response)
+    return response
 
 
 # TODO unify w/ `post` to add retries and remote-execution

@@ -117,6 +117,20 @@ def test_shutdown_waits_for_producer_loop():
 
 
 @pytest.mark.asyncio
+async def test_failed_refresh_abort_runs_on_producer_loop():
+    async def shutdown(*, abort):
+        assert abort
+        assert asyncio.get_running_loop() is get_async_loop().loop
+        return "cancelled"
+
+    producer = SimpleNamespace(shutdown=shutdown)
+    assert await integration.publication_boundary(producer, True, abort=True) == "cancelled"
+    for begin, refresh in [(False, False), (True, True)]:
+        with pytest.raises(ValueError, match="terminal lifecycle"):
+            await integration.publication_boundary(producer, begin, refresh=refresh, abort=True)
+
+
+@pytest.mark.asyncio
 async def test_finalization_waits_for_acknowledgement_and_propagates_failure():
     entered, release = asyncio.Event(), asyncio.Event()
 

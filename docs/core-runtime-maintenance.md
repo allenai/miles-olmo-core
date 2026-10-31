@@ -90,6 +90,36 @@ in checkpoint templates: they describe training spans. The fix avoids the
 unnecessary parsing; it does not add support for those tags to MiniJinja.
 The manual router test fails with the old wheel and passes with the replacement.
 
+## Core refresh response decoding
+
+Core refresh requests with routing replay ask the distributed HTTP actor to
+decode the base64 routing blob before returning the response through Ray. It
+returns a flat `int32` array; the producer reshapes it using the accumulated
+token count and model layers, retaining nonzero and policy-provenance checks.
+
+Core refresh requests also opt into `compact_token_logprobs=True`, independently
+of routing replay. This replaces `meta_info.output_token_logprobs` with
+`TokenLogprobs`: two flat NumPy arrays, `log_probs` (`float64`) and `token_ids`
+(`int64`), instead of one nested record per generated token. Numeric values are
+preserved; indexing and iteration expose `(logprob, token_id, None)` records.
+Token text is not retained, so this opt-in is intended for callers that do not
+request per-token text. Other response fields and policy provenance are unchanged.
+
+Both transforms run after JSON parsing in the distributed HTTP actor, before
+Ray delivery. The local HTTP fallback applies the same transforms locally.
+Ordinary POST callers retain their existing contract because both options
+default to false; `return_bytes=True` bypasses both transforms.
+
+Worker observations include `replay_decode_seconds`,
+`replay_decode_thread_cpu_seconds`, and `replay_decoded_bytes`, plus
+`token_logprobs_compact_seconds`, `token_logprobs_compact_thread_cpu_seconds`, and
+`token_logprobs_count`. Both transforms occur after the HTTP retry loop, so a
+conversion failure cannot cause a delivered request to be resent. Processing is
+synchronous within each HTTP actor; this change does not add a background
+decoding executor or bounded payload fetching. Ray reconstruction and producer
+batch preparation still need separate measurement. CPU transport tests do not
+establish GPU throughput gains.
+
 ## Recorded validation, October 22, 2026
 
 These results are historical evidence at specific revisions. They do not make

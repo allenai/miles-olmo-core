@@ -2385,6 +2385,24 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
         def add_network_arguments(parser):
             parser.add_argument("--http-proxy", type=str, default=None)
             parser.add_argument("--use-distributed-post", action="store_true", default=False)
+            parser.add_argument(
+                "--http-post-actors-per-node",
+                type=int,
+                default=None,
+                help="HTTP worker processes per node; defaults to num_gpus_per_node.",
+            )
+            parser.add_argument(
+                "--http-post-num-cpus",
+                type=float,
+                default=0.001,
+                help="Ray CPU reservation per distributed HTTP worker.",
+            )
+            parser.add_argument(
+                "--rollout-executor-num-cpus",
+                type=float,
+                default=1,
+                help="CPU reservation for the rollout executor; does not add event loops.",
+            )
             return parser
 
         def add_reward_model_arguments(parser):

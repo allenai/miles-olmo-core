@@ -55,15 +55,24 @@ def test_serving_module_cache_is_private_even_without_compiler_cache():
     assert original["HF_MODULES_CACHE"] == "/tmp/old-shared-modules"
 
 
-def test_worker_restore_publish_and_rank_isolation(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "slot,other_slot,shared",
+    [
+        ("train-actor-cell0-rank0", "train-actor-cell0-rank1", False),
+        ("inference-engine-all-0-0-0-0", "inference-engine-all-0-0-12-0", True),
+    ],
+)
+def test_worker_restore_publish_and_rank_isolation(tmp_path, monkeypatch, slot, other_slot, shared):
     descriptor = policy(tmp_path, restore=False)
+    descriptor["slot"] = slot
+    descriptor["run_config"]["miles"]["rollout_num_gpus_per_engine"] = 1
     monkeypatch.setenv(startup.ENV, json.dumps(descriptor))
     fake_ray = SimpleNamespace(get_runtime_context=lambda: SimpleNamespace(get_node_id=lambda: "node"))
     original_import = startup.importlib.import_module
     monkeypatch.setattr(
         startup.importlib, "import_module", lambda name: fake_ray if name == "ray" else original_import(name)
     )
-    monkeypatch.setattr(startup.probes, "toolchain", lambda env: {"gpu": "B300"})
+    monkeypatch.setattr(startup.probes, "toolchain", lambda env: {"torch_hardware": {"gpus": [{"name": "B300"}] * 8}})
     monkeypatch.setattr(startup.probes, "compiler_environment", lambda env: {})
     startup.setup_worker()
     cold = json.loads(next((tmp_path / "reports").glob("*.json")).read_text())
@@ -79,7 +88,11 @@ def test_worker_restore_publish_and_rank_isolation(tmp_path, monkeypatch):
     assert warm["fingerprint"] == cold["fingerprint"] and warm["local"] != cold["local"]
     assert (Path(warm["local"]) / "triton/kernel").read_bytes() == b"compiled"
     startup.publish_worker(warm)
-    descriptor["slot"] = "train-actor-cell0-rank1"
+    descriptor["slot"] = other_slot
+    if shared:
+        monkeypatch.setattr(
+            startup.probes, "toolchain", lambda env: {"torch_hardware": {"gpus": [{"name": "B300"}] * 7}}
+        )
     monkeypatch.setenv(startup.ENV, json.dumps(descriptor))
     startup.setup_worker()
     other = next(
@@ -87,7 +100,11 @@ def test_worker_restore_publish_and_rank_isolation(tmp_path, monkeypatch):
         for p in (tmp_path / "reports").glob("*.json")
         if json.loads(p.read_text())["slot"] == descriptor["slot"]
     )
-    assert other["fingerprint"] != cold["fingerprint"] and other["restore"]["status"] == "miss"
+    assert (other["fingerprint"] == cold["fingerprint"]) is shared
+    assert other["restore"]["status"] == ("hit" if shared else "miss")
+    assert other["local"] not in {cold["local"], warm["local"]}
+    if shared:
+        assert (Path(other["local"]) / "triton/kernel").read_bytes() == b"compiled"
     startup.publish_worker(other)
 
 

@@ -3,6 +3,7 @@ from collections.abc import Mapping
 
 from sglang_router.launch_router import RouterArgs
 
+from miles.backends.sglang_utils.rust_router_membership import controller_manages_router
 from miles.utils.workers.argv_utils import render_cli_argv
 
 _ROUTER_DEST_PREFIX = "router_"
@@ -27,6 +28,11 @@ def compute_sglang_router_args(
 
     if args.sglang_router_policy:
         router_args["policy"] = args.sglang_router_policy
+
+    if controller_manages_router(args):
+        # Core owns whole-group retries and weight-ready membership. These are
+        # backend invariants, overriding the serving router's recovery defaults.
+        router_args.update(disable_retries=True, disable_health_check=True, disable_circuit_breaker=True)
 
     if has_pd_disaggregation:
         router_args["pd_disaggregation"] = True

@@ -267,22 +267,25 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                 put_task.result()
                 return True
             put_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await put_task
+            # Observe child cancellation without catching cancellation directed
+            # at this producer task while the child is retiring.
+            await asyncio.wait({put_task})
+            if not put_task.cancelled():
+                put_task.result()
             return False
         finally:
             self._completed_put_wait_seconds += time.monotonic() - self._completed_put_started
             self._completed_put_started = None
             if not put_task.done():
                 put_task.cancel()
-            await asyncio.gather(put_task, return_exceptions=True)
+            stop_waiter.cancel()
+            # return_exceptions absorbs child cancellation, while cancellation
+            # of the caller still propagates after both children are joined.
+            await asyncio.gather(put_task, stop_waiter, return_exceptions=True)
             if not put_task.cancelled() and put_task.exception() is None:
                 if put_task.result() is False:
                     self.data_source.acknowledge_groups([item.prompt_group])
                 self._producing_groups.pop(item.prompt_group[0].group_index, None)
-            stop_waiter.cancel()
-            with suppress(asyncio.CancelledError):
-                await stop_waiter
 
     async def _worker_loop(self) -> None:
         """Generate continuously while retaining ownership of every child task."""
@@ -318,10 +321,17 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                     self._producer_idle.clear()
                     continue
 
-                try:
-                    done, active = await asyncio.wait_for(self._scheduler.wait_for_progress(active), timeout=0.5)
-                except TimeoutError:
-                    continue
+                # Under a busy uvloop, the timeout can fire before the scheduled
+                # waiter observes even already-completed tasks. Never put ready
+                # groups behind that wait: repeated timeouts can starve training.
+                done = {task for task in active if task.done()}
+                if done:
+                    active -= done
+                else:
+                    try:
+                        done, active = await asyncio.wait_for(self._scheduler.wait_for_progress(active), timeout=0.5)
+                    except TimeoutError:
+                        continue
                 self._active_tasks = active
                 completions = []
                 for task in done:

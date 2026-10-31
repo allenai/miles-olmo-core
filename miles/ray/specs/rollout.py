@@ -13,6 +13,8 @@ ROLLOUT_EXECUTOR_WORKER_CLASS = "miles.ray.rollout.rollout_executor.RolloutExecu
 
 
 def spec_rollout_executor(args) -> ServeWorkerSpec:
+    if getattr(args, "rollout_executor_num_cpus", 1) <= 0:
+        raise ValueError("rollout_executor_num_cpus must be positive")
     return ServeWorkerSpec(
         name=ROLLOUT_EXECUTOR_POOL_ID,
         port_infos=[],
@@ -21,7 +23,7 @@ def spec_rollout_executor(args) -> ServeWorkerSpec:
             num_cells=1,
             num_workers_per_cell=1,
             num_gpus_per_worker=0,
-            num_cpus_per_worker=1,
+            num_cpus_per_worker=getattr(args, "rollout_executor_num_cpus", 1),
             pin_to_head=args.pin_rollout_manager_to_head,
         ),
         worker_class=ROLLOUT_EXECUTOR_WORKER_CLASS,

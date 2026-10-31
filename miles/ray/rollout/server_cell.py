@@ -274,7 +274,7 @@ class ServerCell:
             worker_type=self.meta.worker_type,
             use_legacy_api=use_legacy_router_api(self.args),
             bootstrap_port=addr_info.bootstrap_port,
-            **({"weights_ready": True} if weights_ready else {}),
+            **({"weights_ready": True} if weights_ready and self.args.use_miles_router else {}),
         )
 
     async def dispose(self) -> None:

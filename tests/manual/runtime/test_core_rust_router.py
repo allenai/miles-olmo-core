@@ -24,7 +24,7 @@ from miles.backends.core_utils.publication import policy_refresh
 from miles.backends.core_utils.rollout import rollout_errors
 from miles.backends.sglang_utils import router_args_utils
 from miles.backends.sglang_utils.sglang_router_api_client import SGLangRouterApiClient
-from miles.ray.rollout.cell_state import CellAddrInfo, StatePendingWeights
+from miles.ray.rollout.cell_state import CellAddrInfo, StateDisposed, StatePendingWeights
 from miles.ray.rollout.server_cell import ServerCell
 from miles.utils.ft_utils.health_checker import ActiveAndEpoch
 from miles.utils.http_utils import GeneralHttpClientProvider
@@ -38,7 +38,8 @@ def free_port():
 
 
 @pytest.fixture
-def runtime(tmp_path):
+def runtime(tmp_path, request):
+    dp_size = getattr(request, "param", None)
     state = dict(healthy=True, version=0, requests=[], entered=threading.Event(), release=threading.Event())
     routes = np.arange(512, dtype=np.int32).reshape(2, 16, 16)
 
@@ -56,7 +57,7 @@ def runtime(tmp_path):
 
         def do_GET(self):
             self.reply(
-                dict(model_path="synthetic", is_generation=True, max_req_input_len=34816),
+                dict(model_path="synthetic", is_generation=True, max_req_input_len=34816, dp_size=dp_size or 1),
                 200 if state["healthy"] else 503,
             )
 
@@ -100,6 +101,7 @@ def runtime(tmp_path):
     args = router_args_utils._make_prefixed_cli_parser().parse_args([])
     args.train_backend = "olmo_core"
     args.use_miles_router = False
+    args.router_dp_aware = dp_size is not None
     args.sglang_router_policy = "round_robin"
     args.sglang_router_request_timeout_secs = 1800
     options = router_args_utils.compute_sglang_router_args(
@@ -131,6 +133,7 @@ def runtime(tmp_path):
             state=state,
             routes=routes,
             options=options,
+            dp_size=dp_size,
         )
     finally:
         state["release"].set()
@@ -150,6 +153,8 @@ def make_cell(runtime):
     cell = ServerCell.__new__(ServerCell)
     cell.args = SimpleNamespace(
         train_backend="olmo_core",
+        router_dp_aware=runtime.dp_size is not None,
+        sglang_dp_size=runtime.dp_size or 1,
         use_miles_router=False,
         debug_rollout_only=False,
         rollout_health_check_interval=0,
@@ -262,3 +267,25 @@ async def test_disconnected_engine_is_reported_to_group_retry(runtime, monkeypat
             assert len(runtime.state["requests"]) == 1
         finally:
             await cell.dispose()
+
+
+@pytest.mark.parametrize("runtime", [1, 2], indirect=True)
+async def test_dp_registration_and_removal_against_pinned_rust(runtime):
+    cell = make_cell(runtime)
+    try:
+        async with httpx.AsyncClient() as client:
+            with mock.patch.object(GeneralHttpClientProvider, "client", return_value=client):
+                await cell.mark_weights_ready()
+                assert cell.is_serving
+                workers = (await client.get(f"{runtime.router}/workers")).json()["workers"]
+                assert {w["url"] for w in workers} == {f"{runtime.engine}@{rank}" for rank in range(runtime.dp_size)}
+                assert cell._rust_membership.worker_id not in {w["id"] for w in workers}
+                await cell.mark_weights_ready()
+                await cell.dispose()
+                assert (await client.get(f"{runtime.router}/workers")).json()["workers"] == []
+    finally:
+        if not isinstance(cell._state, StateDisposed):
+            # Keep the router/client alive for cleanup if an assertion fails.
+            async with httpx.AsyncClient() as client:
+                with mock.patch.object(GeneralHttpClientProvider, "client", return_value=client):
+                    await cell.dispose()

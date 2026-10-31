@@ -569,11 +569,12 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                     normalization.world_size,
                 )
             )
-            self._observed_response_tokens += normalization.active_tokens
+            if self._observed_response_tokens is not None:
+                self._observed_response_tokens += normalization.active_tokens
+                summary["run_consumed_response_tokens"] = self._observed_response_tokens
             summary.update(
                 model_tokens=normalization.model_tokens,
                 active_response_tokens=normalization.active_tokens,
-                run_consumed_response_tokens=self._observed_response_tokens,
             )
             summary.update(observability.allocator_metrics(allocator_before, device=step_batches[0]["tokens"].device))
 

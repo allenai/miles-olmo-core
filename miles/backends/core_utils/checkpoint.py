@@ -45,6 +45,7 @@ def save(actor, rollout_id):
             "torch": torch.get_rng_state(),
             "cuda": torch.cuda.get_rng_state(),
             "scheduler": actor.lr_scheduler.state_dict(),
+            "consumed_response_tokens": actor._observed_response_tokens,
         },
         path / f"rank_{dist.get_rank()}.pt",
     )
@@ -184,6 +185,9 @@ def _restore_preflight(actor):
     for field in ("scheduler", "python", "numpy", "torch", "cuda"):
         if field not in state:
             raise ValueError(f"Missing rank checkpoint field: {field}")
+    tokens = state.get("consumed_response_tokens")
+    if tokens is not None and (type(tokens) is not int or tokens < 0):
+        raise ValueError("Invalid checkpoint consumed_response_tokens")
     return path, state, clock
 
 
@@ -194,6 +198,12 @@ def restore(actor):
     models.load_native(actor.train_module, path / "model")
     actor.lr_scheduler.load_state_dict(state["scheduler"])
     actor.clock = clock
+    actor._observed_response_tokens = state.get("consumed_response_tokens")
+    if actor._observed_response_tokens is None:
+        logger.warning(
+            "Checkpoint has no cumulative response-token count; omitting run_consumed_response_tokens "
+            "because the pre-resume total is unknown"
+        )
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
     torch.set_rng_state(state["torch"])

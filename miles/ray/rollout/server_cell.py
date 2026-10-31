@@ -266,6 +266,7 @@ class ServerCell:
                     worker_url=addr_info.server_url,
                     worker_type=self.meta.worker_type,
                     bootstrap_port=addr_info.bootstrap_port,
+                    dp_size=self.args.sglang_dp_size if getattr(self.args, "router_dp_aware", False) else None,
                 )
             await self._rust_membership.ensure_registered()
             return

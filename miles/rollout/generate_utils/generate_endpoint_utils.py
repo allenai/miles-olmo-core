@@ -14,7 +14,7 @@ from miles.rollout.generate_utils.rollout_topk_logprobs import (
 from miles.rollout.generate_utils.sampling_mask import append_sampling_metadata, should_return_sampling_mask
 from miles.utils.lora.utils import LORA_ADAPTER_NAME, lora_rollout_enabled
 from miles.utils.processing_utils import encode_image_for_rollout_engine, extract_multimodal_train_inputs
-from miles.utils.rollout_replay import decode_int32_buffer
+from miles.utils.rollout_replay import TokenLogprobs, decode_int32_buffer
 from miles.utils.types import Sample
 
 
@@ -98,7 +98,11 @@ async def update_sample_from_response(
     if (len(sample.response) == 0) and not sample.tokens:
         sample.tokens = payload["input_ids"]
 
-    if x := output["meta_info"].get("output_token_logprobs"):
+    if isinstance(x := output["meta_info"].get("output_token_logprobs"), TokenLogprobs):
+        # Flat arrays from the HTTP worker: two buffer-to-list conversions,
+        # no per-token Python records to walk.
+        new_response_tokens, new_response_log_probs = x.tokens(), x.logprobs()
+    elif x:
         new_response_tokens = [item[1] for item in x]
         new_response_log_probs = [item[0] for item in x]
     else:

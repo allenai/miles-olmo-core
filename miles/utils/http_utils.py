@@ -14,6 +14,7 @@ from miles.utils import logger_utils
 from miles.utils.http_post_errors import HTTPPostFailure
 from miles.utils.http_post_observer import PostObserver
 from miles.utils.logging_utils import configure_logger_raw
+from miles.utils.rollout_replay import compact_token_logprobs as compact_token_logprobs_response
 from miles.utils.rollout_replay import decode_response_routes
 
 logger = logger_utils.setup_logger(__name__)
@@ -369,6 +370,7 @@ def _init_ray_distributed_post(args):
             *,
             return_bytes=False,
             decode_routed_experts=False,
+            compact_token_logprobs=False,
         ):
             observation = self._observer.start(payload)
             result = None
@@ -385,11 +387,13 @@ def _init_ray_distributed_post(args):
                 )
                 # Decode after the HTTP retry loop: malformed replay is not a
                 # transport failure and must never replay a delivered request.
-                result = (
-                    decode_response_routes(response, observation=observation)
-                    if decode_routed_experts and not return_bytes
-                    else response
-                )
+                processed = response
+                if not return_bytes:
+                    if decode_routed_experts:
+                        processed = decode_response_routes(processed, observation=observation)
+                    if compact_token_logprobs:
+                        processed = compact_token_logprobs_response(processed, observation=observation)
+                result = processed
                 return result
             except httpx.HTTPError as error:
                 return HTTPPostFailure.capture(error, method=action, url=url)
@@ -447,7 +451,15 @@ async def post(
     *,
     return_bytes=False,
     decode_routed_experts=False,
+    compact_token_logprobs=False,
 ):
+    """POST ``payload`` and return the parsed response.
+
+    ``decode_routed_experts`` turns the base64 routing blob into an int32 array
+    and ``compact_token_logprobs`` turns per-token logprob records into flat
+    arrays. Both run where the JSON was parsed, so a distributed HTTP worker
+    ships buffers to the producer instead of nested Python objects.
+    """
     # If distributed mode is enabled and actors exist, dispatch via Ray.
     if _distributed_post_enabled and _post_actors:
         # A remote failure can follow successful request delivery. Propagate it;
@@ -462,6 +474,7 @@ async def post(
                 headers=headers,
                 return_bytes=return_bytes,
                 decode_routed_experts=decode_routed_experts,
+                compact_token_logprobs=compact_token_logprobs,
             )
             if isinstance(result, HTTPPostFailure):
                 raise result.exception()
@@ -476,7 +489,13 @@ async def post(
         headers=headers,
         return_bytes=return_bytes,
     )
-    return decode_response_routes(response) if decode_routed_experts and not return_bytes else response
+    if return_bytes:
+        return response
+    if decode_routed_experts:
+        response = decode_response_routes(response)
+    if compact_token_logprobs:
+        response = compact_token_logprobs_response(response)
+    return response
 
 
 # TODO unify w/ `post` to add retries and remote-execution

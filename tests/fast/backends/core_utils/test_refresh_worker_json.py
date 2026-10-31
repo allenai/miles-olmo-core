@@ -15,7 +15,7 @@ import ray
 from miles.backends.core_utils.rollout import refreshing_rollout, sibling_timing
 from miles.rollout.base_types import GenerateFnInput
 from miles.rollout.generate_utils import generate_endpoint_utils
-from miles.utils import http_utils
+from miles.utils import http_utils, rollout_replay
 from miles.utils.types import Sample
 
 
@@ -90,6 +90,16 @@ def test_refresh_uses_worker_parsing_and_preserves_replay(monkeypatch, tmp_path)
         return native_decode(value)
 
     monkeypatch.setattr(generate_endpoint_utils, "decode_int32_buffer", require_worker_decoded)
+    native_update = refreshing_rollout.update_sample_from_response
+    received_records = []
+
+    async def require_worker_compacted(args, sample, payload, output):
+        records = output["meta_info"]["output_token_logprobs"]
+        assert isinstance(records, rollout_replay.TokenLogprobs), "Producer must not receive per-token lists"
+        received_records.append(records)
+        return await native_update(args, sample, payload, output)
+
+    monkeypatch.setattr(refreshing_rollout, "update_sample_from_response", require_worker_compacted)
     ray.init(
         address="local",
         num_cpus=2,
@@ -113,6 +123,7 @@ def test_refresh_uses_worker_parsing_and_preserves_replay(monkeypatch, tmp_path)
 
         results = asyncio.run(exercise())
         assert len(received_arrays) == 4
+        assert len(received_records) == 4 and all(len(r) == length for r in received_records)
         assert len(set(requests)) == len(requests) == 4
         paths = list(tmp_path.glob("http_post_worker_*.jsonl"))
         assert len(paths) == 2
@@ -134,6 +145,8 @@ def test_refresh_uses_worker_parsing_and_preserves_replay(monkeypatch, tmp_path)
             assert worker["replay_decode_seconds"] >= 0
             assert worker["replay_decode_thread_cpu_seconds"] >= 0
             assert worker["replay_decoded_bytes"] == routes.nbytes
+            assert worker["token_logprobs_count"] == length
+            assert worker["token_logprobs_compact_seconds"] >= 0
             assert (
                 worker["response_body_ready_unix"]
                 <= worker["response_ready_unix"]

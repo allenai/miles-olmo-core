@@ -130,8 +130,10 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             # with fleet concurrency and compete with response delivery. Keep
             # the deadline; driver/queue diagnostics report aggregate progress.
             # Keep MILES' parsed-response contract: distributed HTTP actors own
-            # JSON and routing-blob decoding. Ray transports the decoded replay
-            # array; the producer retains shape and policy-provenance checks.
+            # JSON decoding, routing-blob decoding and per-token logprob
+            # compaction. Ray transports flat arrays; the producer retains
+            # shape and policy-provenance checks without rebuilding one
+            # Python list per generated token.
             output = await asyncio.wait_for(
                 post(
                     url,
@@ -139,6 +141,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
                     max_retries=1,
                     headers={"x-miles-request-id": payload["rid"]},
                     decode_routed_experts=payload.get("return_routed_experts", False),
+                    compact_token_logprobs=True,
                 ),
                 timeout=infra_timeouts.seconds(timeout),
             )

@@ -10,6 +10,7 @@ from numbers import Integral
 import torch
 
 from miles.backends.core_utils.publication import policy_versions
+from miles.utils.rollout_replay import TokenLogprobs
 from miles.utils.types import WeightVersionSpan, WeightVersionsPerCall
 
 
@@ -66,7 +67,8 @@ def record_response(sample, meta):
     records = meta.get("output_token_logprobs")
     if records is None or len(records) != sample.response_length:
         raise ValueError("Policy refresh response is missing token/logprob records")
-    if [x[1] for x in records] != sample.tokens[-sample.response_length :]:
+    received = records.tokens() if isinstance(records, TokenLogprobs) else [x[1] for x in records]
+    if received != sample.tokens[-sample.response_length :]:
         raise ValueError("Policy refresh behavior logprobs are not aligned with response tokens")
     provenance = {"spans": spans, "replay_version": replay_version}
     # Keep server observations distinct from inferred publication boundaries:

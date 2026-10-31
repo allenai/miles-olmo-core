@@ -130,8 +130,8 @@ class RolloutExecutor:
         return self._init_once.state.value
 
     @rpc(enabled=False)
-    async def core_publication_boundary(self, begin: bool, *, refresh: bool = False):
-        return await core_integration.publication_boundary(self.generate_rollout, begin, refresh=refresh)
+    async def core_publication_boundary(self, begin: bool, *, refresh: bool = False, abort: bool = False):
+        return await core_integration.publication_boundary(self.generate_rollout, begin, refresh=refresh, abort=abort)
 
     @rpc(enabled=False)
     async def core_engine_drain(self, operation: str, **kwargs):

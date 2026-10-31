@@ -28,6 +28,19 @@ async def test_publication_and_drain_rpc_delegates_preserve_results_and_version(
 
 
 @pytest.mark.asyncio
+async def test_executor_forwards_terminal_abort():
+    executor = object.__new__(rollout_executor.RolloutExecutor)
+    calls = []
+
+    async def shutdown(*, abort):
+        calls.append(abort)
+
+    executor.generate_rollout = SimpleNamespace(shutdown=shutdown)
+    await executor.core_publication_boundary(True, abort=True)
+    assert calls == [True]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ["megatron", "fsdp", "olmo_core"])
 @pytest.mark.parametrize("legacy", [False, True])
 async def test_executor_stops_core_producer_before_shared_cleanup(monkeypatch, backend, legacy):

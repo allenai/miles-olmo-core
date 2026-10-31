@@ -683,7 +683,7 @@ class TestDistributedPostActors:
 
         http_utils._init_ray_distributed_post(SimpleNamespace(num_gpus_per_node=2))
 
-        assert recorded == [((), {"concurrency": 8})] * 2
+        assert recorded == [((), {"concurrency": 4, "observation_dir": None})] * 2
 
 
 class _PosterActorInit(NamedTuple):
@@ -762,7 +762,7 @@ class TestPosterActorKeywordOnlyConstruction:
             nodes=[{"NodeID": fake_ray_node_id(0), "Alive": True}, {"NodeID": fake_ray_node_id(1), "Alive": True}],
         )
 
-        assert init.calls == [((), {"concurrency": 6})] * 4
+        assert init.calls == [((), {"concurrency": 3, "observation_dir": None})] * 4
 
 
 class TestInitHttpClientConcurrency:

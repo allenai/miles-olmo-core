@@ -103,6 +103,11 @@ def score_metrics(mean_abs, active_tokens, profile):
         result[f"collection_score_{quantile}_overflow"] = int(upper is None)
         if upper is not None:
             result[f"collection_score_{quantile}"] = upper
+    for name, group in profile.get("groups", {}).items():
+        result[f"collection_score/{name}/tokens"] = group["tokens"]
+        if group["mean_abs"] is not None:
+            result[f"collection_score/{name}/mean_abs"] = group["mean_abs"]
+    result.update(profile.get("behavior_metrics", {}))
     return result
 
 

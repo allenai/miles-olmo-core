@@ -29,7 +29,7 @@ logger = logger_utils.setup_logger(__name__)
 
 
 class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
-    """Publication gates new groups; lifecycle boundaries park queued generation.
+    """Engine publication preserves requests; lifecycle boundaries park generation.
 
     SGLang owns request retraction, state invalidation and continuation. Core's
     actor publishes while source weights are fixed and reopens engines only
@@ -48,6 +48,8 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         self._refresh_started = None
 
     async def begin_refresh(self):
+        # Compatibility for older Core drivers. New drivers publish without
+        # producer round trips and explicitly abort on terminal failure.
         if self._refreshing or self._publication_paused or self._stopping or self._interrupted():
             raise RuntimeError("Cannot start policy refresh while paused, stopping, or recovering")
         self._refreshing = True
@@ -107,7 +109,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         timing = sibling_timing.sample_record(sample)
         if timing is not None:
             timing["request_id"] = payload["rid"]
-        # With the qualified MILES router the complete response metadata survives.
+        # With the pinned Rust or MILES router the complete response metadata survives.
         # Do not retry a request in place. On recognized transport loss, the
         # producer discards the whole group and requeues its pristine prompts.
         url = f"http://{input.args.sglang_router_ip}:{input.args.sglang_router_port}/generate"
@@ -122,16 +124,30 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             len(payload.get("input_ids", [])),
         )
         try:
-            output = await infra_timeouts.wait_for(
-                post(url, payload, max_retries=1, headers={"x-miles-request-id": payload["rid"]}),
-                timeout,
-                operation=f"generation request {payload['rid']}",
+            # Long generations are normal. Per-request 30s watchdog logs scale
+            # with fleet concurrency and compete with response delivery. Keep
+            # the deadline; driver/queue diagnostics report aggregate progress.
+            # Keep MILES' parsed-response contract: distributed HTTP actors own
+            # JSON decoding, routing-blob decoding and per-token logprob
+            # compaction. Ray transports flat arrays; the producer retains
+            # shape and policy-provenance checks without rebuilding one
+            # Python list per generated token.
+            output = await asyncio.wait_for(
+                post(
+                    url,
+                    payload,
+                    max_retries=1,
+                    headers={"x-miles-request-id": payload["rid"]},
+                    decode_routed_experts=payload.get("return_routed_experts", False),
+                    compact_token_logprobs=True,
+                ),
+                timeout=infra_timeouts.seconds(timeout),
             )
+            if timing is not None:
+                timing["response_decoded_ready_unix"] = time.time()
         except httpx.HTTPError as error:
             logger.exception(
-                "Policy refresh HTTP failure: request=%s group=%s sample=%s url=%s elapsed_seconds=%.3f "
-                "error=%s status=%s attempts=1 delivery=unknown; correlate request with miles_router logs. "
-                "No HTTP-level retry; passing failure to the producer for bounded group recovery.",
+                "Policy refresh HTTP failure: request=%s group=%s sample=%s url=%s elapsed_seconds=%.3f error=%s status=%s attempts=1 delivery=unknown; correlate request with router/engine logs. No HTTP-level retry; passing failure to the producer for bounded group recovery.",
                 payload["rid"],
                 sample.group_index,
                 sample.index,
@@ -151,8 +167,11 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         sibling_timing.response_received(sample, payload["rid"], output.get("meta_info", {}))
         if output.get("meta_info", {}).get("finish_reason", {}).get("type") not in ("stop", "length"):
             raise RuntimeError("Policy refresh request did not finish; refusing a partial training sample")
+        conversion_start = time.monotonic()
         await update_sample_from_response(input.args, sample, payload, output)
         record = policy_refresh.record_response(sample, output["meta_info"])
+        if timing is not None:
+            timing["sample_conversion_seconds"] = time.monotonic() - conversion_start
         logger.info(
             "Policy refresh response: request=%s tokens=%d spans=%s replay_version=%d",
             payload["rid"],
@@ -208,7 +227,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             await asyncio.gather(idle, return_exceptions=True)
 
     async def finish_publication(self):
-        if self._refreshing or self._interrupted():
+        if self._refreshing or self._stopping or self._interrupted():
             raise RuntimeError("Cannot resume generation before successful publication")
         if self._worker is not None and self._worker.done():
             self._worker.result()
@@ -261,21 +280,26 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         await self.finish_publication()
         return RolloutFnEvalOutput(data=results)
 
-    async def shutdown(self):
+    async def shutdown(self, *, abort=False):
         if self._shutdown_complete:
             return
         pipeline_observer.write_lifecycle(self, "shutdown_start")
         quiesced = False
         try:
-            await self.prepare_publication()
-            quiesced = True
+            if not abort:
+                await self.prepare_publication()
+                quiesced = True
         finally:
             # On failed publication, cancel HTTP ownership without reopening any
             # engine. Driver teardown terminates servers after transport cleanup.
             self._stopping = True
+            self._publication_paused = True
+            self._producer_resumed.clear()
+            self._generation_admission.pause()
             self._stop_requested.set()
             if self._worker is not None:
                 self._worker.cancel()
                 await asyncio.gather(self._worker, return_exceptions=True)
             self._shutdown_complete = True
-            pipeline_observer.write_lifecycle(self, "shutdown_complete" if quiesced else "shutdown_incomplete")
+            outcome = "shutdown_aborted" if abort else "shutdown_complete" if quiesced else "shutdown_incomplete"
+            pipeline_observer.write_lifecycle(self, outcome)

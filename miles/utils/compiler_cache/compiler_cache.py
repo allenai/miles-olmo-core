@@ -286,10 +286,14 @@ def relocate_triton(root, destination=None):
 
 
 def snapshot(source, destination, family):
+    if family == "tilelang" and any(path.is_file() for path in source.glob("**/.staging/**/*")):
+        raise ValueError("TileLang publication deferred: an atomic kernel export is in progress")
     before = inventory(source)
     shutil.copytree(source, destination, dirs_exist_ok=True)
     if inventory(destination) != before or inventory(source) != before:
         raise ValueError("Compiler cache changed during snapshot")
+    if family == "tilelang" and any(path.is_file() for path in source.glob("**/.staging/**/*")):
+        raise ValueError("TileLang publication deferred: an atomic kernel export is in progress")
     if family == "triton":
         # Relocate copied absolute paths through the original namespace before
         # canonicalizing them; only the documented group JSON is rewritten.

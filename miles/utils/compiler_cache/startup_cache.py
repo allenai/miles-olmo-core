@@ -24,7 +24,7 @@ from miles.utils import logger_utils
 from miles.utils.compiler_cache import compilation_observer
 from miles.utils.compiler_cache import compiler_cache as cache
 from miles.utils.compiler_cache import compiler_identity as probes
-from miles.utils.compiler_cache import triton_compatibility
+from miles.utils.compiler_cache import tilelang_cache, triton_compatibility
 
 logger = logger_utils.setup_logger(__name__)
 ENV = "OI_CORE_STARTUP_CACHE"
@@ -125,6 +125,8 @@ def prepare(args, *, application_root):
         max_storage_bytes=args.olmo_core.compiler_cache_max_storage_bytes,
         publish_interval_seconds=args.olmo_core.compiler_cache_publish_interval_seconds,
     )
+    if getattr(args.olmo_core, "compiler_cache_tilelang", False):
+        args.olmo_core_startup_cache["tilelang_runtime"] = tilelang_cache.compiler_identity()
     logger.info("Core compiler cache: Triton enabled; worker reports in %s", report_dir)
 
 
@@ -253,6 +255,7 @@ def setup_worker():
     (local / "triton").mkdir()
     probes.validate_local_cache_controls(os.environ)
     os.environ["TRITON_CACHE_DIR"] = str(local / "triton")
+    tilelang_cache.configure(policy, local)
     ray = importlib.import_module("ray")
     report = dict(
         slot=policy["slot"],
@@ -275,6 +278,7 @@ def setup_worker():
             else {"family": "triton", "status": "cold"}
         )
         report["restored_files"] = len(cache.inventory(local / "triton"))
+        tilelang_cache.restore(policy, report, local)
     except Exception as error:
         # Compilation is still available locally; a cache failure is not a run failure.
         report["restore"] = {"family": "triton", "status": "unavailable", "reason": str(error)}
@@ -337,6 +341,8 @@ def publish_worker(report, *, retain_local=False):
     if not local.name.startswith("core-triton-") or local.parent != Path("/tmp"):
         raise ValueError("Unexpected worker cache directory")
     result = dict(slot=report["slot"], restore=report["restore"], setup_seconds=report["setup_seconds"])
+    if report.get("tilelang"):
+        result["tilelang"] = tilelang_cache.publish(report, local)
     try:
         if report.get("activity_directory"):
             result["activity_directory"] = archive_activity(report, local)
@@ -508,7 +514,9 @@ async def _publish_progress(args, policy, state, rollout_id):
         report["publication_error"] = f"{type(error).__name__}: {error}"
         logger.warning("Core compiler cache progress publication unavailable: %s", report["publication_error"])
     state["capped_slots"].update(
-        worker["slot"] for worker in report["workers"] if worker.get("publish", {}).get("status") == "storage_limit"
+        worker["slot"]
+        for worker in report["workers"]
+        if worker.get("publish", {}).get("status") == "storage_limit" and not worker.get("tilelang")
     )
     report["seconds"] = time.monotonic() - started
     state["published"] += 1

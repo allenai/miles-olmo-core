@@ -41,9 +41,8 @@ single-node probe, including its broader cache families. Open Instruct's old
 Storage, lifecycle, subprocess, module-priming, and relocation tests live in
 `tests/fast/compiler_cache/`. The application keeps configuration and packaged
 runtime integration tests. A GPU cold/warm pair is needed to qualify reuse for
-a specific image, model, and topology. Moving source files changes fingerprints:
-compare cold/warm runs of the same new revision, rather than forcing old entries
-to match.
+a specific image, model, and topology. Legacy strict scopes hash source locations; the ordinary Triton policy below
+separates source provenance from artifact compatibility.
 
 ## Core Triton compatibility
 
@@ -86,8 +85,9 @@ capture, module loading and non-Triton compilers are outside these timings.
 single-GPU fresh-process qualification: cold, warm, changed Python provenance,
 changed kernel dependency, changed shape, and FA4 cold/warm. It exercises KDA
 forward/backward and SGLang expert inference, checks numerical outputs, and
-requires no Triton compilation in the unchanged warm phases. The FA4 probe is
-experimental; it does not enable FA4 persistence in ordinary training.
+requires no Triton compilation in the unchanged warm phases. TileLang artifacts are also archived and restored into fresh directories, with
+its supported JIT diagnostics checking for unexpected warm compilation. These
+probes do not enable additional compiler families by default.
 
 Triton autotuning can record different timing measurements for the same key and
 candidate configurations on different workers. Publication retains the first
@@ -97,3 +97,17 @@ incoming kernel group. The previously published group stays byte-for-byte
 unchanged; unrelated new kernel groups can still be published. Receipts list
 `rejected_incoming_groups` and startup logs warn about them. Cross-group metadata
 remains a strict rejection; other compiler families retain strict publication.
+
+## Opt-in TileLang lifecycle
+
+Open Instruct's `core.compiler_cache_tilelang` enables a separate
+`core-tilelang-v1` compatibility envelope. It fingerprints installed TileLang
+Python/native/compiler sources, including its bundled TVM, in addition to the
+base runtime, device/toolchain and compile settings. Native-library stamping is
+forced on. This is opt-in pending GPU output/gradient qualification.
+
+The mutable cache and compiler scratch are separate private directories. Active
+`.staging` exports and changing snapshots are rejected; publication retries on
+a later interval. Independent TileLang receipts and storage caps prevent its
+state from being mistaken for Triton hits. Diagnostics use TileLang's supported
+`TILELANG_JIT_DIAGNOSTICS` phase logging.

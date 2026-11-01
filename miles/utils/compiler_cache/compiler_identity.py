@@ -98,6 +98,7 @@ def compiler_environment(environment):
         # per serving process; including it prevents an identical restart hit.
         "SGLANG_DG_CACHE_DIR",
         "TILELANG_TMP_DIR",
+        "TILELANG_JIT_DIAGNOSTICS",
     }
     return {
         key: cache.digest(value)

@@ -26,6 +26,7 @@ def install(local):
                 "event": "compile_hit" if cache_hit else "compile_miss",
                 "timestamp": time.time(),
                 "kernel": src.name,
+                "source_digest": cache.digest(getattr(getattr(src, "fn", None), "cache_key", None)),
                 "signature": {str(key): str(value) for key, value in getattr(src, "signature", {}).items()},
                 "specialization_digest": cache.digest(str(getattr(src, "constants", {}))),
                 "compiler_microseconds": times.ir_initialization + sum(stages.values()) + times.store_results,

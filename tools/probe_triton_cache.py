@@ -18,10 +18,11 @@ import time
 from logging import INFO, StreamHandler
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from miles.utils import logger_utils
 from miles.utils.compiler_cache import compiler_cache as cache
-from miles.utils.compiler_cache import startup_cache
+from miles.utils.compiler_cache import startup_cache, tilelang_cache
 
 KERNEL = """import triton
 from triton import language as tl
@@ -104,6 +105,15 @@ def _serving_workload(torch, root):
     runtime_context.publish(
         server_args.ServerArgs(model_path=str(config_root), disable_cuda_graph=True), role="scheduler"
     )
+    parallel = importlib.import_module("sglang.srt.distributed.parallel_state")
+    parallel.init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method=f"file://{root / ('distributed-' + str(os.getpid()))}",
+        backend="nccl",
+    )
+    parallel.initialize_model_parallel()
     moe = importlib.import_module("sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe")
     torch.manual_seed(23)
     x = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
@@ -120,24 +130,44 @@ def _serving_workload(torch, root):
             gate, up = (w1[expert].float() @ x[row].float()).chunk(2)
             expected[row] += 0.5 * (w2[expert].float() @ (torch.nn.functional.silu(gate) * up))
     torch.testing.assert_close(out.float(), expected, atol=0.002, rtol=0.03)
+    parallel.destroy_model_parallel()
+    torch.distributed.destroy_process_group()
     return {"serving_moe": out.cpu()}
 
 
 def _fa4_workload():
     torch = importlib.import_module("torch")
     attention = importlib.import_module("flash_attn.cute")
+    cute = importlib.import_module("cutlass.cute")
+    original_compile = cute.compile
+    metrics = {"compile_calls": 0, "compile_seconds": 0.0}
+
+    def compile_observed(*args, **kwargs):
+        started = time.monotonic()
+        try:
+            return original_compile(*args, **kwargs)
+        finally:
+            metrics["compile_calls"] += 1
+            metrics["compile_seconds"] += time.monotonic() - started
+
     torch.manual_seed(17)
     q, k, v = [
         torch.randn((1, 256, 4, 128), device="cuda", dtype=torch.bfloat16, requires_grad=True) for _ in range(3)
     ]
-    out = attention.flash_attn_func(q, k, v, causal=True)
-    out.float().square().mean().backward()
+    with mock.patch.object(cute, "compile", compile_observed):
+        out = attention.flash_attn_func(q, k, v, causal=True)
+        out.float().square().mean().backward()
     expected = torch.nn.functional.scaled_dot_product_attention(
         q.detach().transpose(1, 2), k.detach().transpose(1, 2), v.detach().transpose(1, 2), is_causal=True
     ).transpose(1, 2)
     torch.testing.assert_close(out, expected, atol=0.02, rtol=0.02)
     torch.cuda.synchronize()
-    return {"output": out.detach().cpu(), "q_grad": q.grad.cpu(), "k_grad": k.grad.cpu(), "v_grad": v.grad.cpu()}
+    return {
+        "output": out.detach().cpu(),
+        "q_grad": q.grad.cpu(),
+        "k_grad": k.grad.cpu(),
+        "v_grad": v.grad.cpu(),
+    }, metrics
 
 
 def _child(root, phase):
@@ -160,6 +190,9 @@ def _child(root, phase):
     application_root = Path(importlib.util.find_spec("open_instruct").submodule_search_locations[0]).parent
     startup_cache.prepare(args, application_root=application_root)
     descriptor = dict(args.olmo_core_startup_cache, report_dir=str(reports), slot="trainer-engine-actor-0-0")
+    # Exercise the candidate lifecycle even when the base image predates the
+    # application opt-in field. No production cache or model weights are used.
+    descriptor["tilelang_runtime"] = tilelang_cache.compiler_identity()
     # Simulate a changed Python deployment without changing compiler/native code.
     if phase == "orchestration":
         descriptor["sources"]["open-instruct"]["sha256"] = cache.digest(
@@ -173,8 +206,12 @@ def _child(root, phase):
     setup_seconds = time.monotonic() - started
     print(f"PROBE_SETUP_DONE {phase} seconds={setup_seconds:.3f} restore={report['restore']}", flush=True)
     started = time.monotonic()
+    fa4_metrics = None
     try:
-        values = _fa4_workload() if phase.startswith("fa4") else _triton_workload(root, phase)
+        if phase.startswith("fa4"):
+            values, fa4_metrics = _fa4_workload()
+        else:
+            values = _triton_workload(root, phase)
     finally:
         startup_cache.archive_activity(report, Path(report["local"]))
     elapsed = time.monotonic() - started
@@ -197,6 +234,8 @@ def _child(root, phase):
         fingerprint=report["fingerprint"],
         explanation=report.get("compatibility_explanation"),
         publish=published.get("publish"),
+        tilelang=published.get("tilelang"),
+        fa4=fa4_metrics,
         events=dict(collections.Counter(e["event"] for e in events)),
         compile_seconds=sum(e.get("compiler_microseconds", 0) for e in events if e["event"] == "compile_miss") / 1e6,
         numerical_checks="passed",
@@ -227,16 +266,6 @@ def main():
     for phase in ("cold", "warm", "orchestration", "kernel-change", "shape-change", "fa4-cold", "fa4-warm"):
         command = [sys.executable, __file__, "--output", str(root), "--phase", phase]
         phase_env = dict(env)
-        # Never let an incidental ~/.tilelang cache make a cold run look warm.
-        tilelang_private = root / phase / "tilelang-private"
-        (tilelang_private / "tilelang").mkdir(parents=True)
-        phase_env["TILELANG_CACHE_DIR"] = str(tilelang_private / "tilelang")
-        phase_env["TILELANG_TMP_DIR"] = str(root / phase / "tilelang-tmp")
-        if phase in {"warm", "orchestration", "kernel-change", "shape-change"}:
-            restored = cache.restore(
-                root / "tilelang-shared", tilelang_private, cache.digest("tilelang-probe"), "tilelang"
-            )
-            assert restored["status"] == "hit", restored
         if phase.startswith("fa4"):
             private = root / phase / "private"
             (private / "fa4").mkdir(parents=True)
@@ -248,12 +277,6 @@ def main():
             process = subprocess.run(command, env=phase_env, stdout=log, stderr=subprocess.STDOUT, timeout=600)
         print((root / f"{phase}.log").read_text(), flush=True)
         process.check_returncode()
-        if phase == "cold":
-            published = cache.publish(
-                root / "tilelang-shared", tilelang_private, cache.digest("tilelang-probe"), "tilelang"
-            )
-            (root / "tilelang-publication.json").write_text(json.dumps(published, indent=2) + "\n")
-            assert published["status"] == "published", published
         if phase == "fa4-cold":
             published = cache.publish(root / "fa4-shared", private, cache.digest("fa4-probe"), "fa4")
             assert published["status"] == "published", published
@@ -263,9 +286,12 @@ def main():
     for result in results[1:3]:
         assert result["restore"]["status"] == "hit", result
         assert result["events"].get("compile_miss", 0) == 0, result
+        assert result["tilelang"]["restore"]["status"] == "hit", result
         assert "phase start: cache.compile" not in (root / f"{result['phase']}.log").read_text()
     for result in results[3:5]:
         assert result["events"].get("compile_miss", 0) > 0, result
+    assert results[-2]["fa4"]["compile_calls"] > 0, results[-2]
+    assert results[-1]["fa4"]["compile_calls"] == 0, results[-1]
     (root / "summary.json").write_text(json.dumps(results, indent=2) + "\n")
     print("CACHE_PROBE_PASSED", flush=True)
 

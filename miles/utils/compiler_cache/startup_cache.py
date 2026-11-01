@@ -191,18 +191,32 @@ def observe_triton(local):
     original_group = module.FileCacheManager.get_group
     original_put = module.FileCacheManager.put
 
-    def record(event):
+    def record(event, manager, filename, started):
         with (local / f"activity-{os.getpid()}.jsonl").open("a") as stream:
-            stream.write(json.dumps({"event": event}) + "\n")
+            stream.write(
+                json.dumps(
+                    {
+                        "event": event,
+                        "timestamp": time.time(),
+                        "monotonic": time.monotonic(),
+                        "operation_seconds": time.perf_counter() - started,
+                        "cache_key": Path(getattr(manager, "cache_dir", "")).name,
+                        "filename": str(filename) if filename is not None else None,
+                    }
+                )
+                + "\n"
+            )
 
     def get_group(self, *args, **kwargs):
+        started = time.perf_counter()
         value = original_group(self, *args, **kwargs)
-        record("group_hit" if value else "group_miss")
+        record("group_hit" if value else "group_miss", self, args[0] if args else kwargs.get("filename"), started)
         return value
 
     def put(self, *args, **kwargs):
+        started = time.perf_counter()
         value = original_put(self, *args, **kwargs)
-        record("put")
+        record("put", self, args[1] if len(args) > 1 else kwargs.get("filename"), started)
         return value
 
     manager = cast(Any, module.FileCacheManager)
@@ -256,6 +270,8 @@ def setup_worker():
         report["restore"] = {"family": "triton", "status": "unavailable", "reason": str(error)}
     report["setup_seconds"] = time.monotonic() - started
     report_path = Path(policy["report_dir"]) / f"{policy['slot']}-{uuid.uuid4().hex}.json"
+    if policy["observe"]:
+        report["activity_directory"] = str(Path(policy["report_dir"]) / "activity" / report_path.stem)
     report_path.write_bytes(cache.encoded(report))
     if policy["observe"]:
         observe_triton(local)
@@ -280,6 +296,18 @@ def setup_worker():
     )
 
 
+def archive_activity(report, local):
+    """Copy small activity logs during background publication, not each cache hit."""
+    destination = report.get("activity_directory")
+    if destination is None:
+        return None
+    target = Path(destination)
+    target.mkdir(parents=True, exist_ok=True)
+    for source in local.glob("activity-*.jsonl"):
+        shutil.copyfile(source, target / source.name)
+    return str(target)
+
+
 def publish_worker(report, *, retain_local=False):
     """Runs on the original node; deletes the private copy only after final teardown.
 
@@ -291,6 +319,8 @@ def publish_worker(report, *, retain_local=False):
         raise ValueError("Unexpected worker cache directory")
     result = dict(slot=report["slot"], restore=report["restore"], setup_seconds=report["setup_seconds"])
     try:
+        if report.get("activity_directory"):
+            result["activity_directory"] = archive_activity(report, local)
         state_path = local / "publication-state.json"
         previous = json.loads(state_path.read_text()) if state_path.exists() else {}
         if previous.get("capped"):

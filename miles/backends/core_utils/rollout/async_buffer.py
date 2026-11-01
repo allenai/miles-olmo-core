@@ -118,6 +118,10 @@ class HomogeneousPolicyDataBuffer:
     async def get(self, current_version=None, **context):
         return await self._delegate.get(current_version=current_version, **context)
 
+    async def get_ready(self, current_version=None):
+        """Use the same stale-data/disposition checks without waiting for new work."""
+        return await self._delegate.get(current_version=current_version, wait=False)
+
     def get_metrics(self, trainer_model_id=None):
         rejected, incomplete, mixed = self._rejected, self._incomplete, self._mixed
         self._rejected = self._incomplete = self._mixed = 0

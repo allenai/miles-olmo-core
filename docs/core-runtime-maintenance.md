@@ -174,3 +174,26 @@ startup but exhausted trainer GPU memory while allocating optimizer state,
 before any training step. Its driver W&B log correctly recorded exit code 1,
 and the job exited 1. An A100 gate needs a smaller trained checkpoint; reducing
 response length alone does not fix this optimizer-state capacity limit.
+
+
+### Prepared batch ownership
+
+The Core executor exposes `core_prefetch`, `core_get_prepared` and
+`core_cancel_prepared` for the one-update refresh schedule. The application starts
+one preparation task while the trainer works, targeting the published version
+plus one. Ordinary `get` remains sequential. The shared conversion function is
+used by both paths; CPU preparation does not include trainer GPU packing or
+current-policy scoring.
+
+`ManagedFullyAsyncRolloutFn.reserve` retains pristine prompts in the restart
+ledger. Each selected group keeps a completed-buffer slot until
+`release_reservation(consume=True)` commits it. Cancellation joins the actual
+producer-loop task before requeuing prompts and restoring capacity; cancelling a
+cross-thread future alone is insufficient. The executor owns any resulting
+object-store reference until consumption, and disposal cleans unused references.
+The application must cancel pending preparation before a terminal generation
+drain and must not overlap it with shared-engine evaluation's capacity changes.
+
+The expected publication version is checked again at consumption. Metrics under
+`rollout/prepared_batch` distinguish preparation from executor-side wait, but the
+application's acquisition stage remains the authority for RPC scheduling delay.

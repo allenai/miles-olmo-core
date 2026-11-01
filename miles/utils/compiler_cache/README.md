@@ -92,5 +92,8 @@ experimental; it does not enable FA4 persistence in ordinary training.
 Triton autotuning can record different timing measurements for the same key and
 candidate configurations on different workers. Publication retains the first
 valid record when only those measurements differ, and continues merging new
-kernel artifacts. Different keys/candidates or conflicting compiled binaries
-still reject publication and preserve the last published generation.
+kernel artifacts. Different tuning keys/candidates or conflicting binaries reject the entire
+incoming kernel group. The previously published group stays byte-for-byte
+unchanged; unrelated new kernel groups can still be published. Receipts list
+`rejected_incoming_groups` and startup logs warn about them. Cross-group metadata
+remains a strict rejection; other compiler families retain strict publication.

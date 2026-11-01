@@ -15,9 +15,11 @@ import os
 import subprocess
 import sys
 import time
+from logging import INFO, StreamHandler
 from pathlib import Path
 from types import SimpleNamespace
 
+from miles.utils import logger_utils
 from miles.utils.compiler_cache import compiler_cache as cache
 from miles.utils.compiler_cache import startup_cache
 
@@ -140,6 +142,9 @@ def _fa4_workload():
 
 def _child(root, phase):
     print(f"PROBE_PHASE_START {phase}", flush=True)
+    diagnostics = logger_utils.setup_logger("tilelang.jit.diagnostics")
+    diagnostics.setLevel(INFO)
+    diagnostics.addHandler(StreamHandler(sys.stdout))
     started = time.monotonic()
     reports = root / phase / "reports"
     reports.mkdir(parents=True)
@@ -215,11 +220,23 @@ def main():
         PYTHONDONTWRITEBYTECODE="1",
         FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED="1",
         FLASH_ATTENTION_CUTE_DSL_CACHE_DIR=str(root / "fa4-cache"),
+        TILELANG_JIT_DIAGNOSTICS="1",
+        TILELANG_KERNEL_CACHE_USE_LIB_STAMP="1",
     )
     results = []
     for phase in ("cold", "warm", "orchestration", "kernel-change", "shape-change", "fa4-cold", "fa4-warm"):
         command = [sys.executable, __file__, "--output", str(root), "--phase", phase]
         phase_env = dict(env)
+        # Never let an incidental ~/.tilelang cache make a cold run look warm.
+        tilelang_private = root / phase / "tilelang-private"
+        (tilelang_private / "tilelang").mkdir(parents=True)
+        phase_env["TILELANG_CACHE_DIR"] = str(tilelang_private / "tilelang")
+        phase_env["TILELANG_TMP_DIR"] = str(root / phase / "tilelang-tmp")
+        if phase in {"warm", "orchestration", "kernel-change", "shape-change"}:
+            restored = cache.restore(
+                root / "tilelang-shared", tilelang_private, cache.digest("tilelang-probe"), "tilelang"
+            )
+            assert restored["status"] == "hit", restored
         if phase.startswith("fa4"):
             private = root / phase / "private"
             (private / "fa4").mkdir(parents=True)
@@ -227,7 +244,16 @@ def main():
             if phase == "fa4-warm":
                 restored = cache.restore(root / "fa4-shared", private, cache.digest("fa4-probe"), "fa4")
                 assert restored["status"] == "hit", restored
-        subprocess.run(command, env=phase_env, check=True, timeout=600)
+        with (root / f"{phase}.log").open("w") as log:
+            process = subprocess.run(command, env=phase_env, stdout=log, stderr=subprocess.STDOUT, timeout=600)
+        print((root / f"{phase}.log").read_text(), flush=True)
+        process.check_returncode()
+        if phase == "cold":
+            published = cache.publish(
+                root / "tilelang-shared", tilelang_private, cache.digest("tilelang-probe"), "tilelang"
+            )
+            (root / "tilelang-publication.json").write_text(json.dumps(published, indent=2) + "\n")
+            assert published["status"] == "published", published
         if phase == "fa4-cold":
             published = cache.publish(root / "fa4-shared", private, cache.digest("fa4-probe"), "fa4")
             assert published["status"] == "published", published
@@ -237,6 +263,7 @@ def main():
     for result in results[1:3]:
         assert result["restore"]["status"] == "hit", result
         assert result["events"].get("compile_miss", 0) == 0, result
+        assert "phase start: cache.compile" not in (root / f"{result['phase']}.log").read_text()
     for result in results[3:5]:
         assert result["events"].get("compile_miss", 0) > 0, result
     (root / "summary.json").write_text(json.dumps(results, indent=2) + "\n")

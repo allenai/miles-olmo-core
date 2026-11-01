@@ -376,7 +376,15 @@ def publish_worker(report, *, retain_local=False):
             "triton",
             progress=progress,
             max_storage_bytes=report.get("max_storage_bytes", cache.DEFAULT_MAX_STORAGE_BYTES),
+            isolate_triton_conflicts=report.get("identity", {}).get("compatibility_scope")
+            == triton_compatibility.SCOPE,
         )
+        if result["publish"].get("rejected_incoming_groups"):
+            logger.warning(
+                "Core compiler cache kept published bytes and rejected incoming groups: slot=%s groups=%s",
+                report["slot"],
+                result["publish"]["rejected_incoming_groups"],
+            )
         status = result["publish"]["status"]
         if status in {"published", "unchanged", "empty", "storage_limit"}:
             state_path.write_bytes(

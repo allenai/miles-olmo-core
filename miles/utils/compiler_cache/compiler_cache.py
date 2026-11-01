@@ -501,12 +501,48 @@ def _same_autotune_candidates(existing, incoming):
         return False
 
 
-def publish(shared, local, key, family, *, progress=None, max_storage_bytes=DEFAULT_MAX_STORAGE_BYTES):
+def _conflicting_triton_groups(existing, incoming, stage, incoming_root):
+    """Reject whole incoming kernel groups; never mix their files with old bytes."""
+    conflicts = set()
+    for name in existing.keys() & incoming.keys():
+        if existing[name] == incoming[name]:
+            continue
+        if (
+            name.endswith(".autotune.json")
+            and existing[name]["executable"] == incoming[name]["executable"]
+            and _same_autotune_candidates(stage / name, incoming_root / name)
+        ):
+            continue
+        conflicts.add(PurePosixPath(name).parts[0])
+    # Per-group rejection is safe only for self-contained groups. Preserve the
+    # strict failure for unknown metadata that references another kernel group.
+    if conflicts:
+        for root in (stage, incoming_root):
+            for path in root.rglob("__grp__*"):
+                group = path.relative_to(root).parts[0]
+                children = json.loads(path.read_text())["child_paths"].values()
+                if any(PurePosixPath(child).parts[0] != group for child in children):
+                    raise ValueError("Cannot isolate conflicting cross-group Triton metadata")
+    return conflicts
+
+
+def publish(
+    shared,
+    local,
+    key,
+    family,
+    *,
+    progress=None,
+    max_storage_bytes=DEFAULT_MAX_STORAGE_BYTES,
+    isolate_triton_conflicts=False,
+):
     """Publish a verified snapshot, bounded across all families of this key.
 
     Live Triton writers are allowed: snapshot validation rejects concurrent changes.
     Other families require their own writer synchronization before publication.
     """
+    if isolate_triton_conflicts and family != "triton":
+        raise ValueError("Conflict isolation is qualified only for Triton")
     if type(max_storage_bytes) is not int or max_storage_bytes < 0:
         raise ValueError("max_storage_bytes must be a nonnegative integer")
     started = time.monotonic()
@@ -556,7 +592,14 @@ def publish(shared, local, key, family, *, progress=None, max_storage_bytes=DEFA
                 incoming_root = Path(incoming_directory)
                 snapshot(local / family, incoming_root, family)
                 incoming = inventory(incoming_root)
+                conflicts = (
+                    _conflicting_triton_groups(existing, incoming, stage, incoming_root)
+                    if isolate_triton_conflicts
+                    else set()
+                )
                 for name, record in incoming.items():
+                    if PurePosixPath(name).parts[0] in conflicts:
+                        continue
                     if name in existing and existing[name] != record:
                         if (
                             family == "triton"
@@ -635,6 +678,7 @@ def publish(shared, local, key, family, *, progress=None, max_storage_bytes=DEFA
                 "max_storage_bytes": max_storage_bytes,
                 "recency_recorded": recency_recorded,
                 "reused_autotune_records": reused_autotune_records,
+                "rejected_incoming_groups": sorted(conflicts),
                 "phase_seconds": phases,
                 "seconds": time.monotonic() - started,
             }

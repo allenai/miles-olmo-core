@@ -71,6 +71,16 @@ def test_native_digest_ignores_python_but_tracks_extension(tmp_path):
     assert compatibility.native_source(tmp_path) != before
 
 
+def test_compiler_digest_tracks_extensionless_tools_and_ignores_bytecode(tmp_path):
+    (tmp_path / "ptxas").write_bytes(b"compiler")
+    before = compatibility.compiler_source(tmp_path)
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__/compiler.pyc").write_bytes(b"machine-local-bytecode")
+    assert compatibility.compiler_source(tmp_path) == before
+    (tmp_path / "ptxas").write_bytes(b"changed-compiler")
+    assert compatibility.compiler_source(tmp_path) != before
+
+
 def test_diagnostic_explains_changes_without_selecting_cache(tmp_path):
     descriptor = policy(tmp_path)
     fingerprint, identity, provenance = compatibility.fingerprint(descriptor, {}, {})

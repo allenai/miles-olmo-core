@@ -22,6 +22,22 @@ NON_KERNEL_CORE = {
 }
 
 
+def compiler_source(root):
+    """Include extensionless compiler tools and bundled code-generation assets."""
+    files = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if any(part in {".git", "__pycache__", ".venv"} for part in relative.parts):
+            continue
+        if path.is_symlink():
+            raise ValueError(f"Compiler symlink requires a resolved source root: {path}")
+        if path.is_file() and path.suffix not in {".pyc", ".pyo"}:
+            files[relative.as_posix()] = cache.sha256(path)
+    if not files:
+        raise ValueError(f"No compiler files under {root}")
+    return {"sha256": cache.digest(files), "files": len(files)}
+
+
 def native_source(root):
     """Native extensions are not covered by Triton's Python dependency hash."""
     files = {}

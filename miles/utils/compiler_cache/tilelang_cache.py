@@ -7,6 +7,7 @@ from pathlib import Path
 
 from miles.utils import logger_utils
 from miles.utils.compiler_cache import compiler_cache as cache
+from miles.utils.compiler_cache import triton_compatibility
 
 logger = logger_utils.setup_logger(__name__)
 
@@ -17,7 +18,7 @@ def compiler_identity():
     spec = util.find_spec("tilelang")
     if spec is None or not spec.submodule_search_locations:
         raise ValueError("Cannot fingerprint the installed TileLang compiler")
-    return cache.source_identity(Path(next(iter(spec.submodule_search_locations))))
+    return triton_compatibility.compiler_source(Path(next(iter(spec.submodule_search_locations))))
 
 
 def configure(policy, local):

@@ -39,3 +39,11 @@ def test_diagnostic_write_failure_does_not_break_compilation(tmp_path, monkeypat
         cache_hit=False,
         times=SimpleNamespace(ir_initialization=1, lowering_stages=[], store_results=1),
     )
+
+
+def test_numeric_specializations_identify_shape_changes_without_logging_objects():
+    src = SimpleNamespace(
+        fn=SimpleNamespace(arg_names=["X", "N", "BLOCK", "label"]),
+        constants={(1,): 32, (2,): SimpleNamespace(value=256), (3,): "private-string", "flag": True},
+    )
+    assert compilation_observer.numeric_specialization(src) == {"N": 32, "BLOCK": 256, "flag": True}

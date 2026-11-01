@@ -54,7 +54,8 @@ signature, specialization, backend and compiler-option keys when choosing each
 artifact. Changing a kernel still compiles a new specialization.
 
 The outer compatibility key retains the binary base, actual device/toolchain,
-the installed Triton source/binaries, native source and extensions in the
+the complete installed Triton compiler package (including extensionless tools such
+as `ptxas`), native source and extensions in the
 application, MILES, OLMo-core, olmo-sglang and SGLang, model configuration,
 parallel geometry, compiler environment and unknown settings. Known non-kernel
 settings such as lag, batch size, prepared-batch overlap, layer timing and
@@ -76,7 +77,8 @@ which observation is compared. Corrupt diagnostics cannot prevent ordinary
 restoration. Native cache decisions still come from the exact key and checksums.
 
 The optional Triton compilation listener adds `compile_hit` / `compile_miss`
-events with kernel names, compiler microseconds and lowering-stage timings to
+events with kernel names, source/specialization digests, numeric shape/flag
+constants, compiler microseconds and lowering-stage timings to
 `activity-PID.jsonl`. These differ from `group_hit` / `group_miss`, which count
 file-cache operations. Existing compilation listeners are preserved. CUDA graph
 capture, module loading and non-Triton compilers are outside these timings.
@@ -97,6 +99,14 @@ incoming kernel group. The previously published group stays byte-for-byte
 unchanged; unrelated new kernel groups can still be published. Receipts list
 `rejected_incoming_groups` and startup logs warn about them. Cross-group metadata
 remains a strict rejection; other compiler families retain strict publication.
+
+For the v3 Triton lifecycle, publication snapshots completed kernel groups
+independently. A group must have its committed child-path manifest (or be a
+qualified standalone runtime library/autotuning record), and its source and copy
+must remain identical during copying. Incomplete, transient or changing groups
+are skipped and reported as `skipped_live_groups`; they can be retried on the
+next interval. Stable groups can therefore be saved while another kernel is
+compiling. Archive checksums and restore validation are unchanged.
 
 ## Opt-in TileLang lifecycle
 

@@ -72,7 +72,7 @@ def prepare(args, *, application_root):
     if triton_spec is None or not triton_spec.submodule_search_locations:
         raise ValueError("Cannot fingerprint the installed Triton compiler")
     kernel_runtime = {
-        "triton": cache.source_identity(Path(next(iter(triton_spec.submodule_search_locations)))),
+        "triton": triton_compatibility.compiler_source(Path(next(iter(triton_spec.submodule_search_locations)))),
         "native_sources": native_sources,
     }
     core = dataclasses.asdict(args.olmo_core)
@@ -384,6 +384,7 @@ def publish_worker(report, *, retain_local=False):
             max_storage_bytes=report.get("max_storage_bytes", cache.DEFAULT_MAX_STORAGE_BYTES),
             isolate_triton_conflicts=report.get("identity", {}).get("compatibility_scope")
             == triton_compatibility.SCOPE,
+            partial_triton=report.get("identity", {}).get("compatibility_scope") == triton_compatibility.SCOPE,
         )
         if result["publish"].get("rejected_incoming_groups"):
             logger.warning(

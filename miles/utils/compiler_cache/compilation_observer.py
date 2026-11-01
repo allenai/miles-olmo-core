@@ -2,6 +2,7 @@
 
 import importlib
 import json
+import math
 import os
 import time
 
@@ -9,6 +10,24 @@ from miles.utils import logger_utils
 from miles.utils.compiler_cache import compiler_cache as cache
 
 logger = logger_utils.setup_logger(__name__)
+
+
+def numeric_specialization(src):
+    """Expose shape/flag constants, never arbitrary string or object contents."""
+    names = getattr(getattr(src, "fn", None), "arg_names", ())
+    result = {}
+    for key, constant in getattr(src, "constants", {}).items():
+        value = getattr(constant, "value", constant)
+        if value is not None and type(value) not in (int, float, bool):
+            continue
+        if type(value) is float and not math.isfinite(value):
+            continue
+        name = str(key)
+        path = key if isinstance(key, tuple) else (key,)
+        if path and isinstance(path[0], int) and 0 <= path[0] < len(names):
+            name = names[path[0]] + "".join(f"[{part}]" for part in path[1:])
+        result[name] = value
+    return result
 
 
 def install(local):
@@ -29,6 +48,7 @@ def install(local):
                 "source_digest": cache.digest(getattr(getattr(src, "fn", None), "cache_key", None)),
                 "signature": {str(key): str(value) for key, value in getattr(src, "signature", {}).items()},
                 "specialization_digest": cache.digest(str(getattr(src, "constants", {}))),
+                "numeric_specialization": numeric_specialization(src),
                 "compiler_microseconds": times.ir_initialization + sum(stages.values()) + times.store_results,
                 "lowering_microseconds": stages,
             }

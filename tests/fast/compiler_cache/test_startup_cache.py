@@ -22,6 +22,7 @@ def policy(root, *, restore=True):
         image="sha256:" + "a" * 64,
         runtime_lock={},
         sources={k: {"sha256": "same"} for k in ("olmo-core", "miles", "open-instruct", "olmo-sglang")},
+        kernel_runtime={"triton": {"sha256": "compiler"}, "native_sources": {}},
         model_config={},
         run_config={"core": {}, "miles": {}},
         restore=restore,

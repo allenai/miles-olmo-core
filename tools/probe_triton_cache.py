@@ -1,6 +1,7 @@
 """Bounded fresh-process cache qualification on one GPU; no model downloads.
 
-Run: python tools/probe_triton_cache.py --output /output/cache-probe
+Run inside the pinned Open Instruct image with its source root on PYTHONPATH:
+python tools/probe_triton_cache.py --output /output/cache-probe
 Exercises a changed kernel, KDA forward/backward, and FA4 forward/backward.
 Reports compilation separately from process startup and checks numerical reuse.
 """
@@ -51,7 +52,8 @@ def _triton_workload(root, phase):
     module.transform[((n + 255) // 256,)](x, y, n, 256)
     torch.testing.assert_close(y, x * factor, rtol=0, atol=0)
     torch.manual_seed(17)
-    saved = {}
+    print(f"PROBE_SERVING_START {phase}", flush=True)
+    saved = _serving_workload(torch, root)
     # Different packed sequence counts exercise variable-length trainer kernels.
     for count in (1, 4):
         print(f"PROBE_KDA_START {phase} sequences={count}", flush=True)
@@ -67,13 +69,39 @@ def _triton_workload(root, phase):
         for name, tensor in [("output", out), ("q_grad", q.grad), ("k_grad", k.grad), ("v_grad", v.grad)]:
             assert torch.isfinite(tensor).all(), name
             saved[f"{count}/{name}"] = tensor.detach().cpu()
-    print(f"PROBE_SERVING_START {phase}", flush=True)
-    saved.update(_serving_workload(torch))
     torch.cuda.synchronize()
     return saved
 
 
-def _serving_workload(torch):
+def _model_config(root):
+    config_root = root / "serving-config"
+    config_root.mkdir(exist_ok=True)
+    (config_root / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3ForCausalLM"],
+                "model_type": "qwen3",
+                "hidden_size": 128,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "head_dim": 64,
+                "intermediate_size": 256,
+                "vocab_size": 256,
+                "max_position_embeddings": 1024,
+            }
+        )
+    )
+    return config_root
+
+
+def _serving_workload(torch, root):
+    runtime_context = importlib.import_module("sglang.srt.runtime_context")
+    server_args = importlib.import_module("sglang.srt.server_args")
+    config_root = _model_config(root)
+    runtime_context.publish(
+        server_args.ServerArgs(model_path=str(config_root), disable_cuda_graph=True), role="scheduler"
+    )
     moe = importlib.import_module("sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe")
     torch.manual_seed(23)
     x = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
@@ -115,21 +143,24 @@ def _child(root, phase):
     started = time.monotonic()
     reports = root / phase / "reports"
     reports.mkdir(parents=True)
-    compiler_root = Path(importlib.util.find_spec("triton").submodule_search_locations[0])
-    descriptor = dict(
-        shared=str(root / "shared"),
-        report_dir=str(reports),
-        slot="trainer-engine-actor-0-0",
-        image="sha256:" + "a" * 64,
-        runtime_lock={"probe": phase},
-        sources={name: {"sha256": phase} for name in ("miles", "open-instruct", "olmo-core", "olmo-sglang")},
-        kernel_runtime={"triton": cache.source_identity(compiler_root), "native_sources": {}},
-        model_config={"probe": "kda-4x128"},
-        run_config={"core": {"prepared_batch_overlap": phase == "orchestration"}, "miles": {}},
-        restore=True,
-        observe=True,
-        max_storage_bytes=2 * 1024**3,
+    configuration = importlib.import_module("open_instruct.miles.configuration.config")
+    args = SimpleNamespace(
+        olmo_core=configuration.CoreConfig(
+            compiler_cache_root=str(root / "shared"),
+            compiler_cache_diagnostics=True,
+            compiler_cache_max_storage_bytes=2 * 1024**3,
+        ),
+        hf_checkpoint=str(_model_config(root)),
     )
+    application_root = Path(importlib.util.find_spec("open_instruct").submodule_search_locations[0]).parent
+    startup_cache.prepare(args, application_root=application_root)
+    descriptor = dict(args.olmo_core_startup_cache, report_dir=str(reports), slot="trainer-engine-actor-0-0")
+    # Simulate a changed Python deployment without changing compiler/native code.
+    if phase == "orchestration":
+        descriptor["sources"]["open-instruct"]["sha256"] = cache.digest(
+            {"original": descriptor["sources"]["open-instruct"], "edit": "queue-only"}
+        )
+    descriptor["run_config"]["core"]["prepared_batch_overlap"] = phase == "orchestration"
     os.environ[startup_cache.ENV] = json.dumps(descriptor)
     startup_cache.setup_worker()
     report = json.loads(next(reports.glob("*.json")).read_text())
@@ -137,7 +168,10 @@ def _child(root, phase):
     setup_seconds = time.monotonic() - started
     print(f"PROBE_SETUP_DONE {phase} seconds={setup_seconds:.3f} restore={report['restore']}", flush=True)
     started = time.monotonic()
-    values = _fa4_workload() if phase.startswith("fa4") else _triton_workload(root, phase)
+    try:
+        values = _fa4_workload() if phase.startswith("fa4") else _triton_workload(root, phase)
+    finally:
+        startup_cache.archive_activity(report, Path(report["local"]))
     elapsed = time.monotonic() - started
     torch = importlib.import_module("torch")
     baseline = root / ("fa4-cold" if phase.startswith("fa4") else "cold") / "outputs.pt"

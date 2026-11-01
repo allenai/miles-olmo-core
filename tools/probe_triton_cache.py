@@ -157,7 +157,7 @@ def _fa4_workload():
         torch.randn((1, 256, 4, 128), device="cuda", dtype=torch.bfloat16, requires_grad=True) for _ in range(3)
     ]
     with mock.patch.object(cute, "compile", compile_observed):
-        out = attention.flash_attn_func(q, k, v, causal=True)
+        out, _ = attention.flash_attn_func(q, k, v, causal=True)
         out.float().square().mean().backward()
     expected = torch.nn.functional.scaled_dot_product_attention(
         q.detach().transpose(1, 2), k.detach().transpose(1, 2), v.detach().transpose(1, 2), is_causal=True

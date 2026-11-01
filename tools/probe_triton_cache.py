@@ -246,6 +246,30 @@ def _child(root, phase):
     print(json.dumps(summary), flush=True)
 
 
+def run_phase(command, environment, log_path):
+    """Stream bounded child progress while retaining a per-phase evidence file."""
+    started = time.monotonic()
+    with log_path.open("w") as log, log_path.open() as reader:
+        process = subprocess.Popen(command, env=environment, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            while process.poll() is None:
+                remaining = 600 - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, 600)
+                try:
+                    process.wait(timeout=min(30, remaining))
+                except subprocess.TimeoutExpired:
+                    pass
+                print(reader.read(), end="", flush=True)
+            print(reader.read(), end="", flush=True)
+            if process.returncode:
+                raise subprocess.CalledProcessError(process.returncode, command)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -275,10 +299,7 @@ def main():
             if phase == "fa4-warm":
                 restored = cache.restore(root / "fa4-shared", private, cache.digest("fa4-probe"), "fa4")
                 assert restored["status"] == "hit", restored
-        with (root / f"{phase}.log").open("w") as log:
-            process = subprocess.run(command, env=phase_env, stdout=log, stderr=subprocess.STDOUT, timeout=600)
-        print((root / f"{phase}.log").read_text(), flush=True)
-        process.check_returncode()
+        run_phase(command, phase_env, root / f"{phase}.log")
         if phase == "fa4-cold":
             published = cache.publish(root / "fa4-shared", private, cache.digest("fa4-probe"), "fa4")
             assert published["status"] == "published", published

@@ -114,7 +114,8 @@ Open Instruct's `core.compiler_cache_tilelang` enables a separate
 `core-tilelang-v1` compatibility envelope. It fingerprints installed TileLang
 Python/native/compiler sources, including its bundled TVM, in addition to the
 base runtime, device/toolchain and compile settings. Native-library stamping is
-forced on. This is opt-in pending GPU output/gradient qualification.
+forced on. This remains opt-in; qualify output/gradient equivalence on the intended
+model, hardware and topology before depending on it for production restarts.
 
 The mutable cache and compiler scratch are separate private directories. Active
 `.staging` exports and changing snapshots are rejected; publication retries on

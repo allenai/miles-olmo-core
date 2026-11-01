@@ -42,6 +42,8 @@ def transform(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
 def _triton_workload(root, phase):
     # Backend imports are deliberately after setup_worker installs the caches.
     torch = importlib.import_module("torch")
+    # Use the same pinned FLA compatibility initialization as build_train_module.
+    importlib.import_module("miles.backends.core_utils.fla_compat").install_kda_triton_compat()
     kda = importlib.import_module("fla.ops.kda")
     path = root / "probe_kernel.py"
     factor = 3 if phase == "kernel-change" else 2

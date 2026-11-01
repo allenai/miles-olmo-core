@@ -121,3 +121,20 @@ The mutable cache and compiler scratch are separate private directories. Active
 a later interval. Independent TileLang receipts and storage caps prevent its
 state from being mistaken for Triton hits. Diagnostics use TileLang's supported
 `TILELANG_JIT_DIAGNOSTICS` phase logging.
+
+## FLA convolution specialization
+
+The pinned FLA 0.5.2 convolution kernels declared the autotuning bucket
+`NB = ceil(batch * tokens / 1024)` as a compile-time constant although neither
+kernel uses it in arithmetic. Core's KDA setup now installs a guarded adapter
+that makes NB a non-specialized runtime argument. The autotuner retains its
+original NB keys and all candidate configurations; different workload buckets
+can still choose different launch parameters while sharing compiled candidates.
+The adapter rejects unexpected versions, declarations, body references to NB,
+or an already-used tuner. Native Triton keys distinguish the adapted signature.
+
+`python tools/probe_fla_conv_cache.py --output /output/conv-probe` compares the
+original and adapted kernels at identical launch parameters, including packed
+and unpacked sequences, 32K lengths, large channel widths, bias/residual/state
+paths, and forward/backward checksums. A fresh restored phase must compile
+nothing. The tiny Core optimizer probe separately exercises production tuning.

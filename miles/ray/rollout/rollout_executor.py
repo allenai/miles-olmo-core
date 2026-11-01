@@ -143,22 +143,26 @@ class RolloutExecutor:
         )
 
     async def dispose(self) -> None:
-        if getattr(self, "_diagnostic_writer", None) is not None:
-            await self._diagnostic_writer.close()
-        await asyncio.to_thread(
-            get_backend_hooks(getattr(self.args, "train_backend", None)).shutdown_rollout,
-            getattr(self, "generate_rollout", None),
-        )
-        if not self.use_legacy_rollout_v1 and self.generate_rollout is not None:
-            await maybe_await(self.generate_rollout.dispose())
-        if (close := getattr(self.data_source, "close", None)) is not None:
-            close()
-        event_analyzer.run_analysis_from_args(self.args)
-        if self._metric_checker is not None:
-            self._metric_checker.dispose()
-        if isinstance(self.eval_generate_rollout, CheckpointEvalFn):
-            await maybe_await(self.eval_generate_rollout.dispose())
-        finish_tracking()
+        try:
+            if getattr(self, "_diagnostic_writer", None) is not None:
+                await self._diagnostic_writer.close()
+        finally:
+            # A failed diagnostic flush must not leave generation requests or
+            # data/tracking resources alive. Propagate its error after cleanup.
+            await asyncio.to_thread(
+                get_backend_hooks(getattr(self.args, "train_backend", None)).shutdown_rollout,
+                getattr(self, "generate_rollout", None),
+            )
+            if not self.use_legacy_rollout_v1 and self.generate_rollout is not None:
+                await maybe_await(self.generate_rollout.dispose())
+            if (close := getattr(self.data_source, "close", None)) is not None:
+                close()
+            event_analyzer.run_analysis_from_args(self.args)
+            if self._metric_checker is not None:
+                self._metric_checker.dispose()
+            if isinstance(self.eval_generate_rollout, CheckpointEvalFn):
+                await maybe_await(self.eval_generate_rollout.dispose())
+            finish_tracking()
 
     # -------------------------- data generation -----------------------------
 

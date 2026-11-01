@@ -47,9 +47,11 @@ def fingerprint(policy, hardware, compiler_env):
         compiler_env=compiler_env,
         scope=cache.CORE_TRITON_SCOPE,
     )
-    provenance = {key: identity.pop(key) for key in ("runtime_lock", "sources")}
+    provenance = json.loads(cache.encoded({key: policy[key] for key in ("runtime_lock", "sources")}))
+    for key in provenance:
+        identity.pop(key)
     # Required, not optional: old reports lack this evidence and must not seed v3.
-    identity["kernel_runtime"] = policy["kernel_runtime"]
+    identity["kernel_runtime"] = json.loads(cache.encoded(policy["kernel_runtime"]))
     identity["compatibility_scope"] = SCOPE
     identity["cache_families"] = {"triton": cache.FAMILIES["triton"]}
     for key in NON_KERNEL_CORE:

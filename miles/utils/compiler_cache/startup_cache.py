@@ -56,7 +56,12 @@ def prepare(args, *, application_root):
     lock = json.loads(lock_path.read_text())
     sources = {"open-instruct": cache.core_application_source(root / "open_instruct")}
     native_sources = {"open-instruct": triton_compatibility.native_source(root / "open_instruct")}
-    for name, package in [("olmo-core", "olmo_core"), ("miles", "miles"), ("olmo-sglang", "olmo_sglang")]:
+    for name, package in [
+        ("olmo-core", "olmo_core"),
+        ("miles", "miles"),
+        ("olmo-sglang", "olmo_sglang"),
+        ("sglang", "sglang"),
+    ]:
         spec = util.find_spec(package)
         if spec is None or not spec.submodule_search_locations:
             raise ValueError(f"Cannot fingerprint installed source: {package}")
@@ -350,11 +355,16 @@ def publish_worker(report, *, retain_local=False):
         # Publication validates/hashes the snapshot; counting here need not hash it again.
         result["files_after"] = sum(path.is_file() for path in (local / "triton").rglob("*"))
         activity = {}
+        compiler_seconds = {}
         for path in local.glob("activity-*.jsonl"):
             for line in path.read_text().splitlines():
-                event = json.loads(line)["event"]
+                record = json.loads(line)
+                event = record["event"]
                 activity[event] = activity.get(event, 0) + 1
+                if event in {"compile_hit", "compile_miss"}:
+                    compiler_seconds[event] = compiler_seconds.get(event, 0.0) + record["compiler_microseconds"] / 1e6
         result["activity"] = activity
+        result["compiler_seconds"] = compiler_seconds
 
         def progress(event):
             logger.info("Core compiler cache publication: slot=%s %s", report["slot"], json.dumps(event))

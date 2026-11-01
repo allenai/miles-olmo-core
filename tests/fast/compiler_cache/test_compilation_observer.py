@@ -26,3 +26,16 @@ def test_listener_preserves_callback_and_reports_compiler_work(tmp_path, monkeyp
     assert [r["event"] for r in records] == ["compile_miss", "compile_hit"]
     assert all(r["compiler_microseconds"] == 41 for r in records)
     assert len(calls) == 2
+
+
+def test_diagnostic_write_failure_does_not_break_compilation(tmp_path, monkeypatch):
+    knobs = SimpleNamespace(compilation=SimpleNamespace(listener=None))
+    monkeypatch.setattr(compilation_observer.importlib, "import_module", lambda name: knobs)
+    compilation_observer.install(tmp_path / "nonexistent")
+    knobs.compilation.listener(
+        src=SimpleNamespace(name="kernel"),
+        metadata={},
+        metadata_group={},
+        cache_hit=False,
+        times=SimpleNamespace(ir_initialization=1, lowering_stages=[], store_results=1),
+    )

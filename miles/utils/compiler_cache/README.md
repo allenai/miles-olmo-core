@@ -47,28 +47,50 @@ to match.
 
 ## Core Triton compatibility
 
-Ordinary startup uses the versioned `core-triton-v2` identity. It excludes only
-audited non-kernel differences; unknown settings continue to invalidate:
+Ordinary startup uses `core-triton-v3`. Compiler artifacts and experiment
+provenance have different identities. The full application/runtime source hashes
+and lock remain in each worker receipt as `provenance`; Python-only revisions do
+not invalidate every compiled kernel. Triton checks its own source/dependency,
+signature, specialization, backend and compiler-option keys when choosing each
+artifact. Changing a kernel still compiles a new specialization.
 
-| Input | Core Triton behavior |
-| --- | --- |
-| Admission budget, HTTP concurrency, global/rollout batch size, samples per prompt, rollout fleet size, policy lag and run deadline | Do not invalidate existing artifacts. Triton's own keys still distinguish any newly encountered kernel specialization. |
-| Known single-GPU serving workers | Share a role key across engine slots. Repeated identical visible GPU descriptions collapse to one; mixed hardware remains distinct. Mutable caches stay private to each worker. |
-| Trainer ranks, expert/tensor parallelism, microbatch size, packing, precision, kernel backends, compiler controls and unknown settings | Remain part of compatibility. Trainer ranks remain separate. |
-| Open Instruct source | Omit tests and the standalone `miles/evaluation` and `miles/distillation` trees. Other source changes, including new modules, still invalidate. |
-| Runtime lock | Omit the unused Megatron source entries and patches wholly between those sources. Core/MILES/SGLang pins, unknown sources and patches targeting Core remain significant. |
-| Base image, model configuration, GPU architecture/properties, driver and toolchain | Remain significant. |
+The outer compatibility key retains the binary base, actual device/toolchain,
+the installed Triton source/binaries, native source and extensions in the
+application, MILES, OLMo-core, olmo-sglang and SGLang, model configuration,
+parallel geometry, compiler environment and unknown settings. Known non-kernel
+settings such as lag, batch size, prepared-batch overlap, layer timing and
+truncated-response reward gating are excluded. Trainer ranks remain separate;
+known equivalent TP1 serving slots continue sharing their role key. Private
+mutable directories, archive/file verification and collision rejection remain.
 
-The separate experimental multi-family wrapper retains its strict identity and
-full source fingerprint. Versioning deliberately prevents automatic adoption of
-old worker-specific cache keys: the first run of this revision may be cold. A
-new runtime image and Open Instruct runtime-pin update are required to deploy it.
-CPU tests establish identity and publication behavior; GPU reuse still requires
-qualification before treating the draft as a measured startup improvement.
+This scope applies **only to Triton**. It must not be used to restore Inductor,
+FA4/CuTe or other compiler families. Legacy v2 archives lack the compiler/native
+identity evidence, so v3 does not automatically import them. The first v3 run
+may be cold; subsequent Python orchestration changes should reuse its artifacts.
+
+With diagnostics enabled, `compatibility_explanation` compares the current
+identity with the last observed startup for the same model and worker slot.
+It reports changed field names, previous fingerprint and whether provenance
+changed. This bounded diagnostic pointer never selects an archive and is not
+proof that the previous run published successfully. Concurrent starts can change
+which observation is compared. Corrupt diagnostics cannot prevent ordinary
+restoration. Native cache decisions still come from the exact key and checksums.
+
+The optional Triton compilation listener adds `compile_hit` / `compile_miss`
+events with kernel names, compiler microseconds and lowering-stage timings to
+`activity-PID.jsonl`. These differ from `group_hit` / `group_miss`, which count
+file-cache operations. Existing compilation listeners are preserved. CUDA graph
+capture, module loading and non-Triton compilers are outside these timings.
+
+`python tools/probe_triton_cache.py --output /output/cache-probe` is a bounded,
+single-GPU fresh-process qualification: cold, warm, changed Python provenance,
+changed kernel dependency, changed shape, and FA4 cold/warm. It exercises KDA
+forward/backward and SGLang expert inference, checks numerical outputs, and
+requires no Triton compilation in the unchanged warm phases. The FA4 probe is
+experimental; it does not enable FA4 persistence in ordinary training.
 
 Triton autotuning can record different timing measurements for the same key and
 candidate configurations on different workers. Publication retains the first
 valid record when only those measurements differ, and continues merging new
-kernel artifacts. The receipt counts `reused_autotune_records`. Different tuning
-keys, candidates, unknown record formats and conflicting compiled binaries still
-reject publication and preserve the last published generation.
+kernel artifacts. Different keys/candidates or conflicting compiled binaries
+still reject publication and preserve the last published generation.

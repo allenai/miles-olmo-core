@@ -54,6 +54,7 @@ def _triton_workload(root, phase):
     saved = {}
     # Different packed sequence counts exercise variable-length trainer kernels.
     for count in (1, 4):
+        print(f"PROBE_KDA_START {phase} sequences={count}", flush=True)
         shape = (1, 512, 4, 128)
         q, k, v = [torch.randn(shape, device="cuda", dtype=torch.bfloat16, requires_grad=True) for _ in range(3)]
         g = torch.full(shape, -0.1, device="cuda", dtype=torch.float32, requires_grad=True)
@@ -66,6 +67,7 @@ def _triton_workload(root, phase):
         for name, tensor in [("output", out), ("q_grad", q.grad), ("k_grad", k.grad), ("v_grad", v.grad)]:
             assert torch.isfinite(tensor).all(), name
             saved[f"{count}/{name}"] = tensor.detach().cpu()
+    print(f"PROBE_SERVING_START {phase}", flush=True)
     saved.update(_serving_workload(torch))
     torch.cuda.synchronize()
     return saved
@@ -109,6 +111,7 @@ def _fa4_workload():
 
 
 def _child(root, phase):
+    print(f"PROBE_PHASE_START {phase}", flush=True)
     started = time.monotonic()
     reports = root / phase / "reports"
     reports.mkdir(parents=True)
@@ -132,6 +135,7 @@ def _child(root, phase):
     report = json.loads(next(reports.glob("*.json")).read_text())
     assert report["restore"]["status"] in {"miss", "hit"}, report
     setup_seconds = time.monotonic() - started
+    print(f"PROBE_SETUP_DONE {phase} seconds={setup_seconds:.3f} restore={report['restore']}", flush=True)
     started = time.monotonic()
     values = _fa4_workload() if phase.startswith("fa4") else _triton_workload(root, phase)
     elapsed = time.monotonic() - started
@@ -181,8 +185,21 @@ def main():
     results = []
     for phase in ("cold", "warm", "orchestration", "kernel-change", "shape-change", "fa4-cold", "fa4-warm"):
         command = [sys.executable, __file__, "--output", str(root), "--phase", phase]
-        subprocess.run(command, env=env, check=True, timeout=600)
+        phase_env = dict(env)
+        if phase.startswith("fa4"):
+            private = root / phase / "private"
+            (private / "fa4").mkdir(parents=True)
+            phase_env["FLASH_ATTENTION_CUTE_DSL_CACHE_DIR"] = str(private / "fa4")
+            if phase == "fa4-warm":
+                restored = cache.restore(root / "fa4-shared", private, cache.digest("fa4-probe"), "fa4")
+                assert restored["status"] == "hit", restored
+        subprocess.run(command, env=phase_env, check=True, timeout=600)
+        if phase == "fa4-cold":
+            published = cache.publish(root / "fa4-shared", private, cache.digest("fa4-probe"), "fa4")
+            assert published["status"] == "published", published
+            (root / "fa4-publication.json").write_text(json.dumps(published, indent=2) + "\n")
         results.append(json.loads((root / phase / "summary.json").read_text()))
+    assert results[0]["events"].get("compile_miss", 0) > 0, results[0]
     for result in results[1:3]:
         assert result["restore"]["status"] == "hit", result
         assert result["events"].get("compile_miss", 0) == 0, result

@@ -147,14 +147,12 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
                 timing["response_decoded_ready_unix"] = time.time()
         except httpx.HTTPError as error:
             logger.exception(
-                "Policy refresh HTTP failure: request=%s group=%s sample=%s url=%s elapsed_seconds=%.3f error=%s status=%s detail=%s attempts=1 delivery=unknown; correlate request with router/engine logs. No HTTP-level retry; passing failure to the producer for bounded group recovery.",
+                "Policy refresh HTTP failure: request=%s group=%s sample=%s url=%s elapsed_seconds=%.3f detail=%s attempts=1 delivery=unknown; correlate request with router/engine logs. No HTTP-level retry; passing failure to the producer for bounded group recovery.",
                 payload["rid"],
                 sample.group_index,
                 sample.index,
                 url,
                 time.monotonic() - started,
-                type(error).__name__,
-                getattr(getattr(error, "response", None), "status_code", None),
                 rollout_errors.failure_description(error),
             )
             raise

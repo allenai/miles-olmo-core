@@ -59,23 +59,40 @@ def test_unread_response_does_not_hide_original_failure():
     error = httpx.HTTPStatusError("original", request=request, response=response)
     assert "original" in rollout_errors.failure_description(error)
     assert "response body not read" in rollout_errors.failure_description(error)
+    assert rollout_errors.recovery_category(error) is None
 
 
 def test_single_failing_group_has_finite_retries_amid_successful_traffic():
     errors = rollout_errors.RolloutErrors()
+    error = failure({"error": {"code": "read_response_body_failed"}})
     for expected in range(1, 4):
         errors.record(successes=1000)
-        assert errors.check_group_retry(71) == expected
-    with pytest.raises(RuntimeError, match="group 71 failed again after 3 retries"):
-        errors.check_group_retry(71)
-    assert errors.check_group_retry(72) == 1
+        assert errors.check_group_retry(71, error) == expected
+    # An outage after the third isolated failure still gets the global grace period.
+    assert errors.check_group_retry(71, error) == 3
+    errors.record(successes=1)
+    with pytest.raises(RuntimeError, match="group 71 failed again after 3 isolated retries") as caught:
+        errors.check_group_retry(71, error)
+    assert caught.value.__cause__ is error
+    detail = json.loads(rollout_errors.failure_description(caught.value).split(" response=", 1)[1])
+    assert detail["status"] == 500 and "read_response_body_failed" in detail["body"]
+    assert errors.check_group_retry(72, error) == 1
 
 
 def test_success_forgets_group_retry_history():
     errors = rollout_errors.RolloutErrors()
-    errors.check_group_retry(71)
+    error = httpx.ConnectError("refused")
+    errors.check_group_retry(71, error)
     errors.group_succeeded(71)
-    assert errors.check_group_retry(71) == 1
+    assert errors.check_group_retry(71, error) == 1
     errors.group_succeeded(71)
     errors.group_succeeded(72)
     assert errors._group_retries == {}
+
+
+def test_same_prompt_outage_does_not_consume_isolated_retries():
+    errors = rollout_errors.RolloutErrors()
+    for _ in range(20):
+        assert errors.check_group_retry(71, httpx.ConnectError("refused")) == 1
+    errors.record(successes=1)
+    assert errors.check_group_retry(71, httpx.ConnectError("refused")) == 2

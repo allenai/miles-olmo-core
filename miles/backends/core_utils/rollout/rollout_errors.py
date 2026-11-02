@@ -1,4 +1,4 @@
-"""Recoverable generation failures and one sustained-error-rate stop rule."""
+"""Recoverable generation failures with outage and isolated-failure stop rules."""
 
 import asyncio
 import collections
@@ -38,7 +38,7 @@ def recovery_category(error: BaseException) -> str | None:
         return None
     try:
         body = error.response.json()
-    except ValueError:
+    except (ValueError, httpx.ResponseNotRead):
         return None
     if not isinstance(body, dict):
         return None
@@ -74,12 +74,14 @@ def recovery_category(error: BaseException) -> str | None:
 def failure_description(error: BaseException) -> str:
     """Preserve bounded server diagnostics, without request payloads or headers."""
     description = f"{type(error).__name__}: {str(error)[:1024]}"
-    if isinstance(error, httpx.HTTPStatusError):
+    # A retry-limit exception explicitly chains the last serving failure.
+    response_error = error if isinstance(error, httpx.HTTPStatusError) else error.__cause__
+    if isinstance(response_error, httpx.HTTPStatusError):
         try:
-            body = error.response.text
+            body = response_error.response.text
         except httpx.ResponseNotRead:
             body = "<response body not read>"
-        detail = {"status": error.response.status_code, "body": body[:2048], "truncated": len(body) > 2048}
+        detail = {"status": response_error.response.status_code, "body": body[:2048], "truncated": len(body) > 2048}
         description += " response=" + json.dumps(detail, ensure_ascii=True)
     return description
 
@@ -100,15 +102,19 @@ class RolloutErrors:
         self.failures = collections.Counter()
         self._group_retries = {}
 
-    def check_group_retry(self, group_index: int) -> int:
-        """Bound a persistently failing group even when fleet-wide errors are rare."""
-        retries = self._group_retries.get(group_index, 0)
+    def check_group_retry(self, group_index: int, error: BaseException) -> int:
+        """Count isolated failures only while other generation is making progress."""
+        retries, seen = self._group_retries.get(group_index, (0, self.successes))
+        if retries and self.successes == seen:
+            # No successful generation since this prompt last failed. Leave
+            # shared serving outages to the sustained-error-rate stop rule.
+            return retries
         if retries >= MAX_GROUP_RETRIES:
             raise RuntimeError(
-                f"Generation group {group_index} failed again after {MAX_GROUP_RETRIES} retries; "
+                f"Generation group {group_index} failed again after {MAX_GROUP_RETRIES} isolated retries; "
                 "stopping instead of repeatedly regenerating the same failing prompts"
-            )
-        self._group_retries[group_index] = retries + 1
+            ) from error
+        self._group_retries[group_index] = (retries + 1, self.successes)
         return retries + 1
 
     def group_succeeded(self, group_index: int) -> None:

@@ -172,22 +172,21 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         category = rollout_errors.recovery_category(error)
         if category is None or group_index is None:
             return False
-        retry = self._errors.check_group_retry(group_index)
         self._producing_groups.pop(group_index, None)
         self.data_source.requeue_pending_groups([group_index])
         self._errors.record(failures=[category])
+        # Count and retain the final failed group before a retry-limit stop.
+        # It remains pristine in the pending ledger; no partial output trains.
+        retry = self._errors.check_group_retry(group_index, error)
         # Pause new submissions briefly; already-active groups continue. In
         # particular, do not spin on queue-full or no-healthy-worker responses.
         self._retry_after = time.monotonic() + rollout_errors.RETRY_DELAY_SECONDS
-        response = getattr(error, "response", None)
         logger.warning(
-            "Async group %s generation failed: category=%s error=%s status=%s detail=%s; "
-            "pristine prompts requeued for regeneration (group_retry=%d/%d requeued_groups=%d)",
+            "Async group %s generation failed: category=%s detail=%s; "
+            "pristine prompts requeued for regeneration (isolated_group_retry=%d/%d requeued_groups=%d)",
             group_index,
             category,
-            type(error).__name__,
-            getattr(response, "status_code", None),
-            response.text[:512] if response is not None else str(error)[:512],
+            rollout_errors.failure_description(error),
             retry,
             rollout_errors.MAX_GROUP_RETRIES,
             self._errors.failures.total(),
@@ -354,6 +353,9 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                         continue
                 self._active_tasks = active
                 completions = []
+                # Observe successes before checking failed retries, regardless
+                # of iteration order within this batch of completed tasks.
+                self._errors.record(successes=sum(not task.cancelled() and task.exception() is None for task in done))
                 for task in done:
                     group_index = self._task_groups.pop(task, None)
                     error = None if task.cancelled() else task.exception()
@@ -366,7 +368,6 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                         if task.cancelled()
                         else task.result()
                     )
-                self._errors.record(successes=sum(not task.cancelled() and task.exception() is None for task in done))
                 self._errors.check()
                 self._ready_completion_counts.update(
                     (id(completion), pipeline_observer.completion_counts([completion])) for completion in completions

@@ -151,6 +151,7 @@ class RolloutExecutor:
         self._core_prepared_batch = prepared_batch.PreparedBatch(self, rollout_id)
 
     @rpc(enabled=False)
+    @event_logger_context(lambda _self, rollout_id: dict(rollout_id=rollout_id))
     async def core_get_prepared(self, rollout_id: int):
         prepared = getattr(self, "_core_prepared_batch", None)
         if prepared is None:

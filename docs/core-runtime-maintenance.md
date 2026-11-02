@@ -190,8 +190,10 @@ ledger. Each selected group keeps a completed-buffer slot until
 `release_reservation(consume=True)` transfers it to the executor and restores
 capacity. Prompts remain pending until the executor synchronously acknowledges
 them at final handoff, with no intervening await. The data source must serialize
-ledger mutations with its checkpoint cursor lock. Cancellation joins the actual
-producer-loop task before requeuing prompts; a shielded transfer result preserves
+ledger mutations with its checkpoint cursor lock. The reservation owns a shielded
+producer-loop task; cleanup cancels and joins it before requeuing prompts. This
+avoids repeated cancellation from the cross-thread wrapper without depending on
+Python 3.11's task-cancellation inspection API. A shielded transfer result preserves
 recovery even when cancellation arrives after producer-side release. The executor owns any resulting
 object-store reference until consumption, and disposal cleans unused references.
 The application must cancel pending preparation before a terminal generation
@@ -200,3 +202,6 @@ drain and must not overlap it with shared-engine evaluation's capacity changes.
 The expected publication version is checked again at consumption. Metrics under
 `rollout/prepared_batch` distinguish preparation from executor-side wait, but the
 application's acquisition stage remains the authority for RPC scheduling delay.
+These lightweight timing metrics remain enabled independently of diagnostic
+payload writing. Telemetry failures warn without preventing batch handoff, and
+prepared consumption carries the same rollout audit context as ordinary `get`.

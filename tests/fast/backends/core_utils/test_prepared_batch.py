@@ -7,6 +7,9 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from miles.backends.core_utils.rollout import prepared_batch
+from miles.ray.rollout.rollout_executor import RolloutExecutor
+from miles.utils.audit_utils.event_logger import logger as event_logger
+from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 
 
 def executor():
@@ -94,3 +97,45 @@ async def test_cancel_consumer_does_not_orphan_preparation(monkeypatch):
     assert not p.task.done()
     await p.close()
     assert p.task.cancelled()
+
+
+@pytest.mark.parametrize("failure", ["tracking", "event_logger", "logging"])
+async def test_telemetry_failure_does_not_discard_ready_batch(monkeypatch, failure):
+    e = executor()
+    batch = object()
+    e._prepare_rollout = AsyncMock(return_value=batch)
+    monkeypatch.setattr(prepared_batch, "compute_rollout_step", lambda *_: 7)
+    monkeypatch.setattr(prepared_batch.tracking._manager, "log", Mock())
+    monkeypatch.setattr(prepared_batch.tracking, "is_event_logger_initialized", lambda: failure == "event_logger")
+    error = Mock(side_effect=OSError("telemetry unavailable"))
+    if failure == "tracking":
+        monkeypatch.setattr(prepared_batch.tracking._manager, "log", error)
+    elif failure == "event_logger":
+        monkeypatch.setattr(prepared_batch.tracking, "get_event_logger", lambda: SimpleNamespace(log=error))
+    else:
+        monkeypatch.setattr(prepared_batch.logger, "info", error)
+        monkeypatch.setattr(prepared_batch.logger, "warning", error)
+    p = prepared_batch.PreparedBatch(e, 7)
+    e._weight_versions_of_model_id[None] = 12
+    assert await p.consume(7) is batch
+    assert error.called
+    e.data_source.acknowledge_groups.assert_called_once_with([])
+    e.data_source.requeue_pending_groups.assert_not_called()
+
+
+async def test_prepared_handoff_carries_rollout_audit_context(tmp_path, monkeypatch):
+    logger = event_logger.EventLogger(log_dir=tmp_path, source=SimpleProcessIdentity(component="rollout_executor"))
+    monkeypatch.setattr(event_logger, "_event_logger", logger)
+    batch = object()
+
+    async def consume(rollout_id):
+        assert logger._context_var.get() == {"rollout_id": rollout_id}
+        return batch
+
+    e = SimpleNamespace(
+        _core_prepared_batch=SimpleNamespace(consume=consume),
+        _rollouts_since_publish_of_model_id={None: 0},
+    )
+    assert await RolloutExecutor.core_get_prepared(e, 7) is batch
+    assert logger._context_var.get({}) == {}
+    assert e._core_prepared_batch is None and e.rollout_id == 7

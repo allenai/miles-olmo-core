@@ -126,13 +126,17 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         if self._output is None:
             raise RuntimeError("Prepared batches require an initialized async buffer")
         self._reserved_groups = []
-        self._reservation_task = asyncio.current_task()
+        task = asyncio.create_task(self(input))
+        self._reservation_task = task
         try:
-            return await self(input)
+            # Only release_reservation cancels the owned drain. Cancelling the
+            # cross-thread wrapper cannot interrupt its cleanup a second time.
+            return await asyncio.shield(task)
         finally:
             # A completed task retains its large sample result. Keep only the
             # pristine prompt reservation once the executor owns that result.
-            self._reservation_task = None
+            if task.done() and self._reservation_task is task:
+                self._reservation_task = None
 
     async def release_reservation(self, *, consume):
         """Transfer reserved prompts to the consumer, or regenerate unused work.
@@ -148,11 +152,9 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         if task is not None and not task.done():
             if consume:
                 raise RuntimeError("Cannot consume a batch still being prepared")
-            # The executor may already have cancelled the cross-thread future.
-            # A second cancel could interrupt _next_group's waiter cleanup and
-            # lose its just-completed dequeue before it records ownership.
-            if not task.cancelling():
-                task.cancel()
+            # reserve shields this task from its caller; cleanup owns the
+            # cancellation, including on Python 3.10 (no Task.cancelling API).
+            task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         groups = self._reserved_groups
         if not consume and groups:
@@ -192,8 +194,8 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                     raise RuntimeError("fully-async worker exited unexpectedly")
                 if queue_get in done:
                     entry = queue_get.result()
-                    self._record_dequeued(entry)
                     recorded = True
+                    self._record_dequeued(entry)
                     return entry
                 logger.warning("No completed async rollout groups for 30 seconds")
         finally:
@@ -208,8 +210,14 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
 
     def _record_dequeued(self, entry):
         if self._reserved_groups is not None:
+            try:
+                self._output.retain_prepared_capacity()
+            except RuntimeError:
+                # The dequeue already happened. Preserve prompt recovery even
+                # when the capacity invariant fails, without crediting a slot.
+                self.data_source.requeue_pending_groups([entry.prompt_group[0].group_index])
+                raise
             self._reserved_groups.append(entry.prompt_group)
-            self._output.retain_prepared_capacity()
         if self._draining_groups is None:
             self.data_source.acknowledge_groups([entry.prompt_group])
         else:

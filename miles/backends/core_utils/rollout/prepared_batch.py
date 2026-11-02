@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from contextlib import suppress
 
 from miles.utils import async_utils, logger_utils
 from miles.utils.data import remove_rollout_data_refs
@@ -73,6 +74,22 @@ class PreparedBatch:
             async_utils.submit(self.executor.generate_rollout.release_reservation(consume=True))
         )
         groups = await asyncio.shield(self._release)
+        self._log_timings(rollout_id, waited_at)
+        # The data source serializes ledger mutations with its cursor lock.
+        # No await may separate acknowledgement from executor ownership handoff.
+        self.executor.data_source.acknowledge_groups(groups)
+        return batch
+
+    def _log_timings(self, rollout_id, waited_at):
+        # Lightweight timing metrics remain enabled independently of diagnostic
+        # payload writing. Telemetry must never discard an otherwise ready batch.
+        try:
+            self._write_timings(rollout_id, waited_at)
+        except Exception:
+            with suppress(Exception):
+                logger.warning("Could not record prepared-batch timings for rollout %s", rollout_id, exc_info=True)
+
+    def _write_timings(self, rollout_id, waited_at):
         timings = {
             "preparation_seconds": self.finished - self.started,
             "consumer_wait_seconds": time.monotonic() - waited_at,
@@ -88,10 +105,6 @@ class PreparedBatch:
             },
             step_key="rollout/step",
         )
-        # The data source serializes ledger mutations with its cursor lock.
-        # No await may separate acknowledgement from executor ownership handoff.
-        self.executor.data_source.acknowledge_groups(groups)
-        return batch
 
     async def close(self):
         """Cancel collection, join it on both loops, then recover prompts and refs."""

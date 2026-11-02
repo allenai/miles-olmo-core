@@ -10,7 +10,7 @@ import httpx
 
 from miles.backends.core_utils import infra_timeouts
 from miles.backends.core_utils.publication import policy_refresh
-from miles.backends.core_utils.rollout import pipeline_observer, sibling_timing
+from miles.backends.core_utils.rollout import pipeline_observer, rollout_errors, sibling_timing
 from miles.backends.core_utils.rollout.async_rollout import ManagedFullyAsyncRolloutFn
 from miles.backends.core_utils.rollout.errors import GenerationRequestTimeout
 from miles.backends.core_utils.rollout.generation_admission import GenerationAdmission
@@ -147,7 +147,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
                 timing["response_decoded_ready_unix"] = time.time()
         except httpx.HTTPError as error:
             logger.exception(
-                "Policy refresh HTTP failure: request=%s group=%s sample=%s url=%s elapsed_seconds=%.3f error=%s status=%s attempts=1 delivery=unknown; correlate request with router/engine logs. No HTTP-level retry; passing failure to the producer for bounded group recovery.",
+                "Policy refresh HTTP failure: request=%s group=%s sample=%s url=%s elapsed_seconds=%.3f error=%s status=%s detail=%s attempts=1 delivery=unknown; correlate request with router/engine logs. No HTTP-level retry; passing failure to the producer for bounded group recovery.",
                 payload["rid"],
                 sample.group_index,
                 sample.index,
@@ -155,6 +155,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
                 time.monotonic() - started,
                 type(error).__name__,
                 getattr(getattr(error, "response", None), "status_code", None),
+                rollout_errors.failure_description(error),
             )
             raise
         except TimeoutError as error:

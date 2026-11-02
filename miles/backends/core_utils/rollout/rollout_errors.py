@@ -48,6 +48,9 @@ def recovery_category(error: BaseException) -> str | None:
         category = {
             (503, "no_available_workers"): "unavailable",
             (500, "call_upstream_request_error"): "transport",
+            # The worker replied, but its HTTP body was interrupted. Regenerate
+            # the whole pristine group; never consume the partial response.
+            (500, "read_response_body_failed"): "transport",
         }.get((error.response.status_code, router_error.get("code")))
         if category is not None:
             return category
@@ -65,6 +68,19 @@ def recovery_category(error: BaseException) -> str | None:
         "Request waiting timeout reached.": "timeout",
         "Request running timeout reached.": "timeout",
     }.get(message)
+
+
+def failure_description(error: BaseException) -> str:
+    """Preserve bounded server diagnostics, without request payloads or headers."""
+    description = f"{type(error).__name__}: {str(error)[:1024]}"
+    if isinstance(error, httpx.HTTPStatusError):
+        try:
+            body = error.response.text
+        except httpx.ResponseNotRead:
+            body = "<response body not read>"
+        detail = {"status": error.response.status_code, "body": body[:2048], "truncated": len(body) > 2048}
+        description += " response=" + json.dumps(detail, ensure_ascii=True)
+    return description
 
 
 class RolloutErrors:

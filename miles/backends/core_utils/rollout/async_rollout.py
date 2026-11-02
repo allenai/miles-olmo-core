@@ -375,7 +375,7 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         except GenerationInterrupted:
             raise
         except Exception as error:
-            fatal = f"{type(error).__name__}: {str(error)[:1024]}"
+            fatal = rollout_errors.failure_description(error)
             raise
         finally:
             for observer in observers:

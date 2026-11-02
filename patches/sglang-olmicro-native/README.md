@@ -1,4 +1,4 @@
-> Decode-graph candidate a562a2c24dc095436bc0bb1d0821db7119dcb228 extends the original overlay. Historical qualification.json remains unchanged; graph GPU qualification is pending. Current project plan: ../../../../Plan.md.
+> Decode-graph candidate a562a2c24dc095436bc0bb1d0821db7119dcb228 extends the original overlay. Historical qualification.json remains unchanged; graph GPU qualification is pending. Current project plan: [Plan.md](../../../Plan.md).
 
 # Native Olmicro SGLang source overlay
 

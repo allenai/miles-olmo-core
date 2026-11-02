@@ -89,6 +89,33 @@ def test_uncommitted_kernel_is_skipped_until_manifest_is_present(tmp_path):
     assert cache.publish(tmp_path / "shared", local, KEY, "triton", partial_triton=True)["status"] == "published"
 
 
+def test_copytree_aggregated_disappearance_skips_only_its_group(tmp_path, monkeypatch):
+    local, shared = tmp_path / "local", tmp_path / "shared"
+    group(local, "a-stable")
+    changing = group(local, "z-changing")
+    original = cache.shutil.copyfile
+    removed = False
+
+    def remove_before_copy(source, destination, **kwargs):
+        nonlocal removed
+        if Path(source) == changing / "kernel.cubin":
+            Path(source).unlink()
+            removed = True
+        return original(source, destination, **kwargs)
+
+    # Real copytree collects this per-file FileNotFoundError into shutil.Error.
+    monkeypatch.setattr(cache.shutil, "copyfile", remove_before_copy)
+    result = cache.publish(shared, local, KEY, "triton", partial_triton=True)
+    assert removed
+    assert result["status"] == "published"
+    assert result["skipped_live_groups"] == ["z-changing"]
+    restored = tmp_path / "restored"
+    (restored / "triton").mkdir(parents=True)
+    assert cache.restore(shared, restored, KEY, "triton")["status"] == "hit"
+    assert (restored / "triton/a-stable/kernel.cubin").read_bytes() == b"compiled"
+    assert not (restored / "triton/z-changing").exists()
+
+
 def test_standalone_runtime_library_and_autotuning_are_preserved(tmp_path):
     local = tmp_path / "local"
     for name, filename in (("runtime", "cuda_utils.so"), ("tuning", "kernel.autotune.json")):

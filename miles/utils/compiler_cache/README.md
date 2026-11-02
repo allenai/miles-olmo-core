@@ -110,7 +110,10 @@ compiling. Archive checksums and restore validation are unchanged.
 
 ## Opt-in TileLang lifecycle
 
-Open Instruct's `core.compiler_cache_tilelang` enables a separate
+The companion [Open Instruct PR #2140](https://github.com/allenai/open-instruct/pull/2140)
+adds `core.compiler_cache_tilelang` (RunSpec `compiler_cache.tilelang`). This
+application option is required to activate the lifecycle; without it, the
+defaulted lookup in `prepare()` leaves TileLang caching disabled. It enables a separate
 `core-tilelang-v1` compatibility envelope. It fingerprints installed TileLang
 Python/native/compiler sources, including its bundled TVM, in addition to the
 base runtime, device/toolchain and compile settings. Native-library stamping is
@@ -131,8 +134,10 @@ kernel uses it in arithmetic. Core's KDA setup now installs a guarded adapter
 that makes NB a non-specialized runtime argument. The autotuner retains its
 original NB keys and all candidate configurations; different workload buckets
 can still choose different launch parameters while sharing compiled candidates.
-The adapter rejects unexpected versions, declarations, body references to NB,
-or an already-used tuner. Native Triton keys distinguish the adapted signature.
+Unexpected versions or declarations, a missing NB autotuning key, or an
+already-used tuner produce a warning and retain the original kernels. The AST
+guard still rejects body references to NB as a hard error. Both kernels are
+prepared before either is replaced. Native Triton keys distinguish the adapted signature.
 
 `python tools/probe_fla_conv_cache.py --output /output/conv-probe` compares the
 original and adapted kernels at identical launch parameters, including packed

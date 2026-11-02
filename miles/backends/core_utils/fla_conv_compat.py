@@ -11,13 +11,17 @@ _PATCHED = False
 _KERNELS = ("causal_conv1d_fwd_kernel", "causal_conv1d_bwd_kernel")
 
 
+class UnsupportedDeclaration(ValueError):
+    """The optional adapter does not recognize this kernel signature."""
+
+
 def runtime_nb_source(source):
     """Fail closed if the pinned unused bucket ever starts affecting arithmetic."""
     tree = ast.parse(source)
     if any(isinstance(node, ast.Name) and node.id == "NB" for node in ast.walk(tree)):
         raise ValueError("FLA convolution NB is used in the kernel body; dynamic adaptation is not qualified")
     if source.count("NB: tl.constexpr,") != 1:
-        raise ValueError("Unexpected FLA convolution NB declaration")
+        raise UnsupportedDeclaration("Unexpected FLA convolution NB declaration")
     return source.replace("NB: tl.constexpr,", "NB,")
 
 
@@ -45,7 +49,8 @@ def install():
     if _PATCHED:
         return False
     if metadata.version("flash-linear-attention") != "0.5.2":
-        raise ValueError("Convolution specialization adapter requires flash-linear-attention==0.5.2")
+        logger.warning("Skipping convolution specialization adapter: requires flash-linear-attention==0.5.2")
+        return False
     triton = import_module("triton")
     kernels = import_module("fla.modules.conv.triton.kernels")
     replacements = []
@@ -54,8 +59,13 @@ def install():
         while not isinstance(tuner.fn, triton.runtime.JITFunction):
             tuner = tuner.fn
         if "NB" not in tuner.keys or tuner.cache:
-            raise ValueError("Convolution adapter requires an unused autotuner with its original NB bucket")
-        replacements.append((tuner, dynamic_nb_kernel(tuner.fn, triton)))
+            logger.warning("Skipping convolution specialization adapter: %s requires an unused NB autotuner", name)
+            return False
+        try:
+            replacements.append((tuner, dynamic_nb_kernel(tuner.fn, triton)))
+        except UnsupportedDeclaration as error:
+            logger.warning("Skipping convolution specialization adapter for %s: %s", name, error)
+            return False
     for tuner, updated in replacements:
         tuner.fn = updated
     _PATCHED = True

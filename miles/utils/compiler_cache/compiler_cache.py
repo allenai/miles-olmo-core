@@ -316,7 +316,7 @@ def _snapshot_completed_triton_groups(source, destination):
                 if inventory(staged) != before or inventory(group) != before:
                     skipped.append(group.name)
                     continue
-            except FileNotFoundError:
+            except (FileNotFoundError, shutil.Error):
                 skipped.append(group.name)
                 continue
             for name in manifests:

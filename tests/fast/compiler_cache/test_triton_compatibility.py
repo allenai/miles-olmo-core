@@ -6,6 +6,7 @@ import json
 import pytest
 from tests.fast.compiler_cache import test_startup_cache
 
+from miles.utils.compiler_cache import compiler_identity
 from miles.utils.compiler_cache import triton_compatibility as compatibility
 
 
@@ -53,6 +54,19 @@ def test_material_differences_still_miss(tmp_path, change):
     else:
         environment["TRITON_DEBUG"] = "hashed"
     assert compatibility.fingerprint(before, {}, {})[0] != compatibility.fingerprint(after, hardware, environment)[0]
+
+
+def test_tilelang_lifecycle_stamp_does_not_change_triton_identity(tmp_path):
+    descriptor = policy(tmp_path)
+    base = {"TRITON_DEBUG": "0"}
+    enabled = {**base, "TILELANG_KERNEL_CACHE_USE_LIB_STAMP": "1", "TILELANG_JIT_DIAGNOSTICS": "1"}
+    before = compiler_identity.compiler_environment(base)
+    after = compiler_identity.compiler_environment(enabled)
+    assert compatibility.fingerprint(descriptor, {}, before)[0] == compatibility.fingerprint(descriptor, {}, after)[0]
+    changed = compiler_identity.compiler_environment({**enabled, "TILELANG_NEW_COMPILER_OPTION": "1"})
+    assert (
+        compatibility.fingerprint(descriptor, {}, before)[0] != compatibility.fingerprint(descriptor, {}, changed)[0]
+    )
 
 
 def test_legacy_policy_cannot_silently_enter_new_scope(tmp_path):

@@ -41,6 +41,40 @@ def test_completed_group_survives_another_groups_concurrent_write(tmp_path, monk
     assert not (restored / "triton/changing").exists()
 
 
+@pytest.mark.parametrize("operation", ["stat", "hash"])
+def test_disappearing_file_during_initial_inventory_skips_only_its_group(tmp_path, monkeypatch, operation):
+    local, shared = tmp_path / "local", tmp_path / "shared"
+    group(local, "a-stable")
+    changing = group(local, "z-changing")
+    temporary = changing / "tmp.pid_1_uuid"
+    temporary.mkdir()
+    disappearing = temporary / "kernel.cubin"
+    disappearing.write_bytes(b"partial")
+    original = Path.lstat if operation == "stat" else cache.sha256
+    removed = False
+
+    def remove_then_read(path, *args, **kwargs):
+        nonlocal removed
+        if Path(path) == disappearing and not removed:
+            disappearing.unlink()
+            removed = True
+        return original(path, *args, **kwargs)
+
+    if operation == "stat":
+        monkeypatch.setattr(Path, "lstat", remove_then_read)
+    else:
+        monkeypatch.setattr(cache, "sha256", remove_then_read)
+    result = cache.publish(shared, local, KEY, "triton", partial_triton=True)
+    assert removed
+    assert result["status"] == "published"
+    assert result["skipped_live_groups"] == ["z-changing"]
+    restored = tmp_path / "restored"
+    (restored / "triton").mkdir(parents=True)
+    assert cache.restore(shared, restored, KEY, "triton")["status"] == "hit"
+    assert (restored / "triton/a-stable/kernel.cubin").read_bytes() == b"compiled"
+    assert not (restored / "triton/z-changing").exists()
+
+
 def test_uncommitted_kernel_is_skipped_until_manifest_is_present(tmp_path):
     local = tmp_path / "local"
     incomplete = local / "triton/new"

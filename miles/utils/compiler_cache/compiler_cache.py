@@ -297,7 +297,12 @@ def _snapshot_completed_triton_groups(source, destination):
     for group in sorted(source.iterdir()):
         if group.is_symlink() or not group.is_dir():
             raise ValueError("Partial Triton snapshots require directory-isolated kernel groups")
-        before = inventory(group)
+        try:
+            before = inventory(group)
+        except FileNotFoundError:
+            # Atomic compiler writes can disappear between enumeration and hashing.
+            skipped.append(group.name)
+            continue
         manifests = [name for name in before if PurePosixPath(name).name.startswith("__grp__")]
         standalone = len(before) == 1 and next(iter(before)).endswith((".so", ".autotune.json"))
         transient = any(any(part.startswith("tmp.") for part in PurePosixPath(name).parts) for name in before)

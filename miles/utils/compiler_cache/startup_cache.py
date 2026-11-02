@@ -110,7 +110,17 @@ def prepare(args, *, application_root):
         if any(secret in key for secret in ("api_key", "password", "secret", "access_token", "auth_token")):
             del miles[key]
     report_dir = shared / "runs" / uuid.uuid4().hex
-    report_dir.mkdir(parents=True)
+    try:
+        report_dir.mkdir(parents=True)
+    except OSError as error:
+        logger.warning(
+            "SHARED COMPILER CACHE DISABLED: cannot create reports at %s (errno=%s): %s; "
+            "using ordinary local compiler caches without shared restore or publication",
+            report_dir,
+            error.errno,
+            error,
+        )
+        return
     args.olmo_core_startup_cache = dict(
         shared=str(shared),
         report_dir=str(report_dir),
@@ -292,7 +302,19 @@ def setup_worker():
     report_path = Path(policy["report_dir"]) / f"{policy['slot']}-{uuid.uuid4().hex}.json"
     if policy["observe"]:
         report["activity_directory"] = str(Path(policy["report_dir"]) / "activity" / report_path.stem)
-    report_path.write_bytes(cache.encoded(report))
+    try:
+        report_path.write_bytes(cache.encoded(report))
+    except OSError as error:
+        # Reporting must not undo a successful restore or prevent local compilation.
+        logger.warning(
+            "SHARED COMPILER CACHE REPORT FAILED: worker=%s path=%s (errno=%s): %s; "
+            "continuing with local compiler cache at %s; shared publication may be unavailable",
+            policy["slot"],
+            report_path,
+            error.errno,
+            error,
+            local,
+        )
     if policy["observe"]:
         observe_triton(local)
         compilation_observer.install(local)
@@ -405,6 +427,15 @@ def publish_worker(report, *, retain_local=False):
             )
     except Exception as error:
         result["publish"] = {"status": "rejected", "reason": f"{type(error).__name__}: {error}"}
+        logger.warning(
+            "SHARED COMPILER CACHE PUBLICATION FAILED: worker=%s shared=%s (errno=%s): %s; "
+            "local cache retained at %s; training can continue but new artifacts were not confirmed saved",
+            report["slot"],
+            report["shared"],
+            getattr(error, "errno", None),
+            error,
+            local,
+        )
     else:
         if not retain_local:
             shutil.rmtree(local)

@@ -1,6 +1,7 @@
 """Warm compiler caches are published after completed training collections while workers stay live."""
 
 import asyncio
+import errno
 import json
 import shutil
 import tempfile
@@ -67,6 +68,24 @@ def test_final_publication_still_removes_the_private_copy(live_worker):
     result = startup_cache.publish_worker(report)
     assert result["publish"]["status"] == "published"
     assert not local.exists()
+
+
+@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EROFS, errno.EACCES])
+def test_publication_io_failure_warns_and_retains_retryable_local_cache(live_worker, monkeypatch, caplog, code):
+    local, shared, report = live_worker
+    original = cache.publish
+
+    def unavailable(*args, **kwargs):
+        raise OSError(code, "shared cache unavailable", str(shared))
+
+    monkeypatch.setattr(cache, "publish", unavailable)
+    assert startup_cache.publish_worker(report, retain_local=True)["publish"]["status"] == "rejected"
+    assert (local / "triton/group/kernel.so").read_bytes() == b"compiled"
+    assert not (local / "publication-state.json").exists()
+    assert str(shared) in caplog.text and f"errno={code}" in caplog.text
+    assert any(r.levelname == "WARNING" and "PUBLICATION FAILED" in r.message for r in caplog.records)
+    monkeypatch.setattr(cache, "publish", original)
+    assert startup_cache.publish_worker(report, retain_local=True)["publish"]["status"] == "published"
 
 
 def test_progress_schedule_first_collection_then_elapsed_time():

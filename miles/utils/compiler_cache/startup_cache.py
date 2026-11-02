@@ -161,15 +161,15 @@ def _trainer_runtime_env(args, spec, context):
 
 def _serving_environment(args, spec, context):
     env = dict(spec.env_var(context))
-    for name in ("MILES_HYBRID_BRIDGE", "MILES_HYBRID_REFERENCE_BACKBONE"):
+    for name in ("MILES_HYBRID_BRIDGE", "MILES_HYBRID_REFERENCE_BACKBONE", "MILES_HYBRID_NATIVE"):
         if name in os.environ:
             env.setdefault(name, os.environ[name])
     env["HF_MODULES_CACHE"] = _private_hf_modules_cache()
-    env["SGLANG_EXTERNAL_MODEL_PACKAGE"] = (
-        "miles_plugins.hybrid.models"
-        if env.get("MILES_HYBRID_BRIDGE") == "1" or os.environ.get("MILES_HYBRID_BRIDGE") == "1"
-        else "olmo_sglang.models"
-    )
+    env["SGLANG_EXTERNAL_MODEL_PACKAGE"] = "miles_plugins.hybrid.models" if env.get("MILES_HYBRID_BRIDGE") == "1" or os.environ.get("MILES_HYBRID_BRIDGE") == "1" else "olmo_sglang.models"
+    if env.get("MILES_HYBRID_NATIVE") == "1":
+        if env.get("MILES_HYBRID_BRIDGE") == "1" or env.get("MILES_HYBRID_REFERENCE_BACKBONE") == "1":
+            raise ValueError("Native Olmicro serving cannot enable the HF reference bridge")
+        env["SGLANG_EXTERNAL_MODEL_PACKAGE"] = ""
     if policy := getattr(args, "olmo_core_startup_cache", None):
         slot = f"{spec.name}-{context.cell_index}-{context.worker_in_cell_index}"
         env[ENV] = json.dumps({**policy, "slot": slot})
@@ -188,6 +188,9 @@ def _serving_command(spec, context):
     # argv, before the serving child's own registration hook can run.
     if spec.env_var(context).get("MILES_HYBRID_BRIDGE", os.environ.get("MILES_HYBRID_BRIDGE")) == "1":
         importlib.import_module("transformers_plugin").register_config()
+    if spec.env_var(context).get("MILES_HYBRID_NATIVE", os.environ.get("MILES_HYBRID_NATIVE")) == "1":
+        config = importlib.import_module("sglang.srt.configs.mainline_ladder").MainlineLadderConfig
+        importlib.import_module("transformers").AutoConfig.register("mainline_ladder", config, exist_ok=True)
     command = shlex.split(spec.launch_command(context))
     module_index = command.index("-m") + 1
     if command[module_index] != "sglang.launch_server":
@@ -255,11 +258,7 @@ def setup_worker():
             compiler_env=probes.compiler_environment(os.environ),
         )
         report.update(fingerprint=key, identity=identity)
-        report["restore"] = (
-            cache.restore(Path(policy["shared"]), local, key, "triton")
-            if policy["restore"]
-            else {"family": "triton", "status": "cold"}
-        )
+        report["restore"] = cache.restore(Path(policy["shared"]), local, key, "triton") if policy["restore"] else {"family": "triton", "status": "cold"}
         report["restored_files"] = len(cache.inventory(local / "triton"))
     except Exception as error:
         # Compilation is still available locally; a cache failure is not a run failure.
@@ -273,11 +272,7 @@ def setup_worker():
         # into its scheduler. This diagnostic-only hook observes those children.
         hook = local / "observer"
         hook.mkdir()
-        (hook / "sitecustomize.py").write_text(
-            "import os\nfrom pathlib import Path\n"
-            "from miles.utils.compiler_cache.startup_cache import observe_triton\n"
-            "observe_triton(Path(os.environ['OI_CORE_CACHE_OBSERVE_ROOT']))\n"
-        )
+        (hook / "sitecustomize.py").write_text("import os\nfrom pathlib import Path\nfrom miles.utils.compiler_cache.startup_cache import observe_triton\nobserve_triton(Path(os.environ['OI_CORE_CACHE_OBSERVE_ROOT']))\n")
         os.environ["OI_CORE_CACHE_OBSERVE_ROOT"] = str(local)
         os.environ["PYTHONPATH"] = str(hook) + os.pathsep + os.environ.get("PYTHONPATH", "")
     logger.info(
@@ -335,15 +330,9 @@ def publish_worker(report, *, retain_local=False):
         )
         status = result["publish"]["status"]
         if status in {"published", "unchanged", "empty", "storage_limit"}:
-            state_path.write_bytes(
-                cache.encoded(
-                    {"signature": signature, "capped": status == "storage_limit", "publish": result["publish"]}
-                )
-            )
+            state_path.write_bytes(cache.encoded({"signature": signature, "capped": status == "storage_limit", "publish": result["publish"]}))
         if status == "storage_limit":
-            logger.warning(
-                "Core compiler cache publication stopped for slot=%s: %s", report["slot"], result["publish"]
-            )
+            logger.warning("Core compiler cache publication stopped for slot=%s: %s", report["slot"], result["publish"])
     except Exception as error:
         result["publish"] = {"status": "rejected", "reason": f"{type(error).__name__}: {error}"}
     else:
@@ -367,16 +356,8 @@ async def _publish_all(workers, *, retain_local=False):
         task = None
         try:
             async with limits[worker["node_id"]]:
-                logger.info(
-                    "Core compiler cache publication queued: slot=%s node=%s", worker["slot"], worker["node_id"]
-                )
-                task = (
-                    ray.remote(num_cpus=0, max_retries=0)(publisher)
-                    .options(
-                        scheduling_strategy=strategies.NodeAffinitySchedulingStrategy(worker["node_id"], soft=False)
-                    )
-                    .remote(worker)
-                )
+                logger.info("Core compiler cache publication queued: slot=%s node=%s", worker["slot"], worker["node_id"])
+                task = ray.remote(num_cpus=0, max_retries=0)(publisher).options(scheduling_strategy=strategies.NodeAffinitySchedulingStrategy(worker["node_id"], soft=False)).remote(worker)
                 return await task
         except asyncio.CancelledError:
             if task is not None:
@@ -447,23 +428,15 @@ async def _publish_progress(args, policy, state, rollout_id):
     try:
         workers, others = _worker_reports(policy["report_dir"])
         report["workers"].extend(others)
-        report["workers"].extend(
-            await _publish_all(
-                [worker for worker in workers if worker["slot"] not in state["capped_slots"]], retain_local=True
-            )
-        )
+        report["workers"].extend(await _publish_all([worker for worker in workers if worker["slot"] not in state["capped_slots"]], retain_local=True))
     except Exception as error:
         report["publication_error"] = f"{type(error).__name__}: {error}"
         logger.warning("Core compiler cache progress publication unavailable: %s", report["publication_error"])
-    state["capped_slots"].update(
-        worker["slot"] for worker in report["workers"] if worker.get("publish", {}).get("status") == "storage_limit"
-    )
+    state["capped_slots"].update(worker["slot"] for worker in report["workers"] if worker.get("publish", {}).get("status") == "storage_limit")
     report["seconds"] = time.monotonic() - started
     state["published"] += 1
     state["history"].append(report)
-    _save_report(
-        args, "compiler-cache-progress.json", {"report_dir": policy["report_dir"], "publications": state["history"]}
-    )
+    _save_report(args, "compiler-cache-progress.json", {"report_dir": policy["report_dir"], "publications": state["history"]})
     logger.info("Core compiler cache progress publication: %s", json.dumps(report))
 
 
@@ -494,9 +467,7 @@ def publish_progress(args, rollout_id):
     if task is not None and not task.done():
         return None
     now = time.monotonic()
-    if not progress_due(
-        state["last_attempt"], now, interval=policy.get("publish_interval_seconds", DEFAULT_PUBLISH_INTERVAL_SECONDS)
-    ):
+    if not progress_due(state["last_attempt"], now, interval=policy.get("publish_interval_seconds", DEFAULT_PUBLISH_INTERVAL_SECONDS)):
         return None
     state["last_attempt"] = now
     state["task"] = asyncio.create_task(_publish_progress(args, policy, state, rollout_id))

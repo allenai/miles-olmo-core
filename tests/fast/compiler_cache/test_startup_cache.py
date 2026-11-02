@@ -95,9 +95,7 @@ def test_worker_restore_publish_and_rank_isolation(tmp_path, monkeypatch):
     monkeypatch.setenv(startup.ENV, json.dumps(descriptor))
     fake_ray = SimpleNamespace(get_runtime_context=lambda: SimpleNamespace(get_node_id=lambda: "node"))
     original_import = startup.importlib.import_module
-    monkeypatch.setattr(
-        startup.importlib, "import_module", lambda name: fake_ray if name == "ray" else original_import(name)
-    )
+    monkeypatch.setattr(startup.importlib, "import_module", lambda name: fake_ray if name == "ray" else original_import(name))
     monkeypatch.setattr(startup.probes, "toolchain", lambda env: {"gpu": "B300"})
     monkeypatch.setattr(startup.probes, "compiler_environment", lambda env: {})
     startup.setup_worker()
@@ -117,11 +115,7 @@ def test_worker_restore_publish_and_rank_isolation(tmp_path, monkeypatch):
     descriptor["slot"] = "train-actor-cell0-rank1"
     monkeypatch.setenv(startup.ENV, json.dumps(descriptor))
     startup.setup_worker()
-    other = next(
-        json.loads(p.read_text())
-        for p in (tmp_path / "reports").glob("*.json")
-        if json.loads(p.read_text())["slot"] == descriptor["slot"]
-    )
+    other = next(json.loads(p.read_text()) for p in (tmp_path / "reports").glob("*.json") if json.loads(p.read_text())["slot"] == descriptor["slot"])
     assert other["fingerprint"] != cold["fingerprint"] and other["restore"]["status"] == "miss"
     startup.publish_worker(other)
 
@@ -165,13 +159,9 @@ def test_publication_has_one_budget_and_cancels_ray_tasks(tmp_path, monkeypatch)
             submitted.append(future)
             return future
 
-    fake_ray = SimpleNamespace(
-        remote=lambda **kwargs: lambda fn: Remote(), cancel=lambda task, **kwargs: cancelled.append((task, kwargs))
-    )
+    fake_ray = SimpleNamespace(remote=lambda **kwargs: lambda fn: Remote(), cancel=lambda task, **kwargs: cancelled.append((task, kwargs)))
     original_import = startup.importlib.import_module
-    monkeypatch.setattr(
-        startup.importlib, "import_module", lambda name: fake_ray if name == "ray" else original_import(name)
-    )
+    monkeypatch.setattr(startup.importlib, "import_module", lambda name: fake_ray if name == "ray" else original_import(name))
     monkeypatch.setattr(startup, "PUBLICATION_TIMEOUT_SECONDS", 0.02)
     args = SimpleNamespace(olmo_core_startup_cache=descriptor, save=str(tmp_path))
     asyncio.run(startup.finish(args, success=True))
@@ -186,9 +176,7 @@ def test_publication_has_one_budget_and_cancels_ray_tasks(tmp_path, monkeypatch)
 def test_publication_handles_mixed_results_and_keeps_training_success(tmp_path, monkeypatch):
     descriptor = policy(tmp_path)
     for n in range(3):
-        (Path(descriptor["report_dir"]) / f"{n}.json").write_text(
-            json.dumps(dict(slot=str(n), node_id="0" * 56, fingerprint="a" * 64))
-        )
+        (Path(descriptor["report_dir"]) / f"{n}.json").write_text(json.dumps(dict(slot=str(n), node_id="0" * 56, fingerprint="a" * 64)))
 
     class Remote:
         def options(self, **kwargs):
@@ -204,9 +192,7 @@ def test_publication_handles_mixed_results_and_keeps_training_success(tmp_path, 
 
     fake_ray = SimpleNamespace(remote=lambda **kwargs: lambda fn: Remote())
     original_import = startup.importlib.import_module
-    monkeypatch.setattr(
-        startup.importlib, "import_module", lambda name: fake_ray if name == "ray" else original_import(name)
-    )
+    monkeypatch.setattr(startup.importlib, "import_module", lambda name: fake_ray if name == "ray" else original_import(name))
     args = SimpleNamespace(olmo_core_startup_cache=descriptor, save=str(tmp_path))
     asyncio.run(startup.finish(args, success=True))
     report = json.loads((tmp_path / "compiler-cache.json").read_text())
@@ -219,3 +205,33 @@ def test_optional_cache_report_failure_cannot_fail_completed_training(tmp_path, 
     args = SimpleNamespace(olmo_core_startup_cache=policy(tmp_path), save=str(tmp_path))
     monkeypatch.setattr(Path, "write_bytes", mock.Mock(side_effect=OSError("shared filesystem unavailable")))
     asyncio.run(startup.finish(args, success=False))
+
+
+def test_native_serving_rejects_bridge_and_disables_external_registry(monkeypatch):
+    monkeypatch.setenv("MILES_HYBRID_NATIVE", "1")
+    monkeypatch.setenv("SGLANG_EXTERNAL_MODEL_PACKAGE", "olmo_sglang.models")
+    args = SimpleNamespace(olmo_core_startup_cache=None)
+    native = SimpleNamespace(env_var=lambda context: {"MILES_HYBRID_BRIDGE": "0"})
+    assert startup._serving_environment(args, native, None)["SGLANG_EXTERNAL_MODEL_PACKAGE"] == ""
+    bridge = SimpleNamespace(env_var=lambda context: {"MILES_HYBRID_BRIDGE": "1"})
+    with pytest.raises(ValueError, match="cannot enable"):
+        startup._serving_environment(args, bridge, None)
+
+
+def test_native_registration_precedes_manager_command(monkeypatch):
+    monkeypatch.setenv("MILES_HYBRID_NATIVE", "1")
+    monkeypatch.delenv("MILES_HYBRID_BRIDGE", raising=False)
+    registration = mock.Mock()
+    config = object()
+    modules = {
+        "sglang.srt.configs.mainline_ladder": SimpleNamespace(MainlineLadderConfig=config),
+        "transformers": SimpleNamespace(AutoConfig=SimpleNamespace(register=registration)),
+    }
+    monkeypatch.setattr(startup.importlib, "import_module", modules.__getitem__)
+
+    def command(context):
+        registration.assert_called_once_with("mainline_ladder", config, exist_ok=True)
+        return "python -m sglang.launch_server --model-path /checkpoint"
+
+    spec = SimpleNamespace(env_var=lambda context: {}, launch_command=command)
+    assert "-m miles.utils.compiler_cache.serving" in startup._serving_command(spec, None)

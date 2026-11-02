@@ -172,6 +172,7 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         category = rollout_errors.recovery_category(error)
         if category is None or group_index is None:
             return False
+        retry = self._errors.check_group_retry(group_index)
         self._producing_groups.pop(group_index, None)
         self.data_source.requeue_pending_groups([group_index])
         self._errors.record(failures=[category])
@@ -181,12 +182,14 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         response = getattr(error, "response", None)
         logger.warning(
             "Async group %s generation failed: category=%s error=%s status=%s detail=%s; "
-            "pristine prompts requeued for regeneration (requeued_groups=%d)",
+            "pristine prompts requeued for regeneration (group_retry=%d/%d requeued_groups=%d)",
             group_index,
             category,
             type(error).__name__,
             getattr(response, "status_code", None),
             response.text[:512] if response is not None else str(error)[:512],
+            retry,
+            rollout_errors.MAX_GROUP_RETRIES,
             self._errors.failures.total(),
         )
         return True
@@ -356,6 +359,8 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                     error = None if task.cancelled() else task.exception()
                     if error is not None and self._requeue_generation_failure(group_index, error):
                         continue
+                    if error is None and not task.cancelled():
+                        self._errors.group_succeeded(cast(int, group_index))
                     completions.append(
                         self._collect_group_result(task, self._producing_groups[cast(int, group_index)])
                         if task.cancelled()

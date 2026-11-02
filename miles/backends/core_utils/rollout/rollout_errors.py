@@ -18,6 +18,7 @@ WINDOW_SECONDS = 300
 FAILURE_FRACTION = 0.5
 RETRY_DELAY_SECONDS = 1.0
 REPORT_INTERVAL_SECONDS = 15
+MAX_GROUP_RETRIES = 3
 CATEGORIES = ("transport", "overload", "unavailable", "timeout")
 
 
@@ -97,6 +98,21 @@ class RolloutErrors:
         self._bad_since = None
         self.successes = 0
         self.failures = collections.Counter()
+        self._group_retries = {}
+
+    def check_group_retry(self, group_index: int) -> int:
+        """Bound a persistently failing group even when fleet-wide errors are rare."""
+        retries = self._group_retries.get(group_index, 0)
+        if retries >= MAX_GROUP_RETRIES:
+            raise RuntimeError(
+                f"Generation group {group_index} failed again after {MAX_GROUP_RETRIES} retries; "
+                "stopping instead of repeatedly regenerating the same failing prompts"
+            )
+        self._group_retries[group_index] = retries + 1
+        return retries + 1
+
+    def group_succeeded(self, group_index: int) -> None:
+        self._group_retries.pop(group_index, None)
 
     def record(self, successes=0, failures=()):
         now = int(time.monotonic())

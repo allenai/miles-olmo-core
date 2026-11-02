@@ -59,3 +59,23 @@ def test_unread_response_does_not_hide_original_failure():
     error = httpx.HTTPStatusError("original", request=request, response=response)
     assert "original" in rollout_errors.failure_description(error)
     assert "response body not read" in rollout_errors.failure_description(error)
+
+
+def test_single_failing_group_has_finite_retries_amid_successful_traffic():
+    errors = rollout_errors.RolloutErrors()
+    for expected in range(1, 4):
+        errors.record(successes=1000)
+        assert errors.check_group_retry(71) == expected
+    with pytest.raises(RuntimeError, match="group 71 failed again after 3 retries"):
+        errors.check_group_retry(71)
+    assert errors.check_group_retry(72) == 1
+
+
+def test_success_forgets_group_retry_history():
+    errors = rollout_errors.RolloutErrors()
+    errors.check_group_retry(71)
+    errors.group_succeeded(71)
+    assert errors.check_group_retry(71) == 1
+    errors.group_succeeded(71)
+    errors.group_succeeded(72)
+    assert errors._group_retries == {}

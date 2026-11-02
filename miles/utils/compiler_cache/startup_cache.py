@@ -110,7 +110,17 @@ def prepare(args, *, application_root):
         if any(secret in key for secret in ("api_key", "password", "secret", "access_token", "auth_token")):
             del miles[key]
     report_dir = shared / "runs" / uuid.uuid4().hex
-    report_dir.mkdir(parents=True)
+    try:
+        report_dir.mkdir(parents=True)
+    except OSError as error:
+        logger.warning(
+            "SHARED COMPILER CACHE DISABLED: cannot create reports at %s (errno=%s): %s; "
+            "using ordinary local compiler caches without shared restore or publication",
+            report_dir,
+            error.errno,
+            error,
+        )
+        return
     args.olmo_core_startup_cache = dict(
         shared=str(shared),
         report_dir=str(report_dir),
@@ -292,7 +302,20 @@ def setup_worker():
     report_path = Path(policy["report_dir"]) / f"{policy['slot']}-{uuid.uuid4().hex}.json"
     if policy["observe"]:
         report["activity_directory"] = str(Path(policy["report_dir"]) / "activity" / report_path.stem)
-    report_path.write_bytes(cache.encoded(report))
+    try:
+        _write_worker_report(report_path, report)
+    except OSError as error:
+        # Reporting must not undo a successful restore or prevent local compilation.
+        logger.warning(
+            "SHARED COMPILER CACHE REPORT FAILED: worker=%s path=%s (errno=%s): %s; "
+            "continuing with local compiler cache at %s; without a readable report this worker cannot be "
+            "published or cleaned up by the driver",
+            policy["slot"],
+            report_path,
+            error.errno,
+            error,
+            local,
+        )
     if policy["observe"]:
         observe_triton(local)
         compilation_observer.install(local)
@@ -317,6 +340,14 @@ def setup_worker():
         policy["observe"],
         report["restore"],
     )
+
+
+def _write_worker_report(path, report):
+    # Readers only scan *.json. Leave failed staging files outside that set;
+    # never expose a partial report or delete shared files on the failure path.
+    pending = path.with_suffix(".json.pending")
+    pending.write_bytes(cache.encoded(report))
+    pending.replace(path)
 
 
 def archive_activity(report, local):
@@ -405,6 +436,18 @@ def publish_worker(report, *, retain_local=False):
             )
     except Exception as error:
         result["publish"] = {"status": "rejected", "reason": f"{type(error).__name__}: {error}"}
+        if isinstance(error, OSError):
+            logger.warning(
+                "SHARED COMPILER CACHE PUBLICATION FAILED: worker=%s shared=%s (errno=%s): %s; "
+                "local cache retained at %s; training can continue but new artifacts were not confirmed saved",
+                report["slot"],
+                report["shared"],
+                error.errno,
+                error,
+                local,
+            )
+        else:
+            logger.info("Core compiler cache publication rejected: worker=%s %s", report["slot"], result["publish"])
     else:
         if not retain_local:
             shutil.rmtree(local)
@@ -479,7 +522,19 @@ def _worker_reports(report_dir):
     """Split worker startup records into publishable workers and cold/unavailable ones."""
     workers, others = [], []
     for path in sorted(Path(report_dir).glob("*.json")):
-        worker = json.loads(path.read_text())
+        try:
+            worker = json.loads(path.read_text())
+            if not isinstance(worker, dict):
+                raise ValueError("Worker report must be a JSON object")
+        except (OSError, ValueError) as error:
+            logger.warning(
+                "SKIPPING UNREADABLE COMPILER CACHE REPORT: path=%s (errno=%s): %s; "
+                "continuing publication for other workers",
+                path,
+                getattr(error, "errno", None),
+                error,
+            )
+            continue
         (workers if "fingerprint" in worker else others).append(worker)
     return workers, others
 

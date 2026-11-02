@@ -1,5 +1,6 @@
 """TileLang identity, staged-export rejection and independent publication."""
 
+import errno
 import tempfile
 from pathlib import Path
 
@@ -77,7 +78,15 @@ def test_absent_opt_in_leaves_environment_and_report_unchanged(tmp_path, monkeyp
     assert "tilelang" not in report
 
 
-def test_publication_failure_is_nonfatal_and_retryable(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "Compiler cache changed during snapshot",
+        "TileLang publication deferred: an atomic kernel export is in progress",
+    ],
+)
+def test_publication_failure_is_nonfatal_and_retryable(tmp_path, monkeypatch, caplog, reason):
+    caplog.set_level("INFO", logger=tilelang_cache.__name__)
     monkeypatch.setattr(tilelang_cache.os, "environ", {})
     report = worker(tmp_path)
     tilelang_cache.configure(descriptor(tmp_path), tmp_path)
@@ -85,11 +94,39 @@ def test_publication_failure_is_nonfatal_and_retryable(tmp_path, monkeypatch):
     (tmp_path / "tilelang/executable.so").write_bytes(b"compiled")
 
     def fail(*args, **kwargs):
-        raise ValueError("changed during snapshot")
+        raise ValueError(reason)
 
+    original = cache.publish
     monkeypatch.setattr(cache, "publish", fail)
     assert tilelang_cache.publish(report, tmp_path)["publish"]["status"] == "rejected"
     assert not (tmp_path / "tilelang-publication-state.json").exists()
+    assert reason in caplog.text
+    assert not any(r.levelname == "WARNING" for r in caplog.records)
+    monkeypatch.setattr(cache, "publish", original)
+    assert tilelang_cache.publish(report, tmp_path)["publish"]["status"] == "published"
+
+
+@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EROFS, errno.EACCES])
+def test_publication_io_failure_warns_and_preserves_local_artifacts(tmp_path, monkeypatch, caplog, code):
+    monkeypatch.setattr(tilelang_cache.os, "environ", {})
+    report = worker(tmp_path)
+    tilelang_cache.configure(descriptor(tmp_path), tmp_path)
+    tilelang_cache.restore(descriptor(tmp_path), report, tmp_path)
+    artifact = tmp_path / "tilelang/executable.so"
+    artifact.write_bytes(b"compiled")
+    original = cache.publish
+
+    def unavailable(*args, **kwargs):
+        raise OSError(code, "shared cache unavailable", report["shared"])
+
+    monkeypatch.setattr(cache, "publish", unavailable)
+    assert tilelang_cache.publish(report, tmp_path)["publish"]["status"] == "rejected"
+    assert artifact.read_bytes() == b"compiled"
+    assert not (tmp_path / "tilelang-publication-state.json").exists()
+    assert report["shared"] in caplog.text and f"errno={code}" in caplog.text
+    assert any(r.levelname == "WARNING" and "PUBLICATION FAILED" in r.message for r in caplog.records)
+    monkeypatch.setattr(cache, "publish", original)
+    assert tilelang_cache.publish(report, tmp_path)["publish"]["status"] == "published"
 
 
 def test_tilelang_publication_runs_even_when_triton_has_not_changed(tmp_path, monkeypatch):

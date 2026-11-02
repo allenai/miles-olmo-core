@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from miles.backends.core_utils import integration as core_integration
+from miles.backends.core_utils.rollout import prepared_batch
 from miles.backends.hooks import get_backend_hooks
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.debug_data import RolloutDataInjectionUtil, load_debug_rollout_data, save_debug_rollout_data
@@ -26,7 +27,7 @@ from miles.rollout.base_types import (
 )
 from miles.rollout.checkpoint_eval import CheckpointEvalFn, EvalSkip
 from miles.rollout.inference_rollout.compatibility import call_rollout_function, load_rollout_function
-from miles.utils import object_store
+from miles.utils import async_utils, object_store
 from miles.utils.async_utils import maybe_await
 from miles.utils.audit_utils.event_analyzer import analyzer as event_analyzer
 from miles.utils.audit_utils.event_logger import checkpoint as event_logger_checkpoint
@@ -75,6 +76,7 @@ class RolloutExecutor:
         self._weight_versions_of_model_id: dict[str | None, int] = {}
         self._rollouts_since_publish_of_model_id: dict[str | None, int] = defaultdict(int)
         self._train_parallel_configs_of_model_id: dict[str | None, dict[str, Any]] = {}
+        self._core_prepared_batch: prepared_batch.PreparedBatch | None = None
         self._router_providers = router_providers
         self._session_server_provider = session_server_provider
         self._inference_controller_provider = inference_controller_provider
@@ -142,8 +144,35 @@ class RolloutExecutor:
             self.generate_rollout, operation, set_weight_version=self.set_weight_version, **kwargs
         )
 
+    @rpc(enabled=False)
+    async def core_prefetch(self, rollout_id: int):
+        if getattr(self, "_core_prepared_batch", None) is not None:
+            raise RuntimeError("Only one prepared batch may be outstanding")
+        self._core_prepared_batch = prepared_batch.PreparedBatch(self, rollout_id)
+
+    @rpc(enabled=False)
+    @event_logger_context(lambda _self, rollout_id: dict(rollout_id=rollout_id))
+    async def core_get_prepared(self, rollout_id: int):
+        prepared = getattr(self, "_core_prepared_batch", None)
+        if prepared is None:
+            raise RuntimeError("No prepared batch is outstanding")
+        batch = await prepared.consume(rollout_id)
+        self._core_prepared_batch = None
+        self.rollout_id = rollout_id
+        self._rollouts_since_publish_of_model_id[None] += 1
+        return batch
+
+    @rpc(enabled=False)
+    async def core_cancel_prepared(self):
+        if (prepared := getattr(self, "_core_prepared_batch", None)) is not None:
+            try:
+                await prepared.close()
+            finally:
+                self._core_prepared_batch = None
+
     async def dispose(self) -> None:
         try:
+            await self.core_cancel_prepared()
             if getattr(self, "_diagnostic_writer", None) is not None:
                 await self._diagnostic_writer.close()
         finally:
@@ -168,17 +197,25 @@ class RolloutExecutor:
 
     @event_logger_context(lambda _self, rollout_id, trainer_model_id=None: dict(rollout_id=rollout_id))
     async def get(self, rollout_id: int, trainer_model_id: str | None = None) -> RolloutDataPack:
-        start_time = time.time()
         self.rollout_id = rollout_id
         self._rollouts_since_publish_of_model_id[trainer_model_id] += 1
         assert_weight_version_is_published(
             self.args, rollouts_since_publish=self._rollouts_since_publish_of_model_id[trainer_model_id]
         )
+        if getattr(self, "_core_prepared_batch", None) is not None:
+            raise RuntimeError("Consume or cancel the prepared batch before another get")
+        return await self._prepare_rollout(rollout_id, trainer_model_id)
+
+    async def _prepare_rollout(self, rollout_id, trainer_model_id=None, *, weight_version=None, reserve=False):
+        start_time = time.time()
         if (get_buffer_length := getattr(self.data_source, "get_buffer_length", None)) is not None:
             dashboard_hooks.report_data_buffer(get_buffer_length())
         with timer("rollout" if trainer_model_id is None else f"{trainer_model_id}/rollout"):
             data, metadata, metrics = await self._get_rollout_data(
-                rollout_id=rollout_id, trainer_model_id=trainer_model_id
+                rollout_id=rollout_id,
+                trainer_model_id=trainer_model_id,
+                weight_version=weight_version,
+                reserve=reserve,
             )
         diagnostic_started = time.perf_counter()
         if getattr(self, "_diagnostic_writer", None) is not None:
@@ -304,21 +341,27 @@ class RolloutExecutor:
         if self.args.ci_test:
             raise RuntimeError(f"CI eval {rollout_id} skipped: {reason}")
 
-    async def _get_rollout_data(self, rollout_id, trainer_model_id: str | None = None):
+    async def _get_rollout_data(
+        self, rollout_id, trainer_model_id: str | None = None, *, weight_version=None, reserve=False
+    ):
         if self.args.load_debug_rollout_data is not None:
             data, metadata = load_debug_rollout_data(self.args, rollout_id=rollout_id)
             metrics = None
         else:
             if not self.use_legacy_rollout_v1:
-                data = await asyncio.to_thread(
-                    call_rollout_function,
-                    self.generate_rollout,
-                    RolloutFnTrainInput(
-                        rollout_id=rollout_id,
-                        weight_version=self._weight_versions_of_model_id.get(trainer_model_id),
-                        trainer_model_id=trainer_model_id,
+                request = RolloutFnTrainInput(
+                    rollout_id=rollout_id,
+                    weight_version=(
+                        self._weight_versions_of_model_id.get(trainer_model_id)
+                        if weight_version is None
+                        else weight_version
                     ),
+                    trainer_model_id=trainer_model_id,
                 )
+                if reserve:
+                    data = await asyncio.wrap_future(async_utils.submit(self.generate_rollout.reserve(request)))
+                else:
+                    data = await asyncio.to_thread(call_rollout_function, self.generate_rollout, request)
             else:
                 data = await asyncio.to_thread(
                     call_rollout_fn, self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False

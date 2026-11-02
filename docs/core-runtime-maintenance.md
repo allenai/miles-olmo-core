@@ -174,3 +174,34 @@ startup but exhausted trainer GPU memory while allocating optimizer state,
 before any training step. Its driver W&B log correctly recorded exit code 1,
 and the job exited 1. An A100 gate needs a smaller trained checkpoint; reducing
 response length alone does not fix this optimizer-state capacity limit.
+
+
+### Prepared batch ownership
+
+The Core executor exposes `core_prefetch`, `core_get_prepared` and
+`core_cancel_prepared` for the one-update refresh schedule. The application starts
+one preparation task while the trainer works, targeting the published version
+plus one. Ordinary `get` remains sequential. The shared conversion function is
+used by both paths; CPU preparation does not include trainer GPU packing or
+current-policy scoring.
+
+`ManagedFullyAsyncRolloutFn.reserve` retains pristine prompts in the restart
+ledger. Each selected group keeps a completed-buffer slot until
+`release_reservation(consume=True)` transfers it to the executor and restores
+capacity. Prompts remain pending until the executor synchronously acknowledges
+them at final handoff, with no intervening await. The data source must serialize
+ledger mutations with its checkpoint cursor lock. The reservation owns a shielded
+producer-loop task; cleanup cancels and joins it before requeuing prompts. This
+avoids repeated cancellation from the cross-thread wrapper without depending on
+Python 3.11's task-cancellation inspection API. A shielded transfer result preserves
+recovery even when cancellation arrives after producer-side release. The executor owns any resulting
+object-store reference until consumption, and disposal cleans unused references.
+The application must cancel pending preparation before a terminal generation
+drain and must not overlap it with shared-engine evaluation's capacity changes.
+
+The expected publication version is checked again at consumption. Metrics under
+`rollout/prepared_batch` distinguish preparation from executor-side wait, but the
+application's acquisition stage remains the authority for RPC scheduling delay.
+These lightweight timing metrics remain enabled independently of diagnostic
+payload writing. Telemetry failures warn without preventing batch handoff, and
+prepared consumption carries the same rollout audit context as ordinary `get`.

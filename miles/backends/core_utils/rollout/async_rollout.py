@@ -77,6 +77,8 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         self._completed_put_wait_seconds = 0.0
         self._completed_put_started = None
         self._draining_groups: list[Any] | None = None
+        self._reserved_groups: list[Any] | None = None
+        self._reservation_task: asyncio.Task[Any] | None = None
         self._interrupted_groups: list[int] = []
         self._publication_paused = False
         self._drain_yield_at = 0.0
@@ -98,19 +100,69 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
             raise GenerationInterrupted("async producer requires recovery and current-weight publication")
         if self._worker is None and self._output is not None:
             self._worker = asyncio.create_task(self._worker_loop())
+        reserved = self._reserved_groups is not None
+        if self._draining_groups is not None or (reserved and asyncio.current_task() is not self._reservation_task):
+            raise RuntimeError("Only one async batch may drain or remain reserved")
         self._draining_groups = []
         try:
             result = await super().__call__(input)
             # A partial dequeue is not consumed training data. Commit the entire
             # batch only after the upstream drain and filtering complete.
-            self.data_source.acknowledge_groups(self._draining_groups)
+            if not reserved:
+                self.data_source.acknowledge_groups(self._draining_groups)
             result.metrics.update(self._errors.metrics())
             return result
         except BaseException:
-            self._interrupted_groups.extend(g[0].group_index for g in self._draining_groups)
+            if not reserved:
+                self._interrupted_groups.extend(g[0].group_index for g in self._draining_groups)
             raise
         finally:
             self._draining_groups = None
+
+    async def reserve(self, input):
+        """Drain at the future consuming version without committing prompt use."""
+        if self._reserved_groups is not None or self._draining_groups is not None:
+            raise RuntimeError("An async batch is already draining or reserved")
+        if self._output is None:
+            raise RuntimeError("Prepared batches require an initialized async buffer")
+        self._reserved_groups = []
+        task = asyncio.create_task(self(input))
+        self._reservation_task = task
+        try:
+            # Only release_reservation cancels the owned drain. Cancelling the
+            # cross-thread wrapper cannot interrupt its cleanup a second time.
+            return await asyncio.shield(task)
+        finally:
+            # A completed task retains its large sample result. Keep only the
+            # pristine prompt reservation once the executor owns that result.
+            if task.done() and self._reservation_task is task:
+                self._reservation_task = None
+
+    async def release_reservation(self, *, consume):
+        """Transfer reserved prompts to the consumer, or regenerate unused work.
+
+        Consumption leaves the checkpoint ledger pending. The executor commits
+        it synchronously with its final handoff, after this cross-loop await.
+        """
+        if self._reserved_groups is None:
+            if consume:
+                raise RuntimeError("No prepared batch reservation to consume")
+            return
+        task = self._reservation_task
+        if task is not None and not task.done():
+            if consume:
+                raise RuntimeError("Cannot consume a batch still being prepared")
+            # reserve shields this task from its caller; cleanup owns the
+            # cancellation, including on Python 3.10 (no Task.cancelling API).
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        groups = self._reserved_groups
+        if not consume and groups:
+            self.data_source.requeue_pending_groups([g[0].group_index for g in groups])
+        await self._output.release_prepared_capacity(len(groups))
+        self._reserved_groups = None
+        self._reservation_task = None
+        return groups
 
     async def _next_group(self, current_version: int | None, trainer_model_id: str | None = None) -> Any:
         if trainer_model_id is not None:
@@ -142,8 +194,8 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                     raise RuntimeError("fully-async worker exited unexpectedly")
                 if queue_get in done:
                     entry = queue_get.result()
-                    self._record_dequeued(entry)
                     recorded = True
+                    self._record_dequeued(entry)
                     return entry
                 logger.warning("No completed async rollout groups for 30 seconds")
         finally:
@@ -151,9 +203,21 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                 queue_get.cancel()
             await asyncio.gather(queue_get, return_exceptions=True)
             if not recorded and not queue_get.cancelled() and queue_get.exception() is None:
-                self._interrupted_groups.append(queue_get.result().prompt_group[0].group_index)
+                if self._reserved_groups is not None:
+                    self._record_dequeued(queue_get.result())
+                else:
+                    self._interrupted_groups.append(queue_get.result().prompt_group[0].group_index)
 
     def _record_dequeued(self, entry):
+        if self._reserved_groups is not None:
+            try:
+                self._output.retain_prepared_capacity()
+            except RuntimeError:
+                # The dequeue already happened. Preserve prompt recovery even
+                # when the capacity invariant fails, without crediting a slot.
+                self.data_source.requeue_pending_groups([entry.prompt_group[0].group_index])
+                raise
+            self._reserved_groups.append(entry.prompt_group)
         if self._draining_groups is None:
             self.data_source.acknowledge_groups([entry.prompt_group])
         else:

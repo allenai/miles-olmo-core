@@ -135,7 +135,11 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
             self._reservation_task = None
 
     async def release_reservation(self, *, consume):
-        """Commit accepted work, or regenerate unused work after joining its drain."""
+        """Transfer reserved prompts to the consumer, or regenerate unused work.
+
+        Consumption leaves the checkpoint ledger pending. The executor commits
+        it synchronously with its final handoff, after this cross-loop await.
+        """
         if self._reserved_groups is None:
             if consume:
                 raise RuntimeError("No prepared batch reservation to consume")
@@ -151,13 +155,12 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         groups = self._reserved_groups
-        if consume:
-            self.data_source.acknowledge_groups(groups)
-        elif groups:
+        if not consume and groups:
             self.data_source.requeue_pending_groups([g[0].group_index for g in groups])
         await self._output.release_prepared_capacity(len(groups))
         self._reserved_groups = None
         self._reservation_task = None
+        return groups
 
     async def _next_group(self, current_version: int | None, trainer_model_id: str | None = None) -> Any:
         if trainer_model_id is not None:

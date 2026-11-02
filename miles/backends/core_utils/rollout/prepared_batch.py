@@ -49,6 +49,7 @@ class PreparedBatch:
         self.version = current + 1
         self.started = time.monotonic()
         self.finished = None
+        self._release = None
         self.task = asyncio.create_task(self._prepare())
 
     async def _prepare(self):
@@ -66,7 +67,12 @@ class PreparedBatch:
         actual = self.executor._weight_versions_of_model_id.get(None)
         if actual != self.version:
             raise RuntimeError(f"Prepared batch expected policy {self.version}, published policy is {actual}")
-        await asyncio.wrap_future(async_utils.submit(self.executor.generate_rollout.release_reservation(consume=True)))
+        # Keep the transfer result even if this consumer is cancelled. Prompts
+        # remain in the checkpoint ledger until the no-await commit below.
+        self._release = asyncio.wrap_future(
+            async_utils.submit(self.executor.generate_rollout.release_reservation(consume=True))
+        )
+        groups = await asyncio.shield(self._release)
         timings = {
             "preparation_seconds": self.finished - self.started,
             "consumer_wait_seconds": time.monotonic() - waited_at,
@@ -82,6 +88,9 @@ class PreparedBatch:
             },
             step_key="rollout/step",
         )
+        # The data source serializes ledger mutations with its cursor lock.
+        # No await may separate acknowledgement from executor ownership handoff.
+        self.executor.data_source.acknowledge_groups(groups)
         return batch
 
     async def close(self):
@@ -91,9 +100,13 @@ class PreparedBatch:
         try:
             # Cancelling the cross-thread future signals cancellation; this call
             # joins the actual producer task before touching its reservation.
-            await asyncio.wrap_future(
-                async_utils.submit(self.executor.generate_rollout.release_reservation(consume=False))
-            )
+            if self._release is not None:
+                groups = await asyncio.shield(self._release)
+                self.executor.data_source.requeue_pending_groups([g[0].group_index for g in groups])
+            else:
+                await asyncio.wrap_future(
+                    async_utils.submit(self.executor.generate_rollout.release_reservation(consume=False))
+                )
         finally:
             if not self.task.cancelled() and self.task.exception() is None:
                 remove_rollout_data_refs(self.executor.args, self.task.result())

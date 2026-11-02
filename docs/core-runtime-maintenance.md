@@ -187,9 +187,12 @@ current-policy scoring.
 
 `ManagedFullyAsyncRolloutFn.reserve` retains pristine prompts in the restart
 ledger. Each selected group keeps a completed-buffer slot until
-`release_reservation(consume=True)` commits it. Cancellation joins the actual
-producer-loop task before requeuing prompts and restoring capacity; cancelling a
-cross-thread future alone is insufficient. The executor owns any resulting
+`release_reservation(consume=True)` transfers it to the executor and restores
+capacity. Prompts remain pending until the executor synchronously acknowledges
+them at final handoff, with no intervening await. The data source must serialize
+ledger mutations with its checkpoint cursor lock. Cancellation joins the actual
+producer-loop task before requeuing prompts; a shielded transfer result preserves
+recovery even when cancellation arrives after producer-side release. The executor owns any resulting
 object-store reference until consumption, and disposal cleans unused references.
 The application must cancel pending preparation before a terminal generation
 drain and must not overlap it with shared-engine evaluation's capacity changes.

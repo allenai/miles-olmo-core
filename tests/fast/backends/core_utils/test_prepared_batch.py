@@ -23,7 +23,8 @@ def executor():
     return SimpleNamespace(
         args=args,
         _weight_versions_of_model_id={None: 11},
-        generate_rollout=SimpleNamespace(release_reservation=AsyncMock()),
+        generate_rollout=SimpleNamespace(release_reservation=AsyncMock(return_value=[])),
+        data_source=SimpleNamespace(acknowledge_groups=Mock(), requeue_pending_groups=Mock()),
     )
 
 
@@ -46,6 +47,7 @@ async def test_one_version_ahead_and_wait_overlaps_work(monkeypatch):
     e._weight_versions_of_model_id[None] = 12
     assert await p.consume(7) is batch
     e.generate_rollout.release_reservation.assert_awaited_once_with(consume=True)
+    e.data_source.acknowledge_groups.assert_called_once_with([])
 
 
 @pytest.mark.parametrize("ready", [False, True])

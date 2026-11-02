@@ -1,6 +1,7 @@
 """Worker isolation, cold fallback and successful-teardown publication contract."""
 
 import asyncio
+import dataclasses
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ def policy(root, *, restore=True):
         image="sha256:" + "a" * 64,
         runtime_lock={},
         sources={k: {"sha256": "same"} for k in ("olmo-core", "miles", "open-instruct", "olmo-sglang")},
+        kernel_runtime={"triton": {"sha256": "compiler"}, "native_sources": {}},
         model_config={},
         run_config={"core": {}, "miles": {}},
         restore=restore,
@@ -128,6 +130,67 @@ def test_invalid_retention_path_cannot_create_reports():
         pytest.raises(ValueError, match="expiry"),
     ):
         startup.prepare(args, application_root="/unused")
+
+
+@pytest.fixture
+def driver_sources(tmp_path, monkeypatch):
+    application = tmp_path / "application"
+    lock = application / "runtime/miles/runtime.lock.json"
+    lock.parent.mkdir(parents=True)
+    lock.write_text(json.dumps({"base_image": {"docker_id": "sha256:" + "a" * 64}}))
+    packages = {}
+    for name in ("open_instruct", "olmo_core", "miles", "olmo_sglang", "sglang", "triton"):
+        root = (application if name == "open_instruct" else tmp_path / "installed") / name
+        root.mkdir(parents=True)
+        (root / "__init__.py").write_text("# package\n")
+        packages[name] = root
+    (packages["sglang"] / "kernel.so").write_bytes(b"native-library")
+    (packages["triton"] / "ptxas").write_bytes(b"extensionless-compiler-tool")
+    specs = {name: SimpleNamespace(submodule_search_locations=[str(root)]) for name, root in packages.items()}
+    monkeypatch.setattr(startup.util, "find_spec", specs.get)
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(json.dumps({"hidden_size": 128}))
+    values = dict(
+        compiler_cache=True,
+        compiler_cache_root=str(tmp_path / "shared"),
+        compiler_cache_restore=True,
+        compiler_cache_diagnostics=False,
+        compiler_cache_max_storage_bytes=1024,
+        compiler_cache_publish_interval_seconds=600,
+        precision="bf16",
+    )
+    config = dataclasses.make_dataclass("CoreConfig", [(key, type(value)) for key, value in values.items()])
+    args = SimpleNamespace(olmo_core=config(**values), hf_checkpoint=str(checkpoint), global_batch_size=128)
+    return args, application, packages, specs
+
+
+def test_enabled_prepare_fingerprints_installed_compiler_and_native_packages(driver_sources):
+    args, application, packages, _ = driver_sources
+    startup.prepare(args, application_root=application)
+    before = args.olmo_core_startup_cache
+    assert set(before["sources"]) == {"open-instruct", "olmo-core", "miles", "olmo-sglang", "sglang"}
+    assert before["kernel_runtime"]["triton"]["files"] == 2
+    assert before["kernel_runtime"]["native_sources"]["sglang"]["files"] == 1
+    assert before["model_config"] == {"hidden_size": 128}
+    assert before["run_config"] == {"core": {"precision": "bf16"}, "miles": {"global_batch_size": 128}}
+    assert Path(before["report_dir"]).is_dir()
+    assert "tilelang_runtime" not in before
+    (packages["triton"] / "ptxas").write_bytes(b"changed-compiler-tool")
+    startup.prepare(args, application_root=application)
+    assert args.olmo_core_startup_cache["kernel_runtime"]["triton"] != before["kernel_runtime"]["triton"]
+    assert args.olmo_core_startup_cache["sources"] == before["sources"]
+
+
+@pytest.mark.parametrize("package", ["sglang", "triton"])
+@pytest.mark.parametrize("spec", [None, SimpleNamespace(submodule_search_locations=[])])
+def test_enabled_prepare_rejects_missing_required_package_before_creating_reports(driver_sources, package, spec):
+    args, application, _, specs = driver_sources
+    specs[package] = spec
+    with pytest.raises(ValueError, match="sglang" if package == "sglang" else "Triton compiler"):
+        startup.prepare(args, application_root=application)
+    assert args.olmo_core_startup_cache is None
+    assert not Path(args.olmo_core.compiler_cache_root).exists()
 
 
 def test_publication_has_one_budget_and_cancels_ray_tasks(tmp_path, monkeypatch):

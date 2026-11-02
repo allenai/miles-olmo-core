@@ -21,8 +21,10 @@ from pathlib import Path
 from typing import Any, cast
 
 from miles.utils import logger_utils
+from miles.utils.compiler_cache import compilation_observer
 from miles.utils.compiler_cache import compiler_cache as cache
 from miles.utils.compiler_cache import compiler_identity as probes
+from miles.utils.compiler_cache import tilelang_cache, triton_compatibility
 
 logger = logger_utils.setup_logger(__name__)
 ENV = "OI_CORE_STARTUP_CACHE"
@@ -53,11 +55,26 @@ def prepare(args, *, application_root):
         lock_path = root / "runtime/miles/runtime.lock.json"
     lock = json.loads(lock_path.read_text())
     sources = {"open-instruct": cache.core_application_source(root / "open_instruct")}
-    for name, package in [("olmo-core", "olmo_core"), ("miles", "miles"), ("olmo-sglang", "olmo_sglang")]:
+    native_sources = {"open-instruct": triton_compatibility.native_source(root / "open_instruct")}
+    for name, package in [
+        ("olmo-core", "olmo_core"),
+        ("miles", "miles"),
+        ("olmo-sglang", "olmo_sglang"),
+        ("sglang", "sglang"),
+    ]:
         spec = util.find_spec(package)
         if spec is None or not spec.submodule_search_locations:
             raise ValueError(f"Cannot fingerprint installed source: {package}")
-        sources[name] = cache.source_identity(Path(next(iter(spec.submodule_search_locations))))
+        source_root = Path(next(iter(spec.submodule_search_locations)))
+        sources[name] = cache.source_identity(source_root)
+        native_sources[name] = triton_compatibility.native_source(source_root)
+    triton_spec = util.find_spec("triton")
+    if triton_spec is None or not triton_spec.submodule_search_locations:
+        raise ValueError("Cannot fingerprint the installed Triton compiler")
+    kernel_runtime = {
+        "triton": triton_compatibility.compiler_source(Path(next(iter(triton_spec.submodule_search_locations)))),
+        "native_sources": native_sources,
+    }
     core = dataclasses.asdict(args.olmo_core)
     for key in tuple(core):
         if key.startswith("compiler_cache"):
@@ -100,6 +117,7 @@ def prepare(args, *, application_root):
         image=lock["base_image"]["docker_id"],
         runtime_lock=lock,
         sources=sources,
+        kernel_runtime=kernel_runtime,
         model_config=json.loads((Path(args.hf_checkpoint) / "config.json").read_text()),
         run_config={"core": core, "miles": miles},
         restore=args.olmo_core.compiler_cache_restore,
@@ -107,6 +125,8 @@ def prepare(args, *, application_root):
         max_storage_bytes=args.olmo_core.compiler_cache_max_storage_bytes,
         publish_interval_seconds=args.olmo_core.compiler_cache_publish_interval_seconds,
     )
+    if getattr(args.olmo_core, "compiler_cache_tilelang", False):
+        args.olmo_core_startup_cache["tilelang_runtime"] = tilelang_cache.compiler_identity()
     logger.info("Core compiler cache: Triton enabled; worker reports in %s", report_dir)
 
 
@@ -235,6 +255,7 @@ def setup_worker():
     (local / "triton").mkdir()
     probes.validate_local_cache_controls(os.environ)
     os.environ["TRITON_CACHE_DIR"] = str(local / "triton")
+    tilelang_cache.configure(policy, local)
     ray = importlib.import_module("ray")
     report = dict(
         slot=policy["slot"],
@@ -247,27 +268,26 @@ def setup_worker():
     )
     try:
         hardware = probes.toolchain(dict(os.environ))
-        settings = {**policy["run_config"], "worker_slot": policy["slot"]}
-        key, identity = cache.fingerprint(
-            image=policy["image"],
-            runtime_lock=policy["runtime_lock"],
-            sources=policy["sources"],
-            model_config=policy["model_config"],
-            run_config=settings,
-            toolchain=hardware,
-            compiler_env=probes.compiler_environment(os.environ),
-            scope=cache.CORE_TRITON_SCOPE,
+        key, identity, provenance = triton_compatibility.fingerprint(
+            policy, hardware, probes.compiler_environment(os.environ)
         )
-        report.update(fingerprint=key, identity=identity)
+        report.update(fingerprint=key, identity=identity, provenance=provenance)
         report["restore"] = (
             cache.restore(Path(policy["shared"]), local, key, "triton")
             if policy["restore"]
             else {"family": "triton", "status": "cold"}
         )
         report["restored_files"] = len(cache.inventory(local / "triton"))
+        tilelang_cache.restore(policy, report, local)
     except Exception as error:
         # Compilation is still available locally; a cache failure is not a run failure.
         report["restore"] = {"family": "triton", "status": "unavailable", "reason": str(error)}
+    if policy["observe"] and "identity" in report:
+        try:
+            report["compatibility_explanation"] = triton_compatibility.explain_previous(policy["shared"], report)
+        except Exception as error:
+            report["compatibility_explanation"] = {"status": "unavailable", "reason": str(error)}
+        logger.info("Core compiler cache compatibility %s: %s", policy["slot"], report["compatibility_explanation"])
     report["setup_seconds"] = time.monotonic() - started
     report_path = Path(policy["report_dir"]) / f"{policy['slot']}-{uuid.uuid4().hex}.json"
     if policy["observe"]:
@@ -275,6 +295,7 @@ def setup_worker():
     report_path.write_bytes(cache.encoded(report))
     if policy["observe"]:
         observe_triton(local)
+        compilation_observer.install(local)
         # SGLang uses spawn: Python patches in the Ray coordinator do not carry
         # into its scheduler. This diagnostic-only hook observes those children.
         hook = local / "observer"
@@ -282,7 +303,9 @@ def setup_worker():
         (hook / "sitecustomize.py").write_text(
             "import os\nfrom pathlib import Path\n"
             "from miles.utils.compiler_cache.startup_cache import observe_triton\n"
+            "from miles.utils.compiler_cache.compilation_observer import install\n"
             "observe_triton(Path(os.environ['OI_CORE_CACHE_OBSERVE_ROOT']))\n"
+            "install(Path(os.environ['OI_CORE_CACHE_OBSERVE_ROOT']))\n"
         )
         os.environ["OI_CORE_CACHE_OBSERVE_ROOT"] = str(local)
         os.environ["PYTHONPATH"] = str(hook) + os.pathsep + os.environ.get("PYTHONPATH", "")
@@ -318,6 +341,8 @@ def publish_worker(report, *, retain_local=False):
     if not local.name.startswith("core-triton-") or local.parent != Path("/tmp"):
         raise ValueError("Unexpected worker cache directory")
     result = dict(slot=report["slot"], restore=report["restore"], setup_seconds=report["setup_seconds"])
+    if report.get("tilelang"):
+        result["tilelang"] = tilelang_cache.publish(report, local)
     try:
         if report.get("activity_directory"):
             result["activity_directory"] = archive_activity(report, local)
@@ -336,11 +361,16 @@ def publish_worker(report, *, retain_local=False):
         # Publication validates/hashes the snapshot; counting here need not hash it again.
         result["files_after"] = sum(path.is_file() for path in (local / "triton").rglob("*"))
         activity = {}
+        compiler_seconds = {}
         for path in local.glob("activity-*.jsonl"):
             for line in path.read_text().splitlines():
-                event = json.loads(line)["event"]
+                record = json.loads(line)
+                event = record["event"]
                 activity[event] = activity.get(event, 0) + 1
+                if event in {"compile_hit", "compile_miss"}:
+                    compiler_seconds[event] = compiler_seconds.get(event, 0.0) + record["compiler_microseconds"] / 1e6
         result["activity"] = activity
+        result["compiler_seconds"] = compiler_seconds
 
         def progress(event):
             logger.info("Core compiler cache publication: slot=%s %s", report["slot"], json.dumps(event))
@@ -352,7 +382,16 @@ def publish_worker(report, *, retain_local=False):
             "triton",
             progress=progress,
             max_storage_bytes=report.get("max_storage_bytes", cache.DEFAULT_MAX_STORAGE_BYTES),
+            isolate_triton_conflicts=report.get("identity", {}).get("compatibility_scope")
+            == triton_compatibility.SCOPE,
+            partial_triton=report.get("identity", {}).get("compatibility_scope") == triton_compatibility.SCOPE,
         )
+        if result["publish"].get("rejected_incoming_groups"):
+            logger.warning(
+                "Core compiler cache kept published bytes and rejected incoming groups: slot=%s groups=%s",
+                report["slot"],
+                result["publish"]["rejected_incoming_groups"],
+            )
         status = result["publish"]["status"]
         if status in {"published", "unchanged", "empty", "storage_limit"}:
             state_path.write_bytes(
@@ -476,7 +515,9 @@ async def _publish_progress(args, policy, state, rollout_id):
         report["publication_error"] = f"{type(error).__name__}: {error}"
         logger.warning("Core compiler cache progress publication unavailable: %s", report["publication_error"])
     state["capped_slots"].update(
-        worker["slot"] for worker in report["workers"] if worker.get("publish", {}).get("status") == "storage_limit"
+        worker["slot"]
+        for worker in report["workers"]
+        if worker.get("publish", {}).get("status") == "storage_limit" and not worker.get("tilelang")
     )
     report["seconds"] = time.monotonic() - started
     state["published"] += 1

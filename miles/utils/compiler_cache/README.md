@@ -41,34 +41,106 @@ single-node probe, including its broader cache families. Open Instruct's old
 Storage, lifecycle, subprocess, module-priming, and relocation tests live in
 `tests/fast/compiler_cache/`. The application keeps configuration and packaged
 runtime integration tests. A GPU cold/warm pair is needed to qualify reuse for
-a specific image, model, and topology. Moving source files changes fingerprints:
-compare cold/warm runs of the same new revision, rather than forcing old entries
-to match.
+a specific image, model, and topology. Legacy strict scopes hash source locations; the ordinary Triton policy below
+separates source provenance from artifact compatibility.
 
 ## Core Triton compatibility
 
-Ordinary startup uses the versioned `core-triton-v2` identity. It excludes only
-audited non-kernel differences; unknown settings continue to invalidate:
+Ordinary startup uses `core-triton-v3`. Compiler artifacts and experiment
+provenance have different identities. The full application/runtime source hashes
+and lock remain in each worker receipt as `provenance`; Python-only revisions do
+not invalidate every compiled kernel. Triton checks its own source/dependency,
+signature, specialization, backend and compiler-option keys when choosing each
+artifact. Changing a kernel still compiles a new specialization.
 
-| Input | Core Triton behavior |
-| --- | --- |
-| Admission budget, HTTP concurrency, global/rollout batch size, samples per prompt, rollout fleet size, policy lag and run deadline | Do not invalidate existing artifacts. Triton's own keys still distinguish any newly encountered kernel specialization. |
-| Known single-GPU serving workers | Share a role key across engine slots. Repeated identical visible GPU descriptions collapse to one; mixed hardware remains distinct. Mutable caches stay private to each worker. |
-| Trainer ranks, expert/tensor parallelism, microbatch size, packing, precision, kernel backends, compiler controls and unknown settings | Remain part of compatibility. Trainer ranks remain separate. |
-| Open Instruct source | Omit tests and the standalone `miles/evaluation` and `miles/distillation` trees. Other source changes, including new modules, still invalidate. |
-| Runtime lock | Omit the unused Megatron source entries and patches wholly between those sources. Core/MILES/SGLang pins, unknown sources and patches targeting Core remain significant. |
-| Base image, model configuration, GPU architecture/properties, driver and toolchain | Remain significant. |
+The outer compatibility key retains the binary base, actual device/toolchain,
+the complete installed Triton compiler package (including extensionless tools such
+as `ptxas`), native source and extensions in the
+application, MILES, OLMo-core, olmo-sglang and SGLang, model configuration,
+parallel geometry, compiler environment and unknown settings. Known non-kernel
+settings such as lag, batch size, prepared-batch overlap, layer timing and
+truncated-response reward gating are excluded. Trainer ranks remain separate;
+known equivalent TP1 serving slots continue sharing their role key. Private
+mutable directories, archive/file verification and collision rejection remain.
 
-The separate experimental multi-family wrapper retains its strict identity and
-full source fingerprint. Versioning deliberately prevents automatic adoption of
-old worker-specific cache keys: the first run of this revision may be cold. A
-new runtime image and Open Instruct runtime-pin update are required to deploy it.
-CPU tests establish identity and publication behavior; GPU reuse still requires
-qualification before treating the draft as a measured startup improvement.
+This scope applies **only to Triton**. It must not be used to restore Inductor,
+FA4/CuTe or other compiler families. Legacy v2 archives lack the compiler/native
+identity evidence, so v3 does not automatically import them. The first v3 run
+may be cold; subsequent Python orchestration changes should reuse its artifacts.
+
+With diagnostics enabled, `compatibility_explanation` compares the current
+identity with the last observed startup for the same model and worker slot.
+It reports changed field names, previous fingerprint and whether provenance
+changed. This bounded diagnostic pointer never selects an archive and is not
+proof that the previous run published successfully. Concurrent starts can change
+which observation is compared. Corrupt diagnostics cannot prevent ordinary
+restoration. Native cache decisions still come from the exact key and checksums.
+
+The optional Triton compilation listener adds `compile_hit` / `compile_miss`
+events with kernel names, source/specialization digests, numeric shape/flag
+constants, compiler microseconds and lowering-stage timings to
+`activity-PID.jsonl`. These differ from `group_hit` / `group_miss`, which count
+file-cache operations. Existing compilation listeners are preserved. CUDA graph
+capture, module loading and non-Triton compilers are outside these timings.
+
+`python tools/probe_triton_cache.py --output /output/cache-probe` is a bounded,
+single-GPU fresh-process qualification: cold, warm, changed Python provenance,
+changed kernel dependency, changed shape, and FA4 cold/warm. It exercises KDA
+forward/backward and SGLang expert inference, checks numerical outputs, and
+requires no Triton compilation in the unchanged warm phases. TileLang artifacts are also archived and restored into fresh directories, with
+its supported JIT diagnostics checking for unexpected warm compilation. These
+probes do not enable additional compiler families by default.
 
 Triton autotuning can record different timing measurements for the same key and
 candidate configurations on different workers. Publication retains the first
 valid record when only those measurements differ, and continues merging new
-kernel artifacts. The receipt counts `reused_autotune_records`. Different tuning
-keys, candidates, unknown record formats and conflicting compiled binaries still
-reject publication and preserve the last published generation.
+kernel artifacts. Different tuning keys/candidates or conflicting binaries reject the entire
+incoming kernel group. The previously published group stays byte-for-byte
+unchanged; unrelated new kernel groups can still be published. Receipts list
+`rejected_incoming_groups` and startup logs warn about them. Cross-group metadata
+remains a strict rejection; other compiler families retain strict publication.
+
+For the v3 Triton lifecycle, publication snapshots completed kernel groups
+independently. A group must have its committed child-path manifest (or be a
+qualified standalone runtime library/autotuning record), and its source and copy
+must remain identical during copying. Incomplete, transient or changing groups
+are skipped and reported as `skipped_live_groups`; they can be retried on the
+next interval. Stable groups can therefore be saved while another kernel is
+compiling. Archive checksums and restore validation are unchanged.
+
+## Opt-in TileLang lifecycle
+
+The companion [Open Instruct PR #2140](https://github.com/allenai/open-instruct/pull/2140)
+adds `core.compiler_cache_tilelang` (RunSpec `compiler_cache.tilelang`). This
+application option is required to activate the lifecycle; without it, the
+defaulted lookup in `prepare()` leaves TileLang caching disabled. It enables a separate
+`core-tilelang-v1` compatibility envelope. It fingerprints installed TileLang
+Python/native/compiler sources, including its bundled TVM, in addition to the
+base runtime, device/toolchain and compile settings. Native-library stamping is
+forced on. This remains opt-in; qualify output/gradient equivalence on the intended
+model, hardware and topology before depending on it for production restarts.
+
+The mutable cache and compiler scratch are separate private directories. Active
+`.staging` exports and changing snapshots are rejected; publication retries on
+a later interval. Independent TileLang receipts and storage caps prevent its
+state from being mistaken for Triton hits. Diagnostics use TileLang's supported
+`TILELANG_JIT_DIAGNOSTICS` phase logging.
+
+## FLA convolution specialization
+
+The pinned FLA 0.5.2 convolution kernels declared the autotuning bucket
+`NB = ceil(batch * tokens / 1024)` as a compile-time constant although neither
+kernel uses it in arithmetic. Core's KDA setup now installs a guarded adapter
+that makes NB a non-specialized runtime argument. The autotuner retains its
+original NB keys and all candidate configurations; different workload buckets
+can still choose different launch parameters while sharing compiled candidates.
+Unexpected versions or declarations, a missing NB autotuning key, or an
+already-used tuner produce a warning and retain the original kernels. The AST
+guard still rejects body references to NB as a hard error. Both kernels are
+prepared before either is replaced. Native Triton keys distinguish the adapted signature.
+
+`python tools/probe_fla_conv_cache.py --output /output/conv-probe` compares the
+original and adapted kernels at identical launch parameters, including packed
+and unpacked sequences, 32K lengths, large channel widths, bias/residual/state
+paths, and forward/backward checksums. A fresh restored phase must compile
+nothing. The tiny Core optimizer probe separately exercises production tuning.

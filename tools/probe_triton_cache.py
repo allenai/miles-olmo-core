@@ -1,0 +1,323 @@
+"""Bounded fresh-process cache qualification on one GPU; no model downloads.
+
+Run inside the pinned Open Instruct image with its source root on PYTHONPATH:
+python tools/probe_triton_cache.py --output /output/cache-probe
+Exercises a changed kernel, KDA forward/backward, and FA4 forward/backward.
+Reports compilation separately from process startup and checks numerical reuse.
+"""
+
+import argparse
+import collections
+import importlib
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import time
+from logging import INFO, StreamHandler
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+from miles.utils import logger_utils
+from miles.utils.compiler_cache import compiler_cache as cache
+from miles.utils.compiler_cache import startup_cache, tilelang_cache
+
+KERNEL = """import triton
+from triton import language as tl
+
+@triton.jit
+def helper(x):
+    return x * FACTOR
+
+@triton.jit
+def transform(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    values = tl.load(X + offsets, offsets < N, other=0)
+    tl.store(Y + offsets, helper(values), offsets < N)
+"""
+
+
+def _triton_workload(root, phase):
+    # Backend imports are deliberately after setup_worker installs the caches.
+    torch = importlib.import_module("torch")
+    # Use the same pinned FLA compatibility initialization as build_train_module.
+    importlib.import_module("miles.backends.core_utils.fla_compat").install_kda_triton_compat()
+    kda = importlib.import_module("fla.ops.kda")
+    path = root / "probe_kernel.py"
+    factor = 3 if phase == "kernel-change" else 2
+    path.write_text(KERNEL.replace("FACTOR", str(factor)))
+    spec = importlib.util.spec_from_file_location("probe_kernel", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    n = 2048 if phase == "shape-change" else 1024
+    x = torch.arange(n, device="cuda", dtype=torch.float32)
+    y = torch.empty_like(x)
+    module.transform[((n + 255) // 256,)](x, y, n, 256)
+    torch.testing.assert_close(y, x * factor, rtol=0, atol=0)
+    torch.manual_seed(17)
+    print(f"PROBE_SERVING_START {phase}", flush=True)
+    saved = _serving_workload(torch, root)
+    # Different packed sequence counts exercise variable-length trainer kernels.
+    for count in (1, 4):
+        print(f"PROBE_KDA_START {phase} sequences={count}", flush=True)
+        shape = (1, 512, 4, 128)
+        q, k, v = [torch.randn(shape, device="cuda", dtype=torch.bfloat16, requires_grad=True) for _ in range(3)]
+        g = torch.full(shape, -0.1, device="cuda", dtype=torch.float32, requires_grad=True)
+        beta = torch.full(shape[:-1], 0.1, device="cuda", dtype=torch.float32, requires_grad=True)
+        cu_cpu = torch.arange(0, 513, 512 // count, dtype=torch.int32)
+        out, _ = kda.chunk_kda(
+            q, k, v, g, beta, cu_seqlens=cu_cpu.cuda(), cu_seqlens_cpu=cu_cpu, use_qk_l2norm_in_kernel=True
+        )
+        out.float().square().mean().backward()
+        for name, tensor in [("output", out), ("q_grad", q.grad), ("k_grad", k.grad), ("v_grad", v.grad)]:
+            assert torch.isfinite(tensor).all(), name
+            saved[f"{count}/{name}"] = tensor.detach().cpu()
+    torch.cuda.synchronize()
+    return saved
+
+
+def _model_config(root):
+    config_root = root / "serving-config"
+    config_root.mkdir(exist_ok=True)
+    (config_root / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3ForCausalLM"],
+                "model_type": "qwen3",
+                "hidden_size": 128,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "head_dim": 64,
+                "intermediate_size": 256,
+                "vocab_size": 256,
+                "max_position_embeddings": 1024,
+            }
+        )
+    )
+    return config_root
+
+
+def _serving_workload(torch, root):
+    runtime_context = importlib.import_module("sglang.srt.runtime_context")
+    server_args = importlib.import_module("sglang.srt.server_args")
+    config_root = _model_config(root)
+    runtime_context.publish(
+        server_args.ServerArgs(model_path=str(config_root), disable_cuda_graph=True), role="scheduler"
+    )
+    parallel = importlib.import_module("sglang.srt.distributed.parallel_state")
+    parallel.init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method=f"file://{root / ('distributed-' + str(os.getpid()))}",
+        backend="nccl",
+    )
+    parallel.initialize_model_parallel()
+    moe = importlib.import_module("sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe")
+    torch.manual_seed(23)
+    x = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
+    w1 = torch.randn(4, 512, 128, device="cuda", dtype=torch.bfloat16) * 0.02
+    w2 = torch.randn(4, 128, 256, device="cuda", dtype=torch.bfloat16) * 0.02
+    ids = torch.arange(32, device="cuda", dtype=torch.int32).reshape(16, 2) % 4
+    weights = torch.full((16, 2), 0.5, device="cuda")
+    config = moe.MoeRunnerConfig(num_experts=4, num_local_experts=4, top_k=2, inplace=False)
+    out = moe.fused_experts(x, w1, w2, SimpleNamespace(topk_weights=weights, topk_ids=ids), config)
+    expected = torch.zeros_like(x, dtype=torch.float32)
+    for row in range(16):
+        for sibling in range(2):
+            expert = int(ids[row, sibling])
+            gate, up = (w1[expert].float() @ x[row].float()).chunk(2)
+            expected[row] += 0.5 * (w2[expert].float() @ (torch.nn.functional.silu(gate) * up))
+    torch.testing.assert_close(out.float(), expected, atol=0.002, rtol=0.03)
+    parallel.destroy_model_parallel()
+    torch.distributed.destroy_process_group()
+    return {"serving_moe": out.cpu()}
+
+
+def _fa4_workload():
+    torch = importlib.import_module("torch")
+    attention = importlib.import_module("flash_attn.cute")
+    cute = importlib.import_module("cutlass.cute")
+    original_compile = cute.compile
+    metrics = {"compile_calls": 0, "compile_seconds": 0.0}
+
+    def compile_observed(*args, **kwargs):
+        started = time.monotonic()
+        try:
+            return original_compile(*args, **kwargs)
+        finally:
+            metrics["compile_calls"] += 1
+            metrics["compile_seconds"] += time.monotonic() - started
+
+    torch.manual_seed(17)
+    q, k, v = [
+        torch.randn((1, 256, 4, 128), device="cuda", dtype=torch.bfloat16, requires_grad=True) for _ in range(3)
+    ]
+    with mock.patch.object(cute, "compile", compile_observed):
+        out, _ = attention.flash_attn_func(q, k, v, causal=True)
+        out.float().square().mean().backward()
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.detach().transpose(1, 2), k.detach().transpose(1, 2), v.detach().transpose(1, 2), is_causal=True
+    ).transpose(1, 2)
+    torch.testing.assert_close(out, expected, atol=0.02, rtol=0.02)
+    torch.cuda.synchronize()
+    return {
+        "output": out.detach().cpu(),
+        "q_grad": q.grad.cpu(),
+        "k_grad": k.grad.cpu(),
+        "v_grad": v.grad.cpu(),
+    }, metrics
+
+
+def _child(root, phase):
+    print(f"PROBE_PHASE_START {phase}", flush=True)
+    diagnostics = logger_utils.setup_logger("tilelang.jit.diagnostics")
+    diagnostics.setLevel(INFO)
+    diagnostics.addHandler(StreamHandler(sys.stdout))
+    started = time.monotonic()
+    reports = root / phase / "reports"
+    reports.mkdir(parents=True)
+    configuration = importlib.import_module("open_instruct.miles.configuration.config")
+    args = SimpleNamespace(
+        olmo_core=configuration.CoreConfig(
+            compiler_cache_root=str(root / "shared"),
+            compiler_cache_diagnostics=True,
+            compiler_cache_max_storage_bytes=2 * 1024**3,
+        ),
+        hf_checkpoint=str(_model_config(root)),
+    )
+    application_root = Path(importlib.util.find_spec("open_instruct").submodule_search_locations[0]).parent
+    startup_cache.prepare(args, application_root=application_root)
+    descriptor = dict(args.olmo_core_startup_cache, report_dir=str(reports), slot="trainer-engine-actor-0-0")
+    # Exercise the candidate lifecycle even when the base image predates the
+    # application opt-in field. No production cache or model weights are used.
+    descriptor["tilelang_runtime"] = tilelang_cache.compiler_identity()
+    # Simulate a changed Python deployment without changing compiler/native code.
+    if phase == "orchestration":
+        descriptor["sources"]["open-instruct"]["sha256"] = cache.digest(
+            {"original": descriptor["sources"]["open-instruct"], "edit": "queue-only"}
+        )
+    descriptor["run_config"]["core"]["prepared_batch_overlap"] = phase == "orchestration"
+    os.environ[startup_cache.ENV] = json.dumps(descriptor)
+    startup_cache.setup_worker()
+    report = json.loads(next(reports.glob("*.json")).read_text())
+    assert report["restore"]["status"] in {"miss", "hit"}, report
+    setup_seconds = time.monotonic() - started
+    print(f"PROBE_SETUP_DONE {phase} seconds={setup_seconds:.3f} restore={report['restore']}", flush=True)
+    started = time.monotonic()
+    fa4_metrics = None
+    try:
+        if phase.startswith("fa4"):
+            values, fa4_metrics = _fa4_workload()
+        else:
+            values = _triton_workload(root, phase)
+    finally:
+        startup_cache.archive_activity(report, Path(report["local"]))
+    elapsed = time.monotonic() - started
+    torch = importlib.import_module("torch")
+    baseline = root / ("fa4-cold" if phase.startswith("fa4") else "cold") / "outputs.pt"
+    if baseline.exists():
+        previous = torch.load(baseline, weights_only=True)
+        for name, value in values.items():
+            torch.testing.assert_close(value, previous[name], rtol=0, atol=0)
+    torch.save(values, root / phase / "outputs.pt")
+    published = startup_cache.publish_worker(report, retain_local=True)
+    events = []
+    for path in Path(report["local"]).glob("activity-*.jsonl"):
+        events.extend(json.loads(line) for line in path.read_text().splitlines())
+    summary = dict(
+        phase=phase,
+        setup_seconds=setup_seconds,
+        workload_seconds=elapsed,
+        restore=report["restore"],
+        fingerprint=report["fingerprint"],
+        explanation=report.get("compatibility_explanation"),
+        publish=published.get("publish"),
+        tilelang=published.get("tilelang"),
+        fa4=fa4_metrics,
+        events=dict(collections.Counter(e["event"] for e in events)),
+        compile_seconds=sum(e.get("compiler_microseconds", 0) for e in events if e["event"] == "compile_miss") / 1e6,
+        numerical_checks="passed",
+    )
+    (root / phase / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    print(json.dumps(summary), flush=True)
+
+
+def run_phase(command, environment, log_path):
+    """Stream bounded child progress while retaining a per-phase evidence file."""
+    started = time.monotonic()
+    with log_path.open("w") as log, log_path.open() as reader:
+        process = subprocess.Popen(command, env=environment, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            while process.poll() is None:
+                remaining = 600 - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, 600)
+                try:
+                    process.wait(timeout=min(30, remaining))
+                except subprocess.TimeoutExpired:
+                    pass
+                print(reader.read(), end="", flush=True)
+            print(reader.read(), end="", flush=True)
+            if process.returncode:
+                raise subprocess.CalledProcessError(process.returncode, command)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--phase")
+    options = parser.parse_args()
+    root = options.output.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    if options.phase:
+        _child(root, options.phase)
+        return
+    env = dict(
+        os.environ,
+        PYTHONDONTWRITEBYTECODE="1",
+        FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED="1",
+        FLASH_ATTENTION_CUTE_DSL_CACHE_DIR=str(root / "fa4-cache"),
+        TILELANG_JIT_DIAGNOSTICS="1",
+        TILELANG_KERNEL_CACHE_USE_LIB_STAMP="1",
+    )
+    results = []
+    for phase in ("cold", "warm", "orchestration", "kernel-change", "shape-change", "fa4-cold", "fa4-warm"):
+        command = [sys.executable, __file__, "--output", str(root), "--phase", phase]
+        phase_env = dict(env)
+        if phase.startswith("fa4"):
+            private = root / phase / "private"
+            (private / "fa4").mkdir(parents=True)
+            phase_env["FLASH_ATTENTION_CUTE_DSL_CACHE_DIR"] = str(private / "fa4")
+            if phase == "fa4-warm":
+                restored = cache.restore(root / "fa4-shared", private, cache.digest("fa4-probe"), "fa4")
+                assert restored["status"] == "hit", restored
+        run_phase(command, phase_env, root / f"{phase}.log")
+        if phase == "fa4-cold":
+            published = cache.publish(root / "fa4-shared", private, cache.digest("fa4-probe"), "fa4")
+            assert published["status"] == "published", published
+            (root / "fa4-publication.json").write_text(json.dumps(published, indent=2) + "\n")
+        results.append(json.loads((root / phase / "summary.json").read_text()))
+    assert results[0]["events"].get("compile_miss", 0) > 0, results[0]
+    for result in results[1:3]:
+        assert result["restore"]["status"] == "hit", result
+        assert result["events"].get("compile_miss", 0) == 0, result
+        assert result["tilelang"]["restore"]["status"] == "hit", result
+        assert "phase start: cache.compile" not in (root / f"{result['phase']}.log").read_text()
+    for result in results[3:5]:
+        assert result["events"].get("compile_miss", 0) > 0, result
+    assert results[-2]["fa4"]["compile_calls"] > 0, results[-2]
+    assert results[-1]["fa4"]["compile_calls"] == 0, results[-1]
+    (root / "summary.json").write_text(json.dumps(results, indent=2) + "\n")
+    print("CACHE_PROBE_PASSED", flush=True)
+
+
+if __name__ == "__main__":
+    main()

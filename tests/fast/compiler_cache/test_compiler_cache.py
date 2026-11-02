@@ -565,9 +565,9 @@ def test_publication_stages_tree_locally_and_upload_failure_keeps_current(tmp_pa
     original_snapshot = cache.snapshot
     original_copy = cache.shutil.copy2
 
-    def snapshot(source, destination, family):
+    def snapshot(source, destination, family, **kwargs):
         assert destination.is_relative_to(local)
-        return original_snapshot(source, destination, family)
+        return original_snapshot(source, destination, family, **kwargs)
 
     def failed_upload(source, destination, *args, **kwargs):
         if Path(destination).is_relative_to(shared):

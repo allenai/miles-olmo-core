@@ -88,14 +88,15 @@ def publish(report, local):
                 )
     except Exception as error:
         result["publish"] = {"family": "tilelang", "status": "rejected", "reason": f"{type(error).__name__}: {error}"}
-        logger.warning(
-            "SHARED TILELANG CACHE PUBLICATION FAILED: worker=%s shared=%s (errno=%s): %s; "
-            "local cache retained at %s; training can continue but new artifacts were not confirmed saved",
-            report["slot"],
-            report["shared"],
-            getattr(error, "errno", None),
-            error,
-            local,
-        )
+        if isinstance(error, OSError):
+            logger.warning(
+                "SHARED TILELANG CACHE PUBLICATION FAILED: worker=%s shared=%s (errno=%s): %s; "
+                "local cache retained at %s; training can continue but new artifacts were not confirmed saved",
+                report["slot"],
+                report["shared"],
+                error.errno,
+                error,
+                local,
+            )
     logger.info("Core TileLang cache publication: slot=%s %s", report["slot"], result)
     return result

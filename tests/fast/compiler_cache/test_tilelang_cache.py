@@ -78,7 +78,15 @@ def test_absent_opt_in_leaves_environment_and_report_unchanged(tmp_path, monkeyp
     assert "tilelang" not in report
 
 
-def test_publication_failure_is_nonfatal_and_retryable(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "Compiler cache changed during snapshot",
+        "TileLang publication deferred: an atomic kernel export is in progress",
+    ],
+)
+def test_publication_failure_is_nonfatal_and_retryable(tmp_path, monkeypatch, caplog, reason):
+    caplog.set_level("INFO", logger=tilelang_cache.__name__)
     monkeypatch.setattr(tilelang_cache.os, "environ", {})
     report = worker(tmp_path)
     tilelang_cache.configure(descriptor(tmp_path), tmp_path)
@@ -86,11 +94,16 @@ def test_publication_failure_is_nonfatal_and_retryable(tmp_path, monkeypatch):
     (tmp_path / "tilelang/executable.so").write_bytes(b"compiled")
 
     def fail(*args, **kwargs):
-        raise ValueError("changed during snapshot")
+        raise ValueError(reason)
 
+    original = cache.publish
     monkeypatch.setattr(cache, "publish", fail)
     assert tilelang_cache.publish(report, tmp_path)["publish"]["status"] == "rejected"
     assert not (tmp_path / "tilelang-publication-state.json").exists()
+    assert reason in caplog.text
+    assert not any(r.levelname == "WARNING" for r in caplog.records)
+    monkeypatch.setattr(cache, "publish", original)
+    assert tilelang_cache.publish(report, tmp_path)["publish"]["status"] == "published"
 
 
 @pytest.mark.parametrize("code", [errno.ENOSPC, errno.EROFS, errno.EACCES])

@@ -38,12 +38,20 @@ If the driver cannot create shared cache reports (for example, the cache volume
 is full, read-only or inaccessible), it logs the path and errno and uses ordinary
 local compiler caches for that attempt, without shared restore or publication.
 If a worker cannot write its shared report after setup, it retains its private
-local cache, including any successfully restored artifacts, and continues;
-shared publication may be unavailable. Invalid cache configuration still fails
+local cache, including any successfully restored artifacts, and continues.
+Without a readable report, the driver cannot publish that worker's cache or
+remove it at teardown. These directories can accumulate across worker restarts
+within the same container; independent containers need not share `/tmp`.
+Invalid cache configuration still fails
 validation. This fallback covers optional cache I/O, not an unwritable training
 output/checkpoint filesystem or a full node-local compiler cache.
-Startup and publication failures emit explicit `WARNING` messages identifying
+Startup and publication I/O failures emit explicit `WARNING` messages identifying
 the affected path, worker where applicable, errno and local-cache fallback.
+Expected live-snapshot deferrals remain informational, with their rejection
+reason recorded. Worker reports are committed by atomic rename; failed `.pending`
+files are ignored and left to the shared root's expiry policy. Unreadable or
+malformed reports are skipped individually with warnings, so healthy workers
+can still publish.
 During live training, failed Triton/TileLang publications retain local artifacts
 and remain retryable; their structured failure receipts are preserved as well.
 

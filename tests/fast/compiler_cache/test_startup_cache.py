@@ -257,7 +257,41 @@ def test_worker_report_failure_preserves_local_compilation(tmp_path, monkeypatch
     assert f"errno={code}" in caplog.text
     assert descriptor["report_dir"] in caplog.text
     assert "continuing with local compiler cache" in caplog.text
+    assert "cannot be published or cleaned up by the driver" in caplog.text
     assert any(r.levelname == "WARNING" and "SHARED COMPILER CACHE REPORT FAILED" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("failure_stage", ["write", "rename"])
+def test_worker_report_commit_never_exposes_partial_json(tmp_path, monkeypatch, failure_stage):
+    healthy = {"slot": "healthy", "fingerprint": "a" * 64}
+    startup._write_worker_report(tmp_path / "healthy.json", healthy)
+    target = tmp_path / "new.json"
+    incoming = {"slot": "new", "fingerprint": "b" * 64}
+    original_write = Path.write_bytes
+
+    def partial_write(path, data):
+        original_write(path, data[:24])
+        assert startup._worker_reports(tmp_path) == ([healthy], [])
+        raise OSError(errno.ENOSPC, "injected mid-write failure", str(path))
+
+    def failed_rename(path, destination):
+        assert startup._worker_reports(tmp_path) == ([healthy], [])
+        raise OSError(errno.EACCES, "injected rename failure", str(destination))
+
+    with monkeypatch.context() as patch:
+        if failure_stage == "write":
+            patch.setattr(Path, "write_bytes", partial_write)
+        else:
+            patch.setattr(Path, "replace", failed_rename)
+        with pytest.raises(OSError):
+            startup._write_worker_report(target, incoming)
+    assert not target.exists()
+    assert target.with_suffix(".json.pending").is_file()
+    assert startup._worker_reports(tmp_path) == ([healthy], [])
+    startup._write_worker_report(target, incoming)
+    assert json.loads(target.read_text()) == incoming
+    assert not target.with_suffix(".json.pending").exists()
+    assert startup._worker_reports(tmp_path) == ([healthy, incoming], [])
 
 
 def test_publication_has_one_budget_and_cancels_ray_tasks(tmp_path, monkeypatch):

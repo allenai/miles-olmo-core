@@ -14,26 +14,32 @@ logger = logger_utils.setup_logger(__name__)
 
 def enabled(args):
     """Only the single-update, disaggregated refresh schedule predicts v + 1."""
+    return disabled_reason(args) is None
+
+
+def disabled_reason(args):
+    """Return the first failed gate, in evaluation order, or None if eligible."""
     core = getattr(args, "olmo_core", None)
-    return (
-        getattr(core, "prepared_batch_overlap", False)
-        and getattr(core, "publication_mode", None) == "refresh"
-        and args.fully_async
-        and not args.offload_rollout
-        and not getattr(args, "colocate", False)
-        and args.rollout_batch_size * args.n_samples_per_prompt == args.global_batch_size
-        and args.update_weights_interval == 1
-        and args.async_data_buffer_capacity_factor >= 1
-        and not any(
-            getattr(args, name, False)
-            for name in (
-                "debug_train_only",
-                "debug_rollout_only",
-                "debug_skip_weight_update",
-                "load_debug_rollout_data",
-            )
-        )
-    )
+    if not getattr(core, "prepared_batch_overlap", False):
+        return "core.prepared_batch_overlap is false"
+    if getattr(core, "publication_mode", None) != "refresh":
+        return "core.publication_mode must be refresh"
+    if not args.fully_async:
+        return "fully_async must be true"
+    if args.offload_rollout:
+        return "offload_rollout must be false"
+    if getattr(args, "colocate", False):
+        return "colocate must be false"
+    if args.rollout_batch_size * args.n_samples_per_prompt != args.global_batch_size:
+        return "rollout_batch_size * n_samples_per_prompt must equal global_batch_size (one update per collection)"
+    if args.update_weights_interval != 1:
+        return "update_weights_interval must be 1"
+    if not args.async_data_buffer_capacity_factor >= 1:
+        return "async_data_buffer_capacity_factor must be at least 1"
+    for name in ("debug_train_only", "debug_rollout_only", "debug_skip_weight_update", "load_debug_rollout_data"):
+        if getattr(args, name, False):
+            return f"{name} must be disabled"
+    return None
 
 
 class PreparedBatch:

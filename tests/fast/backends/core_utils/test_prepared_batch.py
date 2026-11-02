@@ -31,6 +31,39 @@ def executor():
     )
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("core.prepared_batch_overlap", False),
+        ("core.publication_mode", "barrier"),
+        ("fully_async", False),
+        ("offload_rollout", True),
+        ("colocate", True),
+        ("global_batch_size", 512),
+        ("update_weights_interval", 2),
+        ("async_data_buffer_capacity_factor", 0.5),
+        ("debug_train_only", True),
+        ("debug_rollout_only", True),
+        ("debug_skip_weight_update", True),
+        ("load_debug_rollout_data", "/tmp/saved-rollout"),
+    ],
+)
+def test_gate_reason_matches_actual_eligibility(field, value):
+    args = executor().args
+    assert prepared_batch.enabled(args)
+    assert prepared_batch.disabled_reason(args) is None
+    target = args.olmo_core if field.startswith("core.") else args
+    setattr(target, field.removeprefix("core."), value)
+    assert not prepared_batch.enabled(args)
+    assert field in prepared_batch.disabled_reason(args)
+
+
+def test_disabled_option_short_circuits_other_schedule_fields():
+    args = SimpleNamespace(olmo_core=SimpleNamespace(prepared_batch_overlap=False))
+    assert not prepared_batch.enabled(args)
+    assert prepared_batch.disabled_reason(args) == "core.prepared_batch_overlap is false"
+
+
 async def test_one_version_ahead_and_wait_overlaps_work(monkeypatch):
     e = executor()
     ready = asyncio.Event()

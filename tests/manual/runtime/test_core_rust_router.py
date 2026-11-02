@@ -68,7 +68,13 @@ def runtime(tmp_path, request):
             if data["rid"] == "held":
                 state["entered"].set()
                 assert state["release"].wait(15)
-            if data["rid"] == "disconnect":
+            if data["rid"] in ("disconnect", "truncated_body"):
+                if data["rid"] == "truncated_body":
+                    self.send_response(200)
+                    self.send_header("Content-Length", "100000")
+                    self.end_headers()
+                    self.wfile.write(b'{"partial":')
+                    self.wfile.flush()
                 self.close_connection = True
                 self.connection.shutdown(socket.SHUT_RDWR)
                 self.connection.close()
@@ -254,13 +260,14 @@ async def test_rust_launch_contract_disables_all_independent_recovery(runtime, m
             await cell.dispose()
 
 
-async def test_disconnected_engine_is_reported_to_group_retry(runtime, monkeypatch):
+@pytest.mark.parametrize("failure_mode", ["disconnect", "truncated_body"])
+async def test_disconnected_engine_is_reported_to_group_retry(runtime, monkeypatch, failure_mode):
     async with httpx.AsyncClient(timeout=20) as client:
         monkeypatch.setattr(GeneralHttpClientProvider, "client", lambda: client)
         cell = make_cell(runtime)
         try:
             await cell.mark_weights_ready()
-            response = await client.post(runtime.router + "/generate", json=payload("disconnect"))
+            response = await client.post(runtime.router + "/generate", json=payload(failure_mode))
             with pytest.raises(httpx.HTTPStatusError) as failure:
                 response.raise_for_status()
             assert rollout_errors.recovery_category(failure.value) == "transport", response.text

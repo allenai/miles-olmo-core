@@ -212,10 +212,17 @@ async def create_training_model(args, *, handle: BaseWorkerHandle, trainer_id: s
     return TrainerInfo(handle=handle, restored_rollout_id=restored_rollout_id, start_rollout_id=start_rollout_id)
 
 
-# TODO: move (when reorganizing files)
-async def create_training_models(
-    args, rollout_executor: BaseWorkerHandle
-) -> tuple[BaseWorkerHandle, BaseWorkerHandle | None]:
+class InitializedTrainingModels(NamedTuple):
+    actor: TrainerInfo
+    critic: TrainerInfo | None
+
+
+async def initialize_training_models(args) -> InitializedTrainingModels:
+    """Initialize trainers without requiring inference or a rollout executor.
+
+    The caller owns the returned handles. Connecting rollout metadata and restoring
+    its cursor is a separate barrier; do not publish weights or train before it.
+    """
     trainer_configs = compute_trainer_configs(args)
     handles = create_trainer_handles(args, trainer_configs=trainer_configs)
     resumed = await take_over_trainers(args, handles=handles)
@@ -247,12 +254,23 @@ async def create_training_models(
             not critic_configs
         ), f"a run without --use-critic needs no critic, but the trainer configs are {trainer_configs}"
 
-    args.start_rollout_id = actor_info.start_rollout_id
+    return InitializedTrainingModels(actor=actor_info, critic=critic_info)
 
-    await rollout_executor.set_train_parallel_config(await actor_info.handle.get_train_parallel_config())
+
+async def connect_training_models(args, models: InitializedTrainingModels, rollout_executor: BaseWorkerHandle) -> None:
+    """Commit the restored rollout boundary after both initialization branches finish."""
+    args.start_rollout_id = models.actor.start_rollout_id
+    await rollout_executor.set_train_parallel_config(await models.actor.handle.get_train_parallel_config())
     await rollout_executor.load(args.start_rollout_id - 1)
 
-    return actor_info.handle, critic_info.handle if critic_info is not None else None
+
+async def create_training_models(
+    args, rollout_executor: BaseWorkerHandle
+) -> tuple[BaseWorkerHandle, BaseWorkerHandle | None]:
+    # Preserve the sequential entrypoint for existing upstream callers.
+    models = await initialize_training_models(args)
+    await connect_training_models(args, models, rollout_executor)
+    return models.actor.handle, models.critic.handle if models.critic is not None else None
 
 
 # TODO: move (when reorganizing files)

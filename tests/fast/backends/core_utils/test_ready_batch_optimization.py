@@ -41,6 +41,7 @@ def producer(buffer):
     result = ManagedFullyAsyncRolloutFn.__new__(ManagedFullyAsyncRolloutFn)
     result._output = buffer
     result._worker = asyncio.create_task(asyncio.Event().wait())
+    result._reserved_groups = None
     result._draining_groups = []
     result._interrupted_groups = []
     result._drain_yield_at = float("inf")

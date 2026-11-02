@@ -132,6 +132,22 @@ class HomogeneousPolicyDataBuffer:
             "rollout/fully_async/rejected_mixed_policy_groups": mixed,
         }
 
+    def retain_prepared_capacity(self):
+        """A reserved group still occupies its old completed-buffer slot.
+
+        Called immediately after dequeue, on the same producer event loop, with
+        no intervening yield. A full batch can reduce capacity to zero until it
+        is consumed; this prevents prefetch from adding another batch of depth.
+        """
+        if self._delegate._capacity <= 0:
+            raise RuntimeError("Prepared batch exceeds completed-buffer capacity")
+        self._delegate._capacity -= 1
+
+    async def release_prepared_capacity(self, count):
+        async with self._delegate._cond:
+            self._delegate._capacity += count
+            self._delegate._cond.notify_all()
+
     async def reserve_drain_capacity(self, additional):
         """Allow only already-owned completions through a quiescent lifecycle barrier."""
         if type(additional) is not int or additional < 0:

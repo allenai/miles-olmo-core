@@ -57,6 +57,7 @@ def test_native_drain_preserves_core_single_policy_contract(trainer_model_id, pr
         producer._sample_filter = None
         producer._publication_paused = producer._refreshing = producer._stopping = False
         producer._producer_resumed = asyncio.Event()
+        producer._reserved_groups = None
         producer._draining_groups = []
         producer._interrupted_groups = []
         producer._worker = asyncio.create_task(asyncio.Event().wait())

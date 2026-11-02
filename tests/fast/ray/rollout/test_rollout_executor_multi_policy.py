@@ -128,7 +128,8 @@ class TestPerPolicyKeying:
         )
         _record_logged_model_ids(monkeypatch)
 
-        async def _get_rollout_data(rollout_id, trainer_model_id=None):
+        async def _get_rollout_data(rollout_id, trainer_model_id=None, *, weight_version=None, reserve=False):
+            assert weight_version is None and reserve is False
             return [], None, None
 
         executor._get_rollout_data = _get_rollout_data
@@ -191,7 +192,8 @@ class TestRolloutTimerNaming:
         both_arrived = asyncio.Event()
         arrivals = 0
 
-        async def _get_rollout_data(rollout_id, trainer_model_id=None):
+        async def _get_rollout_data(rollout_id, trainer_model_id=None, *, weight_version=None, reserve=False):
+            assert weight_version is None and reserve is False
             nonlocal arrivals
             arrivals += 1
             if arrivals == 2:
@@ -216,7 +218,8 @@ class TestRolloutTimerNaming:
         executor = _make_executor()
         executor.set_train_parallel_config({"dp_size": 4})
 
-        async def _get_rollout_data(rollout_id, trainer_model_id=None):
+        async def _get_rollout_data(rollout_id, trainer_model_id=None, *, weight_version=None, reserve=False):
+            assert weight_version is None and reserve is False
             return [], None, None
 
         executor._get_rollout_data = _get_rollout_data
@@ -242,7 +245,8 @@ class TestWeightVersionWatchdog:
             executor.set_weight_version(1, trainer_model_id=model_id)
             executor.set_train_parallel_config({"dp_size": 4}, trainer_model_id=model_id)
 
-        async def _get_rollout_data(rollout_id, trainer_model_id=None):
+        async def _get_rollout_data(rollout_id, trainer_model_id=None, *, weight_version=None, reserve=False):
+            assert weight_version is None and reserve is False
             return [], None, None
 
         executor._get_rollout_data = _get_rollout_data

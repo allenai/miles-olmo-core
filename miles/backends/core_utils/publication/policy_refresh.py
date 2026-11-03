@@ -1,7 +1,9 @@
 """Token provenance for responses continued across weight publications.
 
 Behavior probabilities stay in rollout_log_probs. These spans describe draws,
-while replay_version identifies the forward that rebuilt the final route table.
+while replay_version identifies the final serving weight version. With retained
+state, the route table contains the routes actually used across those versions;
+it is not rebuilt by a single forward under the final weights.
 """
 
 import math
@@ -12,6 +14,18 @@ import torch
 from miles.backends.core_utils.publication import policy_versions
 from miles.utils.rollout_replay import TokenLogprobs
 from miles.utils.types import WeightVersionSpan, WeightVersionsPerCall
+
+
+def validate_pause_mode(args):
+    """Retain active-request state only without reusable cross-request prefixes."""
+    mode = getattr(args, "pause_generation_mode", "retract")
+    if mode not in ("retract", "in_place"):
+        raise ValueError("Core weight publication supports retract or in_place pause mode")
+    if mode == "in_place":
+        if not getattr(args, "sglang_disable_radix_cache", False):
+            raise ValueError("Core in_place publication requires --sglang-disable-radix-cache")
+        if getattr(args, "colocate", False):
+            raise ValueError("Core in_place publication requires disaggregated serving")
 
 
 def version_number(value):

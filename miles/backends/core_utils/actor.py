@@ -34,6 +34,7 @@ from miles.backends.training_utils import parallel
 from miles.backends.training_utils.data import rollout as miles_data
 from miles.backends.training_utils.loss import objective as miles_loss
 from miles.backends.training_utils.types import TrainStepOutcome, TrainStepOutput
+from miles.backends.training_utils.weight_update import session
 from miles.ray.train_actor import TrainRayActor
 from miles.utils import async_utils, distributed_utils, logger_utils
 from miles.utils.ft_utils.process_group_utils import GroupInfo
@@ -56,6 +57,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         indep_dp_info=None,
         indep_dp_store_addr=None,
     ):
+        policy_refresh.validate_pause_mode(args)
         if role != "actor" or with_opd_teacher or recv_ckpt_src_rank is not None:
             raise ValueError("Core backend supports the policy actor without trainer-cell recovery")
         if indep_dp_store_addr is not None or (indep_dp_info is not None and indep_dp_info.quorum_id != 0):
@@ -723,6 +725,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                     gpu_counts=info.engine_gpu_counts,
                     gpu_offsets=info.engine_gpu_offsets,
                 )
+        policy_refresh.validate_pause_mode(self.args)
         torch.cuda.synchronize()
         started = time.perf_counter()
         updater = self.weight_updater
@@ -737,7 +740,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         publication.trace("connect_complete", rank=dist.get_rank())
         engines = info.rollout_engines
         if dist.get_rank() == 0:
-            async_utils.wait_futures([async_utils.submit(engine.pause_generation()) for engine in engines])
+            session.pause_engines(self.args, engines)
             async_utils.wait_futures([async_utils.submit(engine.begin_weight_update()) for engine in engines])
         publication.trace("pause_barrier_start", rank=dist.get_rank())
         dist.barrier()
@@ -782,8 +785,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         publication.trace("export_complete", rank=dist.get_rank(), buckets=bucket_count)
         dist.barrier()
         if dist.get_rank() == 0:
-            async_utils.wait_futures([async_utils.submit(engine.flush_cache()) for engine in engines])
-            async_utils.wait_futures([async_utils.submit(engine.end_weight_update()) for engine in engines])
+            session.end_weight_update(engines)
             async_utils.wait_futures(
                 [
                     async_utils.submit(
@@ -801,6 +803,8 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         if dist.get_rank() == 0:
             timings = dict(
                 version=self.clock.completed_steps,
+                pause_mode=self.args.pause_generation_mode,
+                retained_state=self.args.pause_generation_mode == "in_place",
                 repeated_version=repeated_version,
                 pause_connect_seconds=pause_done - started,
                 export_pack_seconds=export_done - pause_done - transfer_seconds,

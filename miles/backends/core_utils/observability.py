@@ -35,6 +35,9 @@ def _active_tokens(rollout, current_version):
 def behavior_metrics(rollout, *, current_version, clip_low, clip_high):
     """Current trainer versus generating policy, token weighted over all ranks.
 
+    k3_kl uses exp(delta)-1-delta with the same [-10, 10] input and
+    [0, 10] output bounds as the existing low_var_kl diagnostic; report its
+    saturation fraction explicitly. It is a sampled, token-weighted estimate.
     ESS uses *unclamped behavior ratios*, with a global per-bucket log scale to
     avoid overflow. It is a token-weight dispersion diagnostic, not an estimate
     of the number of independent trajectories. Age zero still includes numerical
@@ -69,6 +72,10 @@ def behavior_metrics(rollout, *, current_version, clip_low, clip_high):
                             values.sum(),
                             (values < log_low).sum(),
                             (values > log_high).sum(),
+                            (values.clamp(-10, 10).expm1() - values.clamp(-10, 10)).clamp(0, 10).sum(),
+                            (
+                                (values.abs() > 10) | ((values.clamp(-10, 10).expm1() - values.clamp(-10, 10)) > 10)
+                            ).sum(),
                         )
                     ).double(),
                     histogram.double(),
@@ -97,7 +104,7 @@ def behavior_metrics(rollout, *, current_version, clip_low, clip_high):
     for (label, _), sums, maximum, (sum_w, sum_w2) in zip(
         selectors, totals.tolist(), maxima.tolist(), scaled.tolist(), strict=True
     ):
-        count, abs_sum, signed_sum, low, high, *histogram = sums
+        count, abs_sum, signed_sum, low, high, kl_sum, kl_saturated, *histogram = sums
         cumulative, upper = 0, 0.0
         for edge, n in zip((*ERROR_EDGES, None), histogram, strict=True):
             cumulative += n
@@ -108,6 +115,8 @@ def behavior_metrics(rollout, *, current_version, clip_low, clip_high):
             "tokens": count,
             "mean_abs_logratio": abs_sum / max(count, 1),
             "mean_logratio": signed_sum / max(count, 1),
+            "k3_kl": kl_sum / max(count, 1),
+            "k3_kl_saturated_fraction": kl_saturated / max(count, 1),
             "max_abs_logratio": maximum[1],
             "tis_clip_low_fraction": low / max(count, 1),
             "tis_clip_high_fraction": high / max(count, 1),

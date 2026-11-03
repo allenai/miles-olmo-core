@@ -1,5 +1,5 @@
 diff --git a/python/sglang/kernels/ops/attention/fla/chunk.py b/python/sglang/kernels/ops/attention/fla/chunk.py
-index f4b892f68b..0ee9f09a5b 100644
+index f4b892f..0ee9f09 100644
 --- a/python/sglang/kernels/ops/attention/fla/chunk.py
 +++ b/python/sglang/kernels/ops/attention/fla/chunk.py
 @@ -45,12 +45,14 @@ def chunk_gated_delta_rule_fwd(
@@ -72,7 +72,7 @@ index f4b892f68b..0ee9f09a5b 100644
      if head_first:
          o = rearrange(o, "b t h ... -> b h t ...")
 diff --git a/python/sglang/kernels/ops/attention/fla/chunk_fwd.py b/python/sglang/kernels/ops/attention/fla/chunk_fwd.py
-index 4e7b068106..bd089f6d73 100644
+index 4e7b068..bd089f6 100644
 --- a/python/sglang/kernels/ops/attention/fla/chunk_fwd.py
 +++ b/python/sglang/kernels/ops/attention/fla/chunk_fwd.py
 @@ -53,6 +53,8 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
@@ -234,7 +234,7 @@ index 4e7b068106..bd089f6d73 100644
  
      # Step 2: recompute_w_u
 diff --git a/python/sglang/kernels/ops/attention/fla/fused_gdn_gating.py b/python/sglang/kernels/ops/attention/fla/fused_gdn_gating.py
-index 16cdf8f7b8..83894f165a 100644
+index 16cdf8f..83894f1 100644
 --- a/python/sglang/kernels/ops/attention/fla/fused_gdn_gating.py
 +++ b/python/sglang/kernels/ops/attention/fla/fused_gdn_gating.py
 @@ -22,6 +22,7 @@ def fused_gdn_gating_kernel(
@@ -273,7 +273,7 @@ index 16cdf8f7b8..83894f165a 100644
      )
      return g, beta_output
 diff --git a/python/sglang/kernels/ops/attention/fla/fused_recurrent.py b/python/sglang/kernels/ops/attention/fla/fused_recurrent.py
-index 1a59ad0643..174272c35c 100644
+index 1a59ad0..174272c 100644
 --- a/python/sglang/kernels/ops/attention/fla/fused_recurrent.py
 +++ b/python/sglang/kernels/ops/attention/fla/fused_recurrent.py
 @@ -208,6 +208,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
@@ -315,7 +315,7 @@ index 1a59ad0643..174272c35c 100644
          num_warps=num_warps,
          num_stages=num_stages,
 diff --git a/python/sglang/srt/configs/__init__.py b/python/sglang/srt/configs/__init__.py
-index 06239f17ee..6ef7641a6c 100644
+index 06239f1..6ef7641 100644
 --- a/python/sglang/srt/configs/__init__.py
 +++ b/python/sglang/srt/configs/__init__.py
 @@ -55,6 +55,7 @@ from sglang.srt.configs.longcat_flash import LongcatFlashConfig
@@ -336,7 +336,7 @@ index 06239f17ee..6ef7641a6c 100644
      "Qwen3_5TextConfig",
 diff --git a/python/sglang/srt/configs/mainline_ladder.py b/python/sglang/srt/configs/mainline_ladder.py
 new file mode 100644
-index 0000000000..265978fa71
+index 0000000..265978f
 --- /dev/null
 +++ b/python/sglang/srt/configs/mainline_ladder.py
 @@ -0,0 +1,30 @@
@@ -371,7 +371,7 @@ index 0000000000..265978fa71
 +    def layers_block_type(self):
 +        return ["attention" if k == "full_attention" else k for k in self.layer_types]
 diff --git a/python/sglang/srt/layers/attention/linear/gdn_backend.py b/python/sglang/srt/layers/attention/linear/gdn_backend.py
-index 15ac8abac0..b5c4624ac0 100644
+index 15ac8ab..b5c4624 100644
 --- a/python/sglang/srt/layers/attention/linear/gdn_backend.py
 +++ b/python/sglang/srt/layers/attention/linear/gdn_backend.py
 @@ -651,6 +651,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
@@ -434,7 +434,7 @@ index 15ac8abac0..b5c4624ac0 100644
                      forward_metadata.state_checkpoint_cu_starts
                  ),
 diff --git a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
-index 0e5c0e10ca..f1e637b2a9 100644
+index 0e5c0e1..f1e637b 100644
 --- a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
 +++ b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
 @@ -129,6 +129,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
@@ -465,10 +465,10 @@ index 0e5c0e10ca..f1e637b2a9 100644
      def target_verify(
 diff --git a/python/sglang/srt/models/mainline_ladder.py b/python/sglang/srt/models/mainline_ladder.py
 new file mode 100644
-index 0000000000..54a9eeedbd
+index 0000000..2a7330c
 --- /dev/null
 +++ b/python/sglang/srt/models/mainline_ladder.py
-@@ -0,0 +1,319 @@
+@@ -0,0 +1,318 @@
 +"""Native TP1 Olmicro: batched GDN kernels, managed state and paged attention.
 +
 +There is no Transformers model forward or per-request Python cache. Checkpoint
@@ -483,7 +483,6 @@ index 0000000000..54a9eeedbd
 +)
 +from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 +from sglang.srt.configs.mainline_ladder import MainlineLadderConfig
-+from sglang.srt.distributed import get_pp_group
 +from sglang.srt.layers.layernorm import RMSNorm
 +from sglang.srt.layers.logits_processor import LogitsProcessor
 +from sglang.srt.layers.radix_attention import RadixAttention
@@ -726,7 +725,7 @@ index 0000000000..54a9eeedbd
 +class MainlineLadderForCausalLM(nn.Module):
 +    def __init__(self, config: MainlineLadderConfig, quant_config=None, prefix=""):
 +        super().__init__()
-+        if get_parallel().tp_size != 1 or get_pp_group().world_size != 1:
++        if get_parallel().tp_size != 1 or get_parallel().pp_size != 1:
 +            raise ValueError("Native Olmicro currently requires TP1/PP1")
 +        if quant_config is not None or torch.get_default_dtype() != torch.bfloat16:
 +            raise ValueError("Native Olmicro currently requires unquantized BF16")
@@ -789,7 +788,7 @@ index 0000000000..54a9eeedbd
 +
 +EntryClass = MainlineLadderForCausalLM
 diff --git a/python/sglang/srt/utils/hf_transformers/common.py b/python/sglang/srt/utils/hf_transformers/common.py
-index b8d202b750..ab2ffb7eba 100644
+index b8d202b..ab2ffb7 100644
 --- a/python/sglang/srt/utils/hf_transformers/common.py
 +++ b/python/sglang/srt/utils/hf_transformers/common.py
 @@ -67,6 +67,7 @@ from sglang.srt.configs import (
@@ -810,7 +809,7 @@ index b8d202b750..ab2ffb7eba 100644
          Mamba2Config,
 diff --git a/test/manual/olmicro/README.md b/test/manual/olmicro/README.md
 new file mode 100644
-index 0000000000..2d4a73b7dd
+index 0000000..2d4a73b
 --- /dev/null
 +++ b/test/manual/olmicro/README.md
 @@ -0,0 +1,132 @@
@@ -948,7 +947,7 @@ index 0000000000..2d4a73b7dd
 +publication and a full RL update remain separate training qualification gates.
 diff --git a/test/manual/olmicro/probe_backend.py b/test/manual/olmicro/probe_backend.py
 new file mode 100644
-index 0000000000..60779cd603
+index 0000000..60779cd
 --- /dev/null
 +++ b/test/manual/olmicro/probe_backend.py
 @@ -0,0 +1,285 @@
@@ -1239,7 +1238,7 @@ index 0000000000..60779cd603
 +    main()
 diff --git a/test/manual/olmicro/probe_distribution.py b/test/manual/olmicro/probe_distribution.py
 new file mode 100644
-index 0000000000..cff4b90eea
+index 0000000..cff4b90
 --- /dev/null
 +++ b/test/manual/olmicro/probe_distribution.py
 @@ -0,0 +1,166 @@
@@ -1411,7 +1410,7 @@ index 0000000000..cff4b90eea
 +    main()
 diff --git a/test/manual/olmicro/test_activation.py b/test/manual/olmicro/test_activation.py
 new file mode 100644
-index 0000000000..305555c7f4
+index 0000000..305555c
 --- /dev/null
 +++ b/test/manual/olmicro/test_activation.py
 @@ -0,0 +1,18 @@
@@ -1435,7 +1434,7 @@ index 0000000000..305555c7f4
 +    assert (without_rounding != expected).float().mean().item() > 0.1
 diff --git a/test/manual/olmicro/test_beta_scale.py b/test/manual/olmicro/test_beta_scale.py
 new file mode 100644
-index 0000000000..760753a1de
+index 0000000..760753a
 --- /dev/null
 +++ b/test/manual/olmicro/test_beta_scale.py
 @@ -0,0 +1,83 @@
@@ -1524,7 +1523,7 @@ index 0000000000..760753a1de
 +    )
 diff --git a/test/manual/olmicro/test_chunk_precision.py b/test/manual/olmicro/test_chunk_precision.py
 new file mode 100644
-index 0000000000..463e12e771
+index 0000000..463e12e
 --- /dev/null
 +++ b/test/manual/olmicro/test_chunk_precision.py
 @@ -0,0 +1,44 @@
@@ -1574,7 +1573,7 @@ index 0000000000..463e12e771
 +        )
 diff --git a/test/manual/olmicro/test_config.py b/test/manual/olmicro/test_config.py
 new file mode 100644
-index 0000000000..162a9c6e2b
+index 0000000..162a9c6
 --- /dev/null
 +++ b/test/manual/olmicro/test_config.py
 @@ -0,0 +1,23 @@
@@ -1603,7 +1602,7 @@ index 0000000000..162a9c6e2b
 +        MainlineLadderConfig(layer_types=layers, num_hidden_layers=2)
 diff --git a/test/manual/olmicro/test_distribution.py b/test/manual/olmicro/test_distribution.py
 new file mode 100644
-index 0000000000..438d2a4489
+index 0000000..438d2a4
 --- /dev/null
 +++ b/test/manual/olmicro/test_distribution.py
 @@ -0,0 +1,36 @@
@@ -1645,7 +1644,7 @@ index 0000000000..438d2a4489
 +        compare(record(), b)
 diff --git a/test/manual/olmicro/test_norm.py b/test/manual/olmicro/test_norm.py
 new file mode 100644
-index 0000000000..9cfbe11734
+index 0000000..9cfbe11
 --- /dev/null
 +++ b/test/manual/olmicro/test_norm.py
 @@ -0,0 +1,39 @@
@@ -1690,7 +1689,7 @@ index 0000000000..9cfbe11734
 +    assert (actual == expected).float().mean().item() > 0.9999
 diff --git a/test/manual/olmicro/test_probe_backend.py b/test/manual/olmicro/test_probe_backend.py
 new file mode 100644
-index 0000000000..bb5a78620d
+index 0000000..bb5a786
 --- /dev/null
 +++ b/test/manual/olmicro/test_probe_backend.py
 @@ -0,0 +1,67 @@
@@ -1763,7 +1762,7 @@ index 0000000000..bb5a78620d
 +        probe._compare(_record(), right)
 diff --git a/test/manual/olmicro/test_weight_loading.py b/test/manual/olmicro/test_weight_loading.py
 new file mode 100644
-index 0000000000..012daf9514
+index 0000000..012daf9
 --- /dev/null
 +++ b/test/manual/olmicro/test_weight_loading.py
 @@ -0,0 +1,110 @@

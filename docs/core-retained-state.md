@@ -5,6 +5,10 @@ The default remains `retract`. In-place pauses active requests, transfers and
 finalizes weights, publishes the new version, and resumes without flushing their
 attention KV or hybrid recurrent state. It requires disaggregated serving and
 `sglang_disable_radix_cache=true`, so new requests cannot reuse old-weight prefixes.
+For `--sglang-config`, validation resolves model and server-group settings using
+the launch precedence, including eval overrides, and checks every non-placeholder
+group whose model receives weight updates. A group cannot re-enable caching over
+a safe CLI default. Frozen reference/judge models may still cache prefixes.
 The retract path flushes immediately after pausing, before transfer, matching the
 shared helper. Engine-drain publication is a separate path and is unchanged.
 

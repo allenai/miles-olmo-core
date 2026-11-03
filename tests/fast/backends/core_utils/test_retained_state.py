@@ -1,5 +1,6 @@
 """Core must retain live state only on the explicit, safe publication path."""
 
+import json
 from importlib import import_module
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -90,3 +91,113 @@ def test_reject_unsafe_retained_state(colocate, radix_disabled):
                 pause_generation_mode="in_place", colocate=colocate, sglang_disable_radix_cache=radix_disabled
             )
         )
+
+
+def config_args(tmp_path, models, **overrides):
+    path = tmp_path / "engines.json"
+    path.write_text(json.dumps({"sglang": models}))
+    values = dict(
+        pause_generation_mode="in_place",
+        sglang_disable_radix_cache=True,
+        sglang_config=str(path),
+        starts_inference_engines=True,
+        colocate=False,
+        offload_rollout=False,
+        debug_rollout_only=False,
+        actor_num_nodes=1,
+        actor_num_gpus_per_node=8,
+        num_gpus_per_node=8,
+        rollout_num_gpus=sum(g["num_gpus"] for model in models for g in model["server_groups"]),
+        rollout_num_gpus_per_engine=1,
+        eval_num_gpus=0,
+        eval_num_gpus_per_engine=1,
+        hf_checkpoint="/policy",
+    )
+    return SimpleNamespace(**(values | overrides))
+
+
+@pytest.mark.parametrize("worker_type", ["regular", "prefill", "decode"])
+@pytest.mark.parametrize("disabled", [False, None, "false"])
+def test_reject_cache_override_in_later_policy_group(tmp_path, worker_type, disabled):
+    models = [
+        dict(
+            name="policy",
+            server_groups=[
+                dict(worker_type="regular", num_gpus=1),
+                dict(worker_type=worker_type, num_gpus=1, overrides={"disable_radix_cache": disabled}),
+            ],
+        )
+    ]
+    args = config_args(tmp_path, models)
+    with pytest.raises(ValueError, match="model 'policy', server group 1"):
+        policy_refresh.validate_pause_mode(args)
+
+
+@pytest.mark.parametrize("global_disabled", [False, True])
+def test_safe_policy_override_allows_frozen_cache_and_placeholders(tmp_path, global_disabled):
+    models = [
+        dict(
+            name="policy",
+            server_groups=[
+                dict(worker_type="regular", num_gpus=1, overrides={"disable_radix_cache": True}),
+                dict(worker_type="placeholder", num_gpus=1, overrides={"disable_radix_cache": False}),
+            ],
+        ),
+        dict(
+            name="reference",
+            update_weights=False,
+            server_groups=[dict(worker_type="regular", num_gpus=1, overrides={"disable_radix_cache": False})],
+        ),
+        dict(
+            name="judge",
+            model_path="/judge",
+            server_groups=[dict(worker_type="regular", num_gpus=1, overrides={"disable_radix_cache": False})],
+        ),
+    ]
+    policy_refresh.validate_pause_mode(config_args(tmp_path, models, sglang_disable_radix_cache=global_disabled))
+
+
+def test_inferred_policy_in_later_model_cannot_enable_cache(tmp_path):
+    models = [
+        dict(name="frozen", update_weights=False, server_groups=[dict(worker_type="regular", num_gpus=1)]),
+        dict(
+            name="second_policy",
+            server_groups=[dict(worker_type="regular", num_gpus=1, overrides={"disable_radix_cache": False})],
+        ),
+    ]
+    with pytest.raises(ValueError, match="model 'second_policy'"):
+        policy_refresh.validate_pause_mode(config_args(tmp_path, models))
+
+
+@pytest.mark.parametrize("updated,group_override", [(False, False), (True, False), (True, True)])
+def test_updated_eval_model_uses_resolved_eval_and_group_precedence(tmp_path, updated, group_override):
+    models = [
+        dict(name="policy", server_groups=[dict(worker_type="regular", num_gpus=1)]),
+        dict(
+            name="eval",
+            update_weights=updated,
+            server_groups=[
+                dict(
+                    worker_type="regular",
+                    num_gpus=1,
+                    overrides={"disable_radix_cache": True} if group_override else {},
+                )
+            ],
+        ),
+    ]
+    args = config_args(tmp_path, models, rollout_num_gpus=1, eval_num_gpus=1, eval_sglang_disable_radix_cache=False)
+    if updated and not group_override:
+        with pytest.raises(ValueError, match="model 'eval'"):
+            policy_refresh.validate_pause_mode(args)
+    else:
+        policy_refresh.validate_pause_mode(args)
+
+
+def test_retract_allows_policy_cache_override(tmp_path):
+    models = [
+        dict(
+            name="policy",
+            server_groups=[dict(worker_type="regular", num_gpus=1, overrides={"disable_radix_cache": False})],
+        )
+    ]
+    policy_refresh.validate_pause_mode(config_args(tmp_path, models, pause_generation_mode="retract"))

@@ -12,6 +12,7 @@ from numbers import Integral
 import torch
 
 from miles.backends.core_utils.publication import policy_versions
+from miles.backends.sglang_utils import sglang_config
 from miles.utils.rollout_replay import TokenLogprobs
 from miles.utils.types import WeightVersionSpan, WeightVersionsPerCall
 
@@ -22,10 +23,34 @@ def validate_pause_mode(args):
     if mode not in ("retract", "in_place"):
         raise ValueError("Core weight publication supports retract or in_place pause mode")
     if mode == "in_place":
-        if not getattr(args, "sglang_disable_radix_cache", False):
-            raise ValueError("Core in_place publication requires --sglang-disable-radix-cache")
         if getattr(args, "colocate", False):
             raise ValueError("Core in_place publication requires disaggregated serving")
+        validate_engine_cache_settings(args)
+
+
+def validate_engine_cache_settings(args):
+    """Check the same resolved override precedence used to launch policy engines."""
+    default = getattr(args, "sglang_disable_radix_cache", False)
+    if getattr(args, "sglang_config", None) is None:
+        if default is not True:
+            raise ValueError("Core in_place publication requires --sglang-disable-radix-cache")
+        return
+    # Resolve rather than reading raw YAML: model_path determines the default
+    # update_weights flag, and eval/group settings can override the CLI. Frozen
+    # models never receive these publications; placeholders launch no engines.
+    config = sglang_config.resolve_sglang_config(args)
+    for model in config.models:
+        if not model.update_weights:
+            continue
+        for index, group in enumerate(model.server_groups):
+            if group.worker_type == "placeholder":
+                continue
+            if group.overrides.get("disable_radix_cache", default) is not True:
+                raise ValueError(
+                    "Core in_place publication requires effective disable_radix_cache=true "
+                    f"for weight-updated model {model.name!r}, server group {index} ({group.worker_type}); "
+                    "sglang_config overrides take precedence over --sglang-disable-radix-cache"
+                )
 
 
 def version_number(value):

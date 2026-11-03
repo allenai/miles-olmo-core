@@ -19,7 +19,9 @@ def actor():
 
 
 @pytest.mark.parametrize("mode", ["retract", "in_place"])
-@pytest.mark.parametrize("failure", [None, "pause_generation", "begin_weight_update", "end_weight_update"])
+@pytest.mark.parametrize(
+    "failure", [None, "pause_generation", "begin_weight_update", "end_weight_update", "negative_ack"]
+)
 def test_publication_order_and_failed_update_stays_paused(monkeypatch, actor, mode, failure):
     events = []
 
@@ -28,6 +30,8 @@ def test_publication_order_and_failed_update_stays_paused(monkeypatch, actor, mo
             events.append((name, kwargs))
             if name == failure:
                 raise RuntimeError("injected publication failure")
+            if name == "end_weight_update" and failure == "negative_ack":
+                return {"success": False, "message": "injected negative acknowledgment"}
 
         return AsyncMock(side_effect=call)
 
@@ -65,6 +69,7 @@ def test_publication_order_and_failed_update_stays_paused(monkeypatch, actor, mo
     if failure:
         with pytest.raises(RuntimeError, match="injected"):
             worker.update_weights(info)
+        engine.update_weight_version.assert_not_awaited()
         engine.continue_generation.assert_not_awaited()
         worker.clock.published.assert_not_called()
     else:

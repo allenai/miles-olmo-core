@@ -35,9 +35,10 @@ def _active_tokens(rollout, current_version):
 def behavior_metrics(rollout, *, current_version, clip_low, clip_high):
     """Current trainer versus generating policy, token weighted over all ranks.
 
-    k3_kl uses exp(delta)-1-delta with the same [-10, 10] input and
-    [0, 10] output bounds as the existing low_var_kl diagnostic; report its
-    saturation fraction explicitly. It is a sampled, token-weighted estimate.
+    k3_kl uses exp(delta)-1-delta with [-10, 10] input and [0, 10]
+    output bounds; saturation reports either bound taking effect. The existing
+    low_var_kl diagnostic instead clamps its input to [-20, 20] and output to
+    [-10, 10]. It is a sampled, token-weighted estimate.
     ESS uses *unclamped behavior ratios*, with a global per-bucket log scale to
     avoid overflow. It is a token-weight dispersion diagnostic, not an estimate
     of the number of independent trajectories. Age zero still includes numerical
@@ -58,6 +59,10 @@ def behavior_metrics(rollout, *, current_version, clip_low, clip_high):
     edges = delta.new_tensor(ERROR_EDGES)
     log_low = math.log(clip_low) if clip_low > 0 else -math.inf
     log_high = math.log(clip_high)
+    bounded_delta = delta.clamp(-10, 10)
+    raw_k3 = bounded_delta.expm1() - bounded_delta
+    k3 = raw_k3.clamp(0, 10)
+    k3_saturated = (delta.abs() > 10) | (raw_k3 > 10)
     totals, maxima = [], []
     for _, selected in selectors:
         values = delta[selected]
@@ -72,10 +77,8 @@ def behavior_metrics(rollout, *, current_version, clip_low, clip_high):
                             values.sum(),
                             (values < log_low).sum(),
                             (values > log_high).sum(),
-                            (values.clamp(-10, 10).expm1() - values.clamp(-10, 10)).clamp(0, 10).sum(),
-                            (
-                                (values.abs() > 10) | ((values.clamp(-10, 10).expm1() - values.clamp(-10, 10)) > 10)
-                            ).sum(),
+                            k3[selected].sum(),
+                            k3_saturated[selected].sum(),
                         )
                     ).double(),
                     histogram.double(),

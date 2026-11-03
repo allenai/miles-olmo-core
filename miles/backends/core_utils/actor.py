@@ -725,7 +725,6 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                     gpu_counts=info.engine_gpu_counts,
                     gpu_offsets=info.engine_gpu_offsets,
                 )
-        policy_refresh.validate_pause_mode(self.args)
         torch.cuda.synchronize()
         started = time.perf_counter()
         updater = self.weight_updater

@@ -24,7 +24,7 @@ def validate_pause_mode(args):
         raise ValueError("Core weight publication supports retract or in_place pause mode")
     if mode == "in_place":
         if getattr(args, "colocate", False):
-            raise ValueError("Core in_place publication requires disaggregated serving")
+            raise ValueError("Core in_place publication requires non-colocated serving")
         validate_engine_cache_settings(args)
 
 

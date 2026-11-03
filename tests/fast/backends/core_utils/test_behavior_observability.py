@@ -70,6 +70,10 @@ def _worker(rank, rendezvous):
         assert result["behavior/all/tis_clip_high_fraction"] == 1
         assert result["behavior/all/k3_kl"] == 10
         assert result["behavior/all/k3_kl_saturated_fraction"] == 1
+        scores.fill_(-1000)
+        result = observability.behavior_metrics(rollout, current_version=12, clip_low=0.5, clip_high=2)
+        assert result["behavior/all/k3_kl"] == pytest.approx(9 + math.exp(-10))
+        assert result["behavior/all/k3_kl_saturated_fraction"] == 1
         with mock.patch.object(
             torch.cuda,
             "memory_stats",

@@ -16,10 +16,10 @@ Thirty-five focused CPU/GPU regressions passed together. Native generation,
 queueing, slot reuse/reload, selected-token log probabilities, and full-vocabulary
 KL are separate gates; a functional pass does not imply numerical equivalence.
 The bundled patch is the shared source artifact. Local source provenance is
-`986877f4cd38b090ce2338e685f914cd65c18e8c`; reproduce from the pinned upstream
+`4a0d164fe7` (rebased overlay); reproduce from the pinned upstream
 commit and this patch rather than expecting that local commit upstream.
 
-## Results
+## Historical results (original base)
 
 Native functional checks passed at all five sizes. **Strict vLLM numerical
 compatibility is not fully qualified.** The KL gate is maximum bidirectional
@@ -71,7 +71,6 @@ Raw final native reports are under
 `/weka/oe-adapt-default/michaeln/olmicro/native-sglang-20261030/native-fa3-final/`;
 reference reports and earlier candidates are in the parent directory.
 
-Existing MILES benchmark recipes explicitly select the older HF reference
-bridge. A future native training smoke must change that selection and verify
-cross-process learner weight publication and optimizer updates. These serving
-checks do not change a running experiment or qualify the complete RL path.
+Native MILES recipes select `MILES_HYBRID_NATIVE=1` and disable the HF bridge.
+The previous A6000 lifecycle smoke passed, including decode graphs and checkpoint
+resume; the current upstream integration requires a fresh smoke on its own image.

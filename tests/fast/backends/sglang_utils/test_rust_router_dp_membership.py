@@ -19,7 +19,7 @@ async def registry(monkeypatch):
         for rank in range(state["size"]):
             if rank and state.get("rank_gate") is not None:
                 await state["rank_gate"].wait()
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0)
             if state["partial"] and rank:
                 return
             workers[f"http://engine@{rank}"] = dict(
@@ -28,7 +28,7 @@ async def registry(monkeypatch):
 
     async def remove():
         for url in list(workers):
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0)
             if url.startswith("http://engine@"):
                 workers.pop(url)
 
@@ -54,7 +54,9 @@ async def registry(monkeypatch):
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         monkeypatch.setattr(GeneralHttpClientProvider, "client", lambda: client)
         monkeypatch.setattr(module, "POLL_SECONDS", 0.001)
-        monkeypatch.setattr(module, "MEMBERSHIP_TIMEOUT_SECONDS", 0.5)
+        # Successful operations test ordering, not subsecond runner scheduling.
+        # Negative timeout cases below use their own short deadline.
+        monkeypatch.setattr(module, "MEMBERSHIP_TIMEOUT_SECONDS", 5.0)
         yield SimpleNamespace(workers=workers, calls=calls, tasks=tasks, state=state)
         await asyncio.gather(*tasks)
 
@@ -92,16 +94,18 @@ async def test_cancelled_registration_waits_for_late_siblings_before_removal(reg
 
 
 @pytest.mark.parametrize("partial", [False, True])
-async def test_incomplete_or_unhealthy_ranks_never_become_ready(registry, partial):
+async def test_incomplete_or_unhealthy_ranks_never_become_ready(registry, monkeypatch, partial):
     registry.state.update(partial=partial, healthy=partial)
     member = module.RustRouterMembership("http://router", "http://engine", dp_size=2)
-    with pytest.raises(TimeoutError):
-        await member.ensure_registered()
-    if partial:
+    with monkeypatch.context() as deadline:
+        deadline.setattr(module, "MEMBERSHIP_TIMEOUT_SECONDS", 0.05)
         with pytest.raises(TimeoutError):
-            await member.remove(retire=True)
-        assert not any(method == "DELETE" for method, _ in registry.calls)
-    else:
+            await member.ensure_registered()
+        if partial:
+            with pytest.raises(TimeoutError):
+                await member.remove(retire=True)
+            assert not any(method == "DELETE" for method, _ in registry.calls)
+    if not partial:
         await member.remove(retire=True)
         assert not registry.workers
 

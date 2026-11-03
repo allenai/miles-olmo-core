@@ -1,17 +1,25 @@
 """Core must retain live state only on the explicit, safe publication path."""
 
+from importlib import import_module
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from miles.backends.core_utils import actor
 from miles.backends.core_utils.publication import policy_refresh
+
+
+@pytest.fixture
+def actor():
+    # Lightweight CPU CI omits the optional Core trainer. Keep the pure policy
+    # guards below runnable there, and exercise actor ordering in the runtime.
+    pytest.importorskip("olmo_core")
+    return import_module("miles.backends.core_utils.actor")
 
 
 @pytest.mark.parametrize("mode", ["retract", "in_place"])
 @pytest.mark.parametrize("failure", [None, "pause_generation", "begin_weight_update", "end_weight_update"])
-def test_publication_order_and_failed_update_stays_paused(monkeypatch, mode, failure):
+def test_publication_order_and_failed_update_stays_paused(monkeypatch, actor, mode, failure):
     events = []
 
     def method(name):

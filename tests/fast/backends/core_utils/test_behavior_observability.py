@@ -43,6 +43,10 @@ def _worker(rank, rendezvous):
             result = observability.behavior_metrics(rollout, current_version=12, clip_low=0.5, clip_high=2.01)
             weights = [4, 0.25, 1] if empty_rank else [4, 0.25, 1, 2, 1]
             assert result["behavior/all/tokens"] == len(weights)
+            assert result["behavior/all/k3_kl"] == pytest.approx(
+                sum(w - 1 - math.log(w) for w in weights) / len(weights)
+            )
+            assert result["behavior/all/k3_kl_saturated_fraction"] == 0
             assert result["behavior/all/ess_ratio"] == pytest.approx(
                 sum(weights) ** 2 / (len(weights) * sum(w * w for w in weights))
             )
@@ -64,6 +68,12 @@ def _worker(rank, rendezvous):
         result = observability.behavior_metrics(rollout, current_version=12, clip_low=0, clip_high=2)
         assert result["behavior/all/ess_ratio"] == pytest.approx(1)
         assert result["behavior/all/tis_clip_high_fraction"] == 1
+        assert result["behavior/all/k3_kl"] == 10
+        assert result["behavior/all/k3_kl_saturated_fraction"] == 1
+        scores.fill_(-1000)
+        result = observability.behavior_metrics(rollout, current_version=12, clip_low=0.5, clip_high=2)
+        assert result["behavior/all/k3_kl"] == pytest.approx(9 + math.exp(-10))
+        assert result["behavior/all/k3_kl_saturated_fraction"] == 1
         with mock.patch.object(
             torch.cuda,
             "memory_stats",

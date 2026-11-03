@@ -8,7 +8,8 @@ import time
 
 from torch import distributed as dist
 
-from miles.backends.fsdp_utils import update_weight_utils
+from miles.backends.core_utils.publication import transport
+from miles.backends.training_utils.weight_update.protocols.cuda_ipc import FlattenedTensorBucket
 from miles.utils import async_utils, logger_utils
 
 logger = logger_utils.setup_logger(__name__)
@@ -61,7 +62,7 @@ async def request_bucket(engine, payload, engine_index):
     return result
 
 
-class FlattenedDistributedUpdater(update_weight_utils.UpdateWeightFromDistributed):
+class FlattenedDistributedUpdater(transport.DistributedUpdater):
     """One NCCL broadcast per bucket, preserving the HF name/shape order.
 
     ``last_bucket_timing`` splits each bucket into the broadcast wait, which
@@ -85,7 +86,7 @@ class FlattenedDistributedUpdater(update_weight_utils.UpdateWeightFromDistribute
         if len({tensor.device for _, tensor in named_tensors}) != 1:
             raise ValueError("Weight bucket must reside on one device")
         trace("flatten_start", tensors=len(names), first=names[0], last=names[-1])
-        bucket = update_weight_utils.FlattenedTensorBucket(named_tensors=named_tensors)
+        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
         flat = bucket.get_flattened_tensor()
         expected = sum(tensor.nbytes for _, tensor in named_tensors)
         if flat.element_size() != 1 or flat.numel() != expected or not flat.is_contiguous():

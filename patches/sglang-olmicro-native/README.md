@@ -1,15 +1,15 @@
-> Decode-graph candidate a562a2c24dc095436bc0bb1d0821db7119dcb228 extends the original overlay. Historical qualification.json remains unchanged; graph GPU qualification is pending. Current project plan: [Plan.md](../../../Plan.md).
+> Upstream integration candidate: SGLang `4a0d164fe7`, base `b84bec5761`. GPU requalification pending. Results below and qualification.json are historical evidence from the earlier base, not validation of this update.
 
 # Native Olmicro SGLang source overlay
 
 This patch adds a native `MainlineLadderForCausalLM` to SGLang commit
-`3145136dcd1238754e0ea2b2ffd546532119c71c`. It uses batched native GDN kernels,
+`b84bec5761a6cdc8b1df86b9b89ead80a7a9bb02`. It uses batched native GDN kernels,
 SGLang-managed recurrent/convolution state and paged full attention. It does
 not call a Transformers model forward. Release checkpoint and publication
 parameter names are preserved; QKV, gate/up and convolution weights are packed after loading, including partial updates.
 
 The supported configuration is BF16, TP1/PP1, FP32 recurrent state and GDN gate computation,
-no quantization, no CUDA graphs, no prefix cache, and no speculative decoding.
+no quantization, optional full decode CUDA graphs, no prefix cache, and no speculative decoding.
 The five final-midtrain sizes are tested on one Neptune L40S. The final
 per-size outcomes, including failed gates, are recorded in [qualification.json](qualification.json).
 Thirty-five focused CPU/GPU regressions passed together. Native generation,
@@ -46,7 +46,7 @@ preemption. No tolerance was relaxed.
 Apply to a clean SGLang checkout at that exact commit:
 
 ```bash
-git checkout 3145136dcd1238754e0ea2b2ffd546532119c71c
+git checkout b84bec5761a6cdc8b1df86b9b89ead80a7a9bb02
 git apply --check /path/to/miles-olmo-core/patches/sglang-olmicro-native/sglang.patch
 git apply /path/to/miles-olmo-core/patches/sglang-olmicro-native/sglang.patch
 ```

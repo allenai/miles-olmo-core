@@ -1,7 +1,6 @@
 import asyncio
 import ipaddress
 import json
-import logging
 import multiprocessing
 import os
 import random
@@ -11,13 +10,20 @@ import time
 
 import httpx
 
+from miles.utils import logger_utils
+from miles.utils.http_post_errors import HTTPPostFailure
+from miles.utils.http_post_observer import PostObserver
 from miles.utils.logging_utils import configure_logger_raw
+from miles.utils.rollout_replay import compact_token_logprobs as compact_token_logprobs_response
+from miles.utils.rollout_replay import decode_response_routes
 
-logger = logging.getLogger(__name__)
+logger = logger_utils.setup_logger(__name__)
 
 MILES_HOST_IP_ENV = "MILES_HOST_IP"
+MILES_PREFER_IPV6_ENV = "MILES_PREFER_IPV6"
 
-_TCP_POLL_INTERVAL_SECONDS = 0.5
+_CONNECT_ATTEMPT_TIMEOUT_SECONDS = 1.0
+_CONNECT_RETRY_INTERVAL_SECONDS = 0.5
 
 
 def find_available_port(base_port: int):
@@ -67,29 +73,20 @@ def wait_for_server_ready(
     raise RuntimeError(f"Server at {host}:{port} not ready after {timeout}s")
 
 
-# TODO: remove; switch the remaining (test-only) callers to wait_tcp_ready_async
-def wait_tcp_ready(host: str, port: int, *, timeout: float = 30) -> None:
-    """Poll until a TCP port accepts connections."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with socket.create_connection((host.strip("[]"), port), timeout=1):
-                return
-        except OSError:
-            time.sleep(_TCP_POLL_INTERVAL_SECONDS)
-    raise RuntimeError(f"Server at {host}:{port} not ready after {timeout}s")
-
-
 async def wait_tcp_ready_async(host: str, port: int, *, timeout: float = 30) -> None:
-    """Poll until a TCP port accepts connections, leaving the event loop free to run meanwhile."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    """Poll until a TCP port accepts connections."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
         try:
-            _, writer = await asyncio.wait_for(asyncio.open_connection(host.strip("[]"), port), timeout=1)
+            _reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host.strip("[]"), port), timeout=_CONNECT_ATTEMPT_TIMEOUT_SECONDS
+            )
             writer.close()
+            await writer.wait_closed()
             return
         except (OSError, asyncio.TimeoutError):
-            await asyncio.sleep(_TCP_POLL_INTERVAL_SECONDS)
+            await asyncio.sleep(_CONNECT_RETRY_INTERVAL_SECONDS)
     raise RuntimeError(f"Server at {host}:{port} not ready after {timeout}s")
 
 
@@ -99,73 +96,31 @@ def _is_process_running(process: "multiprocessing.Process | subprocess.Popen") -
     return process.is_alive()
 
 
-def get_host_info():
-    hostname = socket.gethostname()
-
-    if env_overwrite_local_ip := os.getenv(MILES_HOST_IP_ENV, None):
-        return hostname, env_overwrite_local_ip
-
-    def _is_loopback(ip):
-        return ip.startswith("127.") or ip == "::1"
-
-    def _resolve_ip(family, test_target_ip):
-        """
-        Attempt to get the local LAN IP for the specific family (IPv4/IPv6).
-        Strategy: UDP Probe (Preferred) -> Hostname Resolution (Fallback) -> None
-        """
-
-        # Strategy 1: UDP Connect Probe (Most accurate, relies on routing table)
-        # Useful when the machine has a default gateway or internet access.
-        try:
-            with socket.socket(family, socket.SOCK_DGRAM) as s:
-                # The IP doesn't need to be reachable, but the routing table must exist.
-                s.connect((test_target_ip, 80))
-                ip = s.getsockname()[0]
-                if not _is_loopback(ip):
-                    return ip
-        except Exception:
-            pass  # Route unreachable or network error, move to next strategy.
-
-        # Strategy 2: Hostname Resolution (Fallback for offline clusters)
-        # Useful for offline environments where UDP connect fails but /etc/hosts is configured.
-        try:
-            # getaddrinfo allows specifying the family (AF_INET or AF_INET6)
-            # Result format: [(family, type, proto, canonname, sockaddr), ...]
-            infos = socket.getaddrinfo(hostname, None, family=family, type=socket.SOCK_STREAM)
-
-            for info in infos:
-                ip = info[4][0]  # The first element of sockaddr is the IP
-                # Must filter out loopback addresses to avoid "127.0.0.1" issues
-                if not _is_loopback(ip):
-                    return ip
-        except Exception:
-            pass
-
-        return None
-
-    prefer_ipv6 = os.getenv("MILES_PREFER_IPV6", "0").lower() in ("1", "true", "yes", "on")
-    local_ip = None
-    final_fallback = "127.0.0.1"
-
-    if prefer_ipv6:
-        # [Strict Mode] IPv6 Only
-        # 1. Try UDP V6 Probe
-        # 2. Try Hostname Resolution (V6)
-        # If failed, fallback to V6 loopback. Never mix with V4.
-        local_ip = _resolve_ip(socket.AF_INET6, "2001:4860:4860::8888")
-        final_fallback = "::1"
+def resolve_ip(host: str) -> str:
+    bare = host.strip("[]")
+    try:
+        ipaddress.ip_address(bare)
+    except ValueError:
+        pass
     else:
-        # [Strict Mode] IPv4 Only (Default)
-        # 1. Try UDP V4 Probe
-        # 2. Try Hostname Resolution (V4)
-        # If failed, fallback to V4 loopback. Never mix with V6.
-        local_ip = _resolve_ip(socket.AF_INET, "8.8.8.8")
-        final_fallback = "127.0.0.1"
+        return wrap_ipv6(bare)
 
-    return hostname, local_ip or final_fallback
+    # "Prefer" is indeed strict to match old semantics
+    prefer_ipv6 = os.getenv(MILES_PREFER_IPV6_ENV, "0").lower() in ("1", "true", "yes", "on")
+    family = socket.AF_INET6 if prefer_ipv6 else socket.AF_INET
+    # getaddrinfo allows specifying the family (AF_INET or AF_INET6)
+    # Result format: [(family, type, proto, canonname, sockaddr), ...]
+    infos = socket.getaddrinfo(bare, None, family=family, type=socket.SOCK_STREAM)
+    for info in infos:
+        ip = info[4][0]  # The first element of sockaddr is the IP
+        # Must filter out loopback addresses to avoid "127.0.0.1" issues
+        if not ipaddress.ip_address(ip).is_loopback:
+            return wrap_ipv6(ip)
+
+    raise RuntimeError(f"{host!r} resolves to no non-loopback {family.name} address, so nothing can bind on it")
 
 
-def _wrap_ipv6(host):
+def wrap_ipv6(host):
     """Wrap IPv6 address in [] if needed."""
     try:
         ipaddress.IPv6Address(host.strip("[]"))
@@ -261,7 +216,9 @@ def _next_actor():
     return actor
 
 
-async def _post(client, url, payload, max_retries=60, action="post", headers=None):
+async def _post(
+    client, url, payload, max_retries=60, action="post", headers=None, *, return_bytes=False, observation=None
+):
     retry_count = 0
     while retry_count < max_retries:
         try:
@@ -271,10 +228,21 @@ async def _post(client, url, payload, max_retries=60, action="post", headers=Non
             else:
                 response = await getattr(client, action)(url, json=payload or {}, headers=headers)
             response.raise_for_status()
+            if observation is not None:
+                observation.update(response_bytes=len(response.content), response_body_ready_unix=time.time())
+            if return_bytes:
+                return response.content
+            decode_start, decode_cpu_start = time.monotonic(), time.thread_time()
             try:
                 output = response.json()
             except json.JSONDecodeError:
                 output = response.text
+            finally:
+                if observation is not None:
+                    observation.update(
+                        json_decode_seconds=time.monotonic() - decode_start,
+                        json_decode_thread_cpu_seconds=time.thread_time() - decode_cpu_start,
+                    )
         except Exception as e:
             retry_count += 1
 
@@ -344,7 +312,7 @@ def init_http_client(args):
     _client_concurrency = max(_client_concurrency, args.sglang_server_concurrency)
     if _http_client is None:
         _http_client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=_client_concurrency),
+            limits=_rollout_client_limits(_client_concurrency),
             timeout=httpx.Timeout(None),
         )
 
@@ -354,11 +322,20 @@ def init_http_client(args):
         _distributed_post_enabled = True
 
 
+def _rollout_client_limits(concurrency):
+    # Large generation responses can stall the consumer after HTTPX chooses an
+    # idle socket but before it writes. The server can close that socket in the
+    # meantime, losing a whole prompt group to ReadError. New connections avoid
+    # this idle-reuse race without retrying potentially delivered generations.
+    # General/control clients owned by other providers retain their own pools.
+    return httpx.Limits(max_connections=max(1, concurrency), max_keepalive_connections=0)
+
+
 def _init_ray_distributed_post(args):
     """Initialize one or more Ray async actors per node for HTTP POST.
 
     Uses NodeAffinitySchedulingStrategy to place actors on distinct nodes.
-    Controlled by MILES_HTTP_POST_ACTORS_PER_NODE.
+    Controlled by --http-post-actors-per-node and --http-post-num-cpus.
     """
     global _post_actors
     if _post_actors:
@@ -375,56 +352,155 @@ def _init_ray_distributed_post(args):
     # Define the async actor
     @ray.remote
     class _HttpPosterActor:
-        def __init__(self, *, concurrency: int):
+        def __init__(self, *, concurrency: int, observation_dir=None):
+            self._observer = PostObserver(observation_dir)
             # Lazy creation to this actor's event loop
             self._client = httpx.AsyncClient(
-                limits=httpx.Limits(max_connections=max(1, concurrency)),
+                limits=_rollout_client_limits(concurrency),
                 timeout=httpx.Timeout(None),
             )
 
-        async def do_post(self, url, payload, max_retries=60, action="post", headers=None):
-            return await _post(self._client, url, payload, max_retries, action=action, headers=headers)
+        async def do_post(
+            self,
+            url,
+            payload,
+            max_retries=60,
+            action="post",
+            headers=None,
+            *,
+            return_bytes=False,
+            decode_routed_experts=False,
+            compact_token_logprobs=False,
+        ):
+            observation = self._observer.start(payload)
+            result = None
+            try:
+                response = await _post(
+                    self._client,
+                    url,
+                    payload,
+                    max_retries,
+                    action=action,
+                    headers=headers,
+                    return_bytes=return_bytes,
+                    observation=observation,
+                )
+                # Decode after the HTTP retry loop: malformed replay is not a
+                # transport failure and must never replay a delivered request.
+                processed = response
+                if not return_bytes:
+                    if decode_routed_experts:
+                        processed = decode_response_routes(processed, observation=observation)
+                    if compact_token_logprobs:
+                        processed = compact_token_logprobs_response(processed, observation=observation)
+                result = processed
+                return result
+            except httpx.HTTPError as error:
+                return HTTPPostFailure.capture(error, method=action, url=url)
+            finally:
+                self._observer.finish(observation, result)
 
     # Create actors per node
     created = []
-    # Distribute client concurrency across actors (at least 1 per actor)
-    per_actor_conc = (_client_concurrency + len(nodes)) // len(nodes)
+    workers_per_node = getattr(args, "http_post_actors_per_node", None)
+    workers_per_node = args.num_gpus_per_node if workers_per_node is None else workers_per_node
+    worker_cpus = getattr(args, "http_post_num_cpus", 0.001)
+    if workers_per_node < 1 or worker_cpus <= 0:
+        raise ValueError("HTTP worker count and CPU reservation must be positive")
+    total_workers = len(nodes) * workers_per_node
+    per_actor_conc = max(1, (_client_concurrency + total_workers - 1) // total_workers)
+    observed = getattr(getattr(args, "olmo_core", None), "pipeline_observation_interval", 0) > 0
+    observation_dir = getattr(args, "save", None) if observed else None
+    logger.info(
+        "Distributed HTTP: nodes=%d workers_per_node=%d total_workers=%d cpus_per_worker=%g concurrency_per_worker=%d",
+        len(nodes),
+        workers_per_node,
+        total_workers,
+        worker_cpus,
+        per_actor_conc,
+    )
 
     for node in nodes:
         node_id = node["NodeID"]
         scheduling = NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
-        for _ in range(args.num_gpus_per_node):
+        for _ in range(workers_per_node):
             actor = _HttpPosterActor.options(
                 name=None,
                 lifetime="detached",
                 scheduling_strategy=scheduling,
                 max_concurrency=per_actor_conc,
-                # Use tiny CPU to schedule
-                num_cpus=0.001,
-            ).remote(concurrency=per_actor_conc)
+                num_cpus=worker_cpus,
+            ).remote(concurrency=per_actor_conc, observation_dir=observation_dir)
             created.append(actor)
 
     _post_actors = created
 
 
+def _rollout_client() -> httpx.AsyncClient:
+    # a process where init_http_client never ran, such as a subproc agent call, gets a default client
+    return _http_client if _http_client is not None else GeneralHttpClientProvider.client()
+
+
 # TODO may generalize the name since it now contains http DELETE/GET etc (with retries and remote-execution)
-async def post(url, payload, max_retries=60, action="post", headers=None):
+async def post(
+    url,
+    payload,
+    max_retries=60,
+    action="post",
+    headers=None,
+    *,
+    return_bytes=False,
+    decode_routed_experts=False,
+    compact_token_logprobs=False,
+):
+    """POST ``payload`` and return the parsed response.
+
+    ``decode_routed_experts`` turns the base64 routing blob into an int32 array
+    and ``compact_token_logprobs`` turns per-token logprob records into flat
+    arrays. Both run where the JSON was parsed, so a distributed HTTP worker
+    ships buffers to the producer instead of nested Python objects.
+    """
     # If distributed mode is enabled and actors exist, dispatch via Ray.
     if _distributed_post_enabled and _post_actors:
-        try:
-            actor = _next_actor()
-            if actor is not None:
-                return await actor.do_post.remote(url, payload, max_retries, action=action, headers=headers)
-        except Exception as e:
-            logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
-            # fall through to local
+        # A remote failure can follow successful request delivery. Propagate it;
+        # the rollout's bounded whole-group recovery owns retries, not this layer.
+        actor = _next_actor()
+        if actor is not None:
+            result = await actor.do_post.remote(
+                url,
+                payload,
+                max_retries,
+                action=action,
+                headers=headers,
+                return_bytes=return_bytes,
+                decode_routed_experts=decode_routed_experts,
+                compact_token_logprobs=compact_token_logprobs,
+            )
+            if isinstance(result, HTTPPostFailure):
+                raise result.exception()
+            return result
 
-    return await _post(_http_client, url, payload, max_retries, action=action, headers=headers)
+    response = await _post(
+        _rollout_client(),
+        url,
+        payload,
+        max_retries,
+        action=action,
+        headers=headers,
+        return_bytes=return_bytes,
+    )
+    if return_bytes:
+        return response
+    if decode_routed_experts:
+        response = decode_response_routes(response)
+    if compact_token_logprobs:
+        response = compact_token_logprobs_response(response)
+    return response
 
 
 # TODO unify w/ `post` to add retries and remote-execution
 async def get(url):
-    response = await _http_client.get(url)
+    response = await _rollout_client().get(url)
     response.raise_for_status()
     output = response.json()
     return output

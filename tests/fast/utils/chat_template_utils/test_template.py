@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import copy
 import json
+from collections import OrderedDict
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -79,6 +80,10 @@ def _make_serving(tokenizer) -> OpenAIServingChat:
     # encode site. __init__ always sets this; mirror it here so _process_messages
     # takes the real production path instead of hitting AttributeError.
     serving._tokenizer_auto_adds_specials = len(tokenizer.encode("")) > 0
+    # Preserve the production choice between template token IDs and a text
+    # round-trip, including tokenizers whose control tokens have no text form.
+    serving._prompt_text_round_trip_is_lossy = serving._probe_prompt_text_round_trip()
+    serving._chat_template_cache = OrderedDict()
     return serving
 
 

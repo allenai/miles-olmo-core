@@ -1,3 +1,5 @@
+> This model is not supported in this fork. Its implementation depends on deliberately excluded model/kernel sources; the instructions below describe upstream Miles.
+
 ---
 title: DeepSeek-V4.1 Flash
 description: Launch recipe for DeepSeek-V4.1 with radixark/miles:deepseek-v41 — BF16 train / BF16 rollout, colocated, 4-node GB300 (16 GPUs) with optimizer state streamed to NVMe.

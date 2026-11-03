@@ -479,7 +479,7 @@ SOFTWARE.
 
 Source: [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention).
 
-Included code: `miles/backends/fsdp_utils/sglang_attn_bridge/triton_attn_bwd.py`.
+Included code: `miles/kernels/attention/dense/backward.py`.
 
 <details>
 <summary>Copyright, license, and notices</summary>
@@ -1418,7 +1418,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Source: [OpenRLHF/OpenRLHF](https://github.com/OpenRLHF/OpenRLHF).
 
-Included code: `miles/ray/utils.py` and `miles/backends/training_utils/loss_hub/math_utils.py`.
+Included code: `miles/ray/utils.py` and `miles/backends/training_utils/loss/hub/math_utils.py`.
 
 <details>
 <summary>Copyright, license, and notices</summary>
@@ -2935,7 +2935,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Source: [sgl-project/sglang](https://github.com/sgl-project/sglang).
 
-Included code: `miles/utils/external_utils/command_utils.py` and upstream context in `docker/npu_patch/sglang.patch`.
+Included code: `miles/utils/external_utils/command_utils/` and upstream context in `docker/npu_patch/sglang.patch`.
 
 <details>
 <summary>Copyright, license, and notices</summary>
@@ -3611,7 +3611,7 @@ Copyright 2018- The Hugging Face team. All rights reserved.
 
 Source: [triton-lang/triton](https://github.com/triton-lang/triton).
 
-Included code: `miles/backends/fsdp_utils/sglang_attn_bridge/triton_attn_bwd.py`.
+Included code: `miles/kernels/attention/dense/backward.py`.
 
 <details>
 <summary>Copyright, license, and notices</summary>
@@ -3869,3 +3869,34 @@ Copyright 2023-2024 Bytedance Ltd. and/or its affiliates
 ```
 
 </details>
+
+## Flash Linear Attention — MIT
+
+Source: [fla-org/flash-linear-attention](https://github.com/fla-org/flash-linear-attention).
+
+Included code: Upstream context and modifications in
+`docker/patch/fla_kda_hoist_next_power_of_2.patch`, applied to version 0.5.2.
+
+```text
+MIT License
+
+Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```

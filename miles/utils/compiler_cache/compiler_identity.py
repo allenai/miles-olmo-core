@@ -98,6 +98,10 @@ def compiler_environment(environment):
         # per serving process; including it prevents an identical restart hit.
         "SGLANG_DG_CACHE_DIR",
         "TILELANG_TMP_DIR",
+        "TILELANG_JIT_DIAGNOSTICS",
+        # Forced by the opt-in TileLang lifecycle; its native libraries are
+        # fingerprinted separately. This is not a Triton compiler option.
+        "TILELANG_KERNEL_CACHE_USE_LIB_STAMP",
     }
     return {
         key: cache.digest(value)

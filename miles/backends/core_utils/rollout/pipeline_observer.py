@@ -66,8 +66,11 @@ def snapshot(producer):
         for identity, counts in getattr(producer, "_ready_completion_counts", {}).items()
         if identity not in buffered_ids
     ]
+    staged_groups = len(ready)
+    unharvested_groups = 0
     for task in producer._active_tasks:
         if task.done() and not task.cancelled() and task.exception() is None:
+            unharvested_groups += 1
             ready.append(completion_counts([task.result()]))
     ready_counts = (
         {key: sum(row[key] for row in ready) for key in ("groups", "samples", "response_tokens")}
@@ -77,6 +80,8 @@ def snapshot(producer):
     return {
         "completed_queue": completed,
         "producer_ready": ready_counts,
+        "producer_staged_completion_groups": staged_groups,
+        "producer_unharvested_completion_groups": unharvested_groups,
         "shutdown_unqueued": getattr(producer, "_shutdown_unqueued_counts", None),
         "completed_put_wait_seconds": getattr(producer, "_completed_put_wait_seconds", None),
         "completed_put_current_wait_seconds": (
@@ -113,8 +118,20 @@ async def observe(producer):
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", buffering=1) as stream:
+            previous_wall, previous_cpu, previous_thread = time.monotonic(), time.process_time(), time.thread_time()
+            expected_wake = previous_wall
             while True:
-                stream.write(json.dumps(snapshot(producer)) + "\n")
+                wall, cpu, thread = time.monotonic(), time.process_time(), time.thread_time()
+                record = snapshot(producer)
+                record.update(
+                    observation_elapsed_seconds=wall - previous_wall,
+                    event_loop_lag_seconds=max(0, wall - expected_wake),
+                    process_cpu_seconds=cpu - previous_cpu,
+                    event_loop_thread_cpu_seconds=thread - previous_thread,
+                )
+                stream.write(json.dumps(record) + "\n")
+                previous_wall, previous_cpu, previous_thread = wall, cpu, thread
+                expected_wake = time.monotonic() + interval
                 await asyncio.sleep(interval)
     except Exception:
         # Diagnostics must not terminate generation or change ownership.

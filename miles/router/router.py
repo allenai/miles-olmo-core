@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 import sys
 from contextlib import suppress
 
@@ -11,12 +10,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
+from miles.router import engine_metrics
 from miles.router.config import MilesRouterConfig
-from miles.utils import infra_timeouts
+from miles.utils import infra_timeouts, logger_utils
 from miles.utils.logging_utils import configure_logger_raw
 from miles.utils.workers.argv_utils import parse_config_argv
 
-logger = logging.getLogger(__name__)
+logger = logger_utils.setup_logger(__name__)
 
 
 def run_router(config: MilesRouterConfig):
@@ -55,9 +55,12 @@ class MilesRouter:
         self._retired: set[str] = set()
         self._worker_epochs: dict[str, int] = {}
         self._health_task: asyncio.Task | None = None
+        self.engine_metrics = engine_metrics.EngineMetrics()
 
         self.client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=config.max_connections),
+            # Avoid idle-socket reuse races while large generation bodies stall
+            # this event loop. Health/control traffic retains its separate pool.
+            limits=httpx.Limits(max_connections=config.max_connections, max_keepalive_connections=0),
             timeout=infra_timeouts.http_timeout(config.timeout),
         )
 
@@ -76,11 +79,18 @@ class MilesRouter:
         self.app.post("/add_worker")(self.add_worker)
         self.app.post("/remove_worker")(self.remove_worker)
         self.app.get("/list_workers")(self.list_workers)
+        self.app.get("/engine_metrics")(self.get_engine_metrics)
         # Catch-all route for proxying to SGLang - must be registered LAST
         self.app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])(self.proxy)
 
     async def _start_background_health_check(self):
         self._health_task = asyncio.create_task(self._health_check_loop())
+
+    async def get_engine_metrics(self):
+        # Include quarantined workers for diagnosis; omit removed workers.
+        urls = tuple(url for url in self.worker_request_counts if url not in self._retired)
+        content = await self.engine_metrics.scrape(urls)
+        return Response(content, media_type="text/plain; version=0.0.4; charset=utf-8")
 
     async def _check_worker_health(self, url):
         """Encapsulated health check logic for better maintainability."""
@@ -178,11 +188,15 @@ class MilesRouter:
 
             response = await self.client.request(request.method, url, content=body, headers=headers)
             content = await response.aread()
+            response_headers = dict(response.headers)
+            if request.headers.get("x-miles-report-worker") == "1":
+                # Diagnostic attribution without parsing large generation payloads.
+                response_headers["x-miles-worker-url"] = worker_url
             return {
                 "request_body": body,
                 "response_body": content,
                 "status_code": response.status_code,
-                "headers": dict(response.headers),
+                "headers": response_headers,
             }
         except httpx.RequestError as error:
             logger.warning(
@@ -304,6 +318,7 @@ class MilesRouter:
                 await self._health_task
             self._health_task = None
         await self.health_client.aclose()
+        await self.engine_metrics.close()
         await self.client.aclose()
 
     def _finish_url(self, url):

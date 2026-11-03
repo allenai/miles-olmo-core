@@ -2,9 +2,11 @@
 
 import gzip
 import json
+from unittest.mock import Mock
 
 import httpx
 import pytest
+from fastapi import Request
 
 from miles.router.router import MilesRouter
 
@@ -58,3 +60,26 @@ async def test_proxy_returns_decoded_httpx_body_without_stale_encoding():
     )
     assert response.body == body
     assert "content-encoding" not in response.headers
+
+
+@pytest.mark.parametrize("report_worker", [False, True])
+async def test_proxy_reports_actual_worker_only_when_requested(report_worker):
+    worker = "http://engine:30000"
+    body = b'{ "logprob": -1.234567890123456789 }'
+
+    async def upstream(request):
+        assert str(request.url) == worker + "/generate"
+        return httpx.Response(200, content=body, headers={"content-type": "application/json"})
+
+    router = object.__new__(MilesRouter)
+    router._use_url = Mock(return_value=worker)
+    router._finish_url = Mock()
+    headers = [(b"x-miles-report-worker", b"1")] if report_worker else []
+    request = Request({"type": "http", "method": "POST", "headers": headers})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        router.client = client
+        result = await router.do_proxy(request, "generate", body=b"{}")
+    response = router.build_proxy_response(result)
+    assert response.body == body
+    assert response.headers.get("x-miles-worker-url") == (worker if report_worker else None)
+    router._finish_url.assert_called_once_with(worker)

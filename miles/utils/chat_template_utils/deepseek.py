@@ -1,4 +1,4 @@
-"""Bridge to SGLang's DeepSeek V4 encoder.
+"""Bridge to SGLang's DeepSeek V4 and V4.1 encoders.
 
 DeepSeek V3.2 encoding is not included in this fork.
 """
@@ -9,11 +9,11 @@ import copy
 import functools
 import json
 import os
+from collections.abc import Callable
 from typing import Any
 
-from sglang.srt.entrypoints.openai import encoding_dsv4
+from sglang.srt.entrypoints.openai import chat_encoding, encoding_dsv4, encoding_dsv41
 from sglang.srt.entrypoints.openai.protocol import Tool
-
 
 _ASSISTANT_SP_TOKEN = "<｜Assistant｜>"
 
@@ -36,17 +36,22 @@ def _read_model_type(name_or_path: str) -> str:
     return config.get("model_type", "") or ""
 
 
-def _inject_tools_into_system(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _inject_tools_into_system(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    tool_payload: Callable[[Tool], dict[str, Any]] = Tool.model_dump,
+) -> list[dict[str, Any]]:
     """Put *tools* in the system message, where ``encode_messages`` reads them.
 
     The encoder serializes each tool dict verbatim into ``<functions>``, so they
-    must round-trip through ``Tool.model_dump()`` (fills defaults / orders fields)
-    or the token ids drift from what sglang serves.
+    must round-trip through the same pydantic payload sglang's ``serving_chat``
+    builds (``Tool.model_dump()`` fills defaults / orders fields; V4.1 keeps
+    only the fields the client sent) or the token ids drift from what sglang serves.
     """
     out = copy.deepcopy(messages)
     if not out or out[0].get("role") != "system":
         out.insert(0, {"role": "system", "content": ""})
-    out[0]["tools"] = [Tool.model_validate(t).model_dump() for t in tools]
+    out[0]["tools"] = [tool_payload(Tool.model_validate(t)) for t in tools]
     return out
 
 
@@ -74,6 +79,9 @@ class DeepSeekFamily:
     def _generation_prompt_suffix(self, tail_role: str | None, thinking_token: str) -> str | None:
         raise NotImplementedError
 
+    def _inject_tools(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return _inject_tools_into_system(messages, tools)
+
     def render_messages(
         self,
         messages: list[dict[str, Any]],
@@ -91,7 +99,7 @@ class DeepSeekFamily:
         """
         encode_config = self._build_encode_config(kwargs)
         if tools:
-            messages = _inject_tools_into_system(messages, tools)
+            messages = self._inject_tools(messages, tools)
         rendered = self.template.encode_messages(messages, **encode_config)
         if add_generation_prompt or not messages:
             return rendered
@@ -116,10 +124,38 @@ class DeepSeekV4Family(DeepSeekFamily):
         return None
 
 
+class DeepSeekV41Family(DeepSeekV4Family):
+    """V4.1 mirrors sglang's ``serving_chat`` dsv41 branch: tools keep only the
+    fields the client sent, ``reasoning_effort`` always reaches the encoder (the
+    server default comes from ``SGLANG_DSV41_REASONING_EFFORT``), and a
+    mid-conversation system message also opens an assistant turn."""
+
+    template = encoding_dsv41
+
+    def _build_encode_config(self, kwargs: dict) -> dict:
+        kwargs = super()._build_encode_config(kwargs)
+        default = chat_encoding.default_dsv41_reasoning_effort_from_env(
+            os.environ.get("SGLANG_DSV41_REASONING_EFFORT", "high")
+        )
+        effort = chat_encoding.parse_dsv41_reasoning_effort(kwargs.get("reasoning_effort"))
+        kwargs["reasoning_effort"] = default if effort is None else effort
+        return kwargs
+
+    def _inject_tools(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return _inject_tools_into_system(messages, tools, chat_encoding.dsv41_tool_payload)
+
+    def _generation_prompt_suffix(self, tail_role: str | None, thinking_token: str) -> str | None:
+        if tail_role in {"user", "developer", "tool", "system"}:
+            return _ASSISTANT_SP_TOKEN + thinking_token
+        return None
+
+
 V4 = DeepSeekV4Family()
+V41 = DeepSeekV41Family()
 
 _FAMILIES = {
     "deepseek_v4": V4,
+    "deepseek_v41": V41,
 }
 
 

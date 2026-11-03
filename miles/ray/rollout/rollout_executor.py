@@ -1,14 +1,19 @@
 import asyncio
 import logging
 import time
+from collections import defaultdict
+from collections.abc import Sequence
+from typing import Any
 
-import ray
-
+from miles.backends.core_utils import integration as core_integration
+from miles.backends.core_utils.rollout import prepared_batch
+from miles.backends.hooks import get_backend_hooks
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.debug_data import RolloutDataInjectionUtil, load_debug_rollout_data, save_debug_rollout_data
-from miles.ray.rollout.eval_fleet import EvalFleet
+from miles.ray.rollout.eval_fleet import EvalFleetInfo, RolloutExecutorEvalFleet
 from miles.ray.rollout.metrics import log_eval_rollout_data, log_eval_skip, log_rollout_data
 from miles.ray.rollout.rollout_data_conversion import postprocess_rollout_data
+from miles.ray.rollout.router_manager import resolve_router_addrs, wait_session_server_ready
 from miles.ray.rollout.train_data_conversion import (
     ROLLOUT_DATA_VALUE_SPEC,
     convert_samples_to_train_data,
@@ -22,20 +27,27 @@ from miles.rollout.base_types import (
 )
 from miles.rollout.checkpoint_eval import CheckpointEvalFn, EvalSkip
 from miles.rollout.inference_rollout.compatibility import call_rollout_function, load_rollout_function
-from miles.utils import object_store
-from miles.utils.async_utils import run
+from miles.utils import async_utils, object_store
+from miles.utils.async_utils import maybe_await
 from miles.utils.audit_utils.event_analyzer import analyzer as event_analyzer
 from miles.utils.audit_utils.event_logger import checkpoint as event_logger_checkpoint
-from miles.utils.audit_utils.process_identity import RolloutExecutorProcessIdentity
+from miles.utils.audit_utils.event_logger.logger import event_logger_context
+from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
+from miles.utils.data import RolloutDataPack
 from miles.utils.environ import use_legacy_rollout_v1
 from miles.utils.function_registry import load_function
-from miles.utils.hf_config import is_complete_hf_export
+from miles.utils.hf_utils.config import is_complete_hf_export
 from miles.utils.http_utils import init_http_client
+from miles.utils.init_once import InitOnce, init_once
 from miles.utils.logging_utils import configure_logger
 from miles.utils.metric_checker import MetricChecker
+from miles.utils.metric_utils import compute_rollout_step
 from miles.utils.timer import timer
+from miles.utils.tracking_utils import tracking
 from miles.utils.tracking_utils.tracking import finish_tracking, init_tracking
 from miles.utils.weight_version import assert_samples_weight_version_sane, assert_weight_version_is_published
+from miles.utils.workers.rpc.common.metadata import rpc
+from miles.utils.workers.worker_provider.base import BaseWorkerProvider
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -44,18 +56,38 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
-@ray.remote
 class RolloutExecutor:
     """The class to run rollout and convert rollout data to training data."""
 
-    def __init__(self, *, args):
-        event_logger_checkpoint.restore(args)
-        configure_logger(args, source=RolloutExecutorProcessIdentity())
+    def __init__(
+        self,
+        *,
+        args,
+        router_providers: Sequence[BaseWorkerProvider],
+        session_server_provider: BaseWorkerProvider | None,
+        inference_controller_provider: BaseWorkerProvider,
+    ):
+        self._init_once = InitOnce(type(self).__name__)
+
+        configure_logger(args, source=SimpleProcessIdentity(component="rollout_executor"))
 
         self.args = args
-        # set by the training actor after each weight update
-        self.weight_version: int | None = None
-        self._rollouts_since_weight_version_publish = 0
+        # set by the training actor after each weight update, keyed by trainer model id (None for one policy)
+        self._weight_versions_of_model_id: dict[str | None, int] = {}
+        self._rollouts_since_publish_of_model_id: dict[str | None, int] = defaultdict(int)
+        self._train_parallel_configs_of_model_id: dict[str | None, dict[str, Any]] = {}
+        self._core_prepared_batch: prepared_batch.PreparedBatch | None = None
+        self._router_providers = router_providers
+        self._session_server_provider = session_server_provider
+        self._inference_controller_provider = inference_controller_provider
+
+    @init_once
+    async def init(self) -> None:
+        args = self.args
+        if not args.debug_train_only or args.eval_num_gpus > 0:
+            await resolve_router_addrs(args, router_providers=self._router_providers)
+            await wait_session_server_ready(args, provider=self._session_server_provider)
+
         # TODO make args immutable
         init_tracking(args, primary=False, router_addr=f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
         object_store.init_instance(args, contribute_segment=False)
@@ -94,61 +126,115 @@ class RolloutExecutor:
 
         self.rollout_id = -1
         self._eval_lock = asyncio.Lock()
-        self._eval_fleet: EvalFleet | None = None
+        self._eval_fleet: RolloutExecutorEvalFleet | None = None
 
         self._metric_checker = MetricChecker.maybe_create(args)
+        self._diagnostic_writer = get_backend_hooks(getattr(args, "train_backend", None)).diagnostic_writer(args)
 
-    # -------------------------- lifecycle -----------------------------
-    # TODO: may have a `async def init` here later
+    async def get_init_state(self) -> str:
+        return self._init_once.state.value
 
-    async def core_publication_boundary(self, begin: bool, *, refresh: bool = False):
-        producer = self.generate_rollout
-        if refresh:
-            method = "begin_refresh" if begin else "end_refresh"
-            if not hasattr(producer, method):
-                raise RuntimeError("Policy refresh requires the managed refreshing producer")
-        else:
-            method = "prepare_publication" if begin else "finish_publication"
-        if hasattr(producer, method):
-            return await asyncio.to_thread(run, getattr(producer, method)())
+    @rpc(enabled=False)
+    async def core_publication_boundary(self, begin: bool, *, refresh: bool = False, abort: bool = False):
+        return await core_integration.publication_boundary(self.generate_rollout, begin, refresh=refresh, abort=abort)
 
+    @rpc(enabled=False)
     async def core_engine_drain(self, operation: str, **kwargs):
-        """Run ownership mutations on the producer event loop, never the Ray loop."""
-        if not hasattr(self.generate_rollout, "engine_drain_control"):
-            raise RuntimeError("engine drain requires the Open Instruct draining producer")
-        result = await asyncio.to_thread(run, self.generate_rollout.engine_drain_control(operation, **kwargs))
-        if operation in ("initialize", "step", "publish"):
-            # Dequeue lag uses the consuming trainer step; serving versions are per engine.
-            self.set_weight_version(result["optimizer_step"])
-        return result
+        return await core_integration.engine_drain(
+            self.generate_rollout, operation, set_weight_version=self.set_weight_version, **kwargs
+        )
 
-    def dispose(self):
-        if self.args.train_backend == "olmo_core" and hasattr(self.generate_rollout, "shutdown"):
-            run(self.generate_rollout.shutdown())
-        if (close := getattr(self.data_source, "close", None)) is not None:
-            close()
-        event_analyzer.run_analysis_from_args(self.args)
-        if self._metric_checker is not None:
-            self._metric_checker.dispose()
-        if isinstance(self.eval_generate_rollout, CheckpointEvalFn):
-            self.eval_generate_rollout.dispose()
-        finish_tracking()
+    @rpc(enabled=False)
+    async def core_prefetch(self, rollout_id: int):
+        if getattr(self, "_core_prepared_batch", None) is not None:
+            raise RuntimeError("Only one prepared batch may be outstanding")
+        self._core_prepared_batch = prepared_batch.PreparedBatch(self, rollout_id)
+
+    @rpc(enabled=False)
+    @event_logger_context(lambda _self, rollout_id: dict(rollout_id=rollout_id))
+    async def core_get_prepared(self, rollout_id: int):
+        prepared = getattr(self, "_core_prepared_batch", None)
+        if prepared is None:
+            raise RuntimeError("No prepared batch is outstanding")
+        batch = await prepared.consume(rollout_id)
+        self._core_prepared_batch = None
+        self.rollout_id = rollout_id
+        self._rollouts_since_publish_of_model_id[None] += 1
+        return batch
+
+    @rpc(enabled=False)
+    async def core_cancel_prepared(self):
+        if (prepared := getattr(self, "_core_prepared_batch", None)) is not None:
+            try:
+                await prepared.close()
+            finally:
+                self._core_prepared_batch = None
+
+    async def dispose(self) -> None:
+        try:
+            await self.core_cancel_prepared()
+            if getattr(self, "_diagnostic_writer", None) is not None:
+                await self._diagnostic_writer.close()
+        finally:
+            # A failed diagnostic flush must not leave generation requests or
+            # data/tracking resources alive. Propagate its error after cleanup.
+            await asyncio.to_thread(
+                get_backend_hooks(getattr(self.args, "train_backend", None)).shutdown_rollout,
+                getattr(self, "generate_rollout", None),
+            )
+            if not self.use_legacy_rollout_v1 and self.generate_rollout is not None:
+                await maybe_await(self.generate_rollout.dispose())
+            if (close := getattr(self.data_source, "close", None)) is not None:
+                close()
+            event_analyzer.run_analysis_from_args(self.args)
+            if self._metric_checker is not None:
+                self._metric_checker.dispose()
+            if isinstance(self.eval_generate_rollout, CheckpointEvalFn):
+                await maybe_await(self.eval_generate_rollout.dispose())
+            finish_tracking()
 
     # -------------------------- data generation -----------------------------
 
-    async def get(self, rollout_id):
-        start_time = time.time()
+    @event_logger_context(lambda _self, rollout_id, trainer_model_id=None: dict(rollout_id=rollout_id))
+    async def get(self, rollout_id: int, trainer_model_id: str | None = None) -> RolloutDataPack:
         self.rollout_id = rollout_id
-        self._rollouts_since_weight_version_publish += 1
+        self._rollouts_since_publish_of_model_id[trainer_model_id] += 1
         assert_weight_version_is_published(
-            self.args, rollouts_since_publish=self._rollouts_since_weight_version_publish
+            self.args, rollouts_since_publish=self._rollouts_since_publish_of_model_id[trainer_model_id]
         )
+        if getattr(self, "_core_prepared_batch", None) is not None:
+            raise RuntimeError("Consume or cancel the prepared batch before another get")
+        return await self._prepare_rollout(rollout_id, trainer_model_id)
+
+    async def _prepare_rollout(self, rollout_id, trainer_model_id=None, *, weight_version=None, reserve=False):
+        start_time = time.time()
         if (get_buffer_length := getattr(self.data_source, "get_buffer_length", None)) is not None:
             dashboard_hooks.report_data_buffer(get_buffer_length())
-        with timer("rollout"):
-            data, metadata, metrics = await self._get_rollout_data(rollout_id=rollout_id)
-        save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=False, metadata=metadata)
-        log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
+        with timer("rollout" if trainer_model_id is None else f"{trainer_model_id}/rollout"):
+            data, metadata, metrics = await self._get_rollout_data(
+                rollout_id=rollout_id,
+                trainer_model_id=trainer_model_id,
+                weight_version=weight_version,
+                reserve=reserve,
+            )
+        diagnostic_started = time.perf_counter()
+        if getattr(self, "_diagnostic_writer", None) is not None:
+            metrics = dict(metrics or {})
+            metrics.update(await self._diagnostic_writer.submit(data, rollout_id, metadata, trainer_model_id))
+        else:
+            save_debug_rollout_data(
+                self.args,
+                data,
+                rollout_id=rollout_id,
+                evaluation=False,
+                metadata=metadata,
+                trainer_model_id=trainer_model_id,
+            )
+        metrics_started = time.perf_counter()
+        log_rollout_data(
+            rollout_id, self.args, data, metrics, time.time() - start_time, trainer_model_id=trainer_model_id
+        )
+        conversion_started = time.perf_counter()
         data = convert_samples_to_train_data(
             self.args,
             data,
@@ -156,20 +242,40 @@ class RolloutExecutor:
             custom_convert_samples_to_train_data_func=self.custom_convert_samples_to_train_data_func,
             custom_reward_post_process_func=self.custom_reward_post_process_func,
         )
+        converted_at = time.perf_counter()
         sample_indices = data.get("sample_indices")
         if self.args.delay_split_train_data_by_dp:
             data_ref = object_store.get_instance().put(value=data, value_spec=ROLLOUT_DATA_VALUE_SPEC)
         else:
-            data_ref = split_train_data_by_dp(self.args, data, self.train_parallel_config)
-        return dict(sample_indices=sample_indices, data_ref=data_ref)
+            data_ref = split_train_data_by_dp(
+                self.args, data, self._train_parallel_configs_of_model_id[trainer_model_id]
+            )
+        handoff = {
+            "rollout_id": rollout_id,
+            "diagnostic_submit_seconds": metrics_started - diagnostic_started,
+            "metrics_seconds": conversion_started - metrics_started,
+            "conversion_seconds": converted_at - conversion_started,
+            "shard_store_seconds": time.perf_counter() - converted_at,
+        }
+        logger.info("Rollout handoff timing: %s", handoff)
+        if getattr(self, "_diagnostic_writer", None) is not None:
+            tracking.log(
+                self.args,
+                {
+                    "rollout/step": compute_rollout_step(self.args, rollout_id),
+                    **{f"rollout/handoff/{key}": value for key, value in handoff.items() if key != "rollout_id"},
+                },
+                step_key="rollout/step",
+            )
+        return RolloutDataPack(sample_indices=sample_indices, data_ref=data_ref)
 
     async def eval(
         self,
-        rollout_id,
+        rollout_id: int,
         hf_dir: str | None = None,
         export_time_seconds: float | None = None,
         require_marker: bool = True,
-    ):
+    ) -> None:
         if self.args.debug_train_only and not self.args.eval_uses_snapshots:
             return
 
@@ -235,17 +341,27 @@ class RolloutExecutor:
         if self.args.ci_test:
             raise RuntimeError(f"CI eval {rollout_id} skipped: {reason}")
 
-    async def _get_rollout_data(self, rollout_id):
+    async def _get_rollout_data(
+        self, rollout_id, trainer_model_id: str | None = None, *, weight_version=None, reserve=False
+    ):
         if self.args.load_debug_rollout_data is not None:
             data, metadata = load_debug_rollout_data(self.args, rollout_id=rollout_id)
             metrics = None
         else:
             if not self.use_legacy_rollout_v1:
-                data = await asyncio.to_thread(
-                    call_rollout_function,
-                    self.generate_rollout,
-                    RolloutFnTrainInput(rollout_id=rollout_id, weight_version=self.weight_version),
+                request = RolloutFnTrainInput(
+                    rollout_id=rollout_id,
+                    weight_version=(
+                        self._weight_versions_of_model_id.get(trainer_model_id)
+                        if weight_version is None
+                        else weight_version
+                    ),
+                    trainer_model_id=trainer_model_id,
                 )
+                if reserve:
+                    data = await asyncio.wrap_future(async_utils.submit(self.generate_rollout.reserve(request)))
+                else:
+                    data = await asyncio.to_thread(call_rollout_function, self.generate_rollout, request)
             else:
                 data = await asyncio.to_thread(
                     call_rollout_fn, self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False
@@ -253,7 +369,7 @@ class RolloutExecutor:
             metrics = data.metrics
             data = data.samples
             data, metadata = postprocess_rollout_data(
-                self.args, data, train_parallel_config=self.train_parallel_config
+                self.args, data, train_parallel_config=self._train_parallel_configs_of_model_id[trainer_model_id]
             )
             assert_samples_weight_version_sane(self.args, samples=data)
             if RolloutDataInjectionUtil.should_inject(self.args, rollout_id):
@@ -269,7 +385,7 @@ class RolloutExecutor:
     # -------------------------- checkpointing -----------------------------
 
     # TODO the train and eval rollout functions will become one object, so one save/load is enough here
-    def save(self, rollout_id):
+    def save(self, rollout_id: int) -> None:
         self.data_source.save(rollout_id)
         if not self.use_legacy_rollout_v1:
             if self.generate_rollout is not None:
@@ -278,7 +394,7 @@ class RolloutExecutor:
                 eval_fn.save(rollout_id)
         event_logger_checkpoint.snapshot(self.args, rollout_id)
 
-    def load(self, rollout_id=None):
+    def load(self, rollout_id: int | None = None) -> None:
         self.data_source.load(rollout_id)
         if not self.use_legacy_rollout_v1:
             if self.generate_rollout is not None:
@@ -288,21 +404,28 @@ class RolloutExecutor:
 
     # -------------------------- misc APIs -----------------------------
 
-    def get_num_rollout_per_epoch(self):
+    def get_num_rollout_per_epoch(self) -> int:
         assert self.args.rollout_global_dataset
         return len(self.data_source.dataset) // self.args.rollout_batch_size
 
-    def set_weight_version(self, weight_version: int):
+    def set_weight_version(self, weight_version: int, trainer_model_id: str | None = None) -> None:
         # warning instead of assert when use indep_dp ft
-        if self.weight_version is not None and weight_version < self.weight_version:
-            message = f"Engine weight version went backwards: {self.weight_version} -> {weight_version}"
+        previous = self._weight_versions_of_model_id.get(trainer_model_id)
+        if previous is not None and weight_version < previous:
+            message = f"Engine weight version went backwards: {previous} -> {weight_version}"
             assert self.args.indep_dp, message
             logger.warning(message)
-        self.weight_version = weight_version
-        self._rollouts_since_weight_version_publish = 0
+        self._weight_versions_of_model_id[trainer_model_id] = weight_version
+        self._rollouts_since_publish_of_model_id[trainer_model_id] = 0
 
-    def set_train_parallel_config(self, config: dict):
-        self.train_parallel_config = config
+    def set_train_parallel_config(self, config: dict[str, Any], trainer_model_id: str | None = None) -> None:
+        self._train_parallel_configs_of_model_id[trainer_model_id] = config
 
-    def set_eval_fleet(self, eval_fleet: "EvalFleet | None"):
-        self._eval_fleet = eval_fleet
+    async def set_eval_fleet_info(self, eval_fleet_info: EvalFleetInfo | None) -> None:
+        if eval_fleet_info is None:
+            self._eval_fleet = None
+            return
+
+        self._eval_fleet = RolloutExecutorEvalFleet(
+            self.args, info=eval_fleet_info, inference_controller_provider=self._inference_controller_provider
+        )

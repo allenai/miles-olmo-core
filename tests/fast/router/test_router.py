@@ -519,12 +519,19 @@ class TestProxyIntegration:
         requests.post(f"{router_env.url}/add_worker", params={"url": worker2.url}, timeout=5.0)
 
         payload = {"input_ids": [1, 2, 3], "return_logprob": True}
+        served_by = []
         for _ in range(4):
-            requests.post(f"{router_env.url}/generate", json=payload, timeout=10.0).raise_for_status()
+            response = requests.post(
+                f"{router_env.url}/generate", json=payload, headers={"x-miles-report-worker": "1"}, timeout=10.0
+            )
+            response.raise_for_status()
+            served_by.append(response.headers["x-miles-worker-url"])
 
         all_requests = worker1.request_log + worker2.request_log
         assert len(all_requests) == 4
         assert all(req == payload for req in all_requests)
+        assert served_by.count(worker1.url) == len(worker1.request_log)
+        assert served_by.count(worker2.url) == len(worker2.request_log)
 
     def test_proxy_health_endpoint(self, router_env: RouterEnv, mock_worker: MockSGLangServer):
         requests.post(f"{router_env.url}/add_worker", params={"url": mock_worker.url}, timeout=5.0)

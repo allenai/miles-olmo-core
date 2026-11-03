@@ -6,10 +6,15 @@ from copy import deepcopy
 from typing import Any
 
 import numpy as np
-import pybase64
 
-from miles.utils.lora import LORA_ADAPTER_NAME, lora_rollout_enabled
+from miles.rollout.generate_utils.rollout_topk_logprobs import (
+    append_rollout_topk_logprobs,
+    configure_rollout_topk_logprobs_request,
+)
+from miles.rollout.generate_utils.sampling_mask import append_sampling_metadata, should_return_sampling_mask
+from miles.utils.lora.utils import LORA_ADAPTER_NAME, lora_rollout_enabled
 from miles.utils.processing_utils import encode_image_for_rollout_engine, extract_multimodal_train_inputs
+from miles.utils.rollout_replay import TokenLogprobs, decode_int32_buffer
 from miles.utils.types import Sample
 
 
@@ -54,6 +59,8 @@ def compute_request_payload(
     input_ids: list[int],
     sampling_params: dict,
     multimodal_inputs: dict | None = None,
+    *,
+    evaluation: bool = False,
 ) -> tuple[dict[str, Any] | None, Sample.Status | None]:
     sampling_params = deepcopy(sampling_params)
     max_new_tokens = sampling_params.pop("max_new_tokens", args.rollout_max_response_len)
@@ -62,18 +69,25 @@ def compute_request_payload(
     if max_new_tokens <= 0:
         return None, Sample.Status.TRUNCATED
 
+    return_sampling_mask = should_return_sampling_mask(args, sampling_params, evaluation=evaluation)
+
     payload = {
         "input_ids": input_ids,
         "sampling_params": {**sampling_params, "max_new_tokens": max_new_tokens},
         "return_logprob": True,
-        "return_routed_experts": args.use_rollout_routing_replay,
-        "return_indexer_topk": args.use_rollout_indexer_replay,
+        # Replay metadata feeds training only, even when evaluation shares its engines.
+        "return_routed_experts": not evaluation and args.use_rollout_routing_replay,
+        "return_indexer_topk": not evaluation and args.use_rollout_indexer_replay,
     }
+    if return_sampling_mask:
+        payload["return_sampling_mask"] = True
     if lora_rollout_enabled(args):
         payload["lora_path"] = LORA_ADAPTER_NAME
     if image_data := (multimodal_inputs or {}).get("images"):
         payload["image_data"] = [encode_image_for_rollout_engine(image) for image in image_data]
 
+    if not evaluation:
+        configure_rollout_topk_logprobs_request(args, payload)
     return payload, None
 
 
@@ -84,11 +98,23 @@ async def update_sample_from_response(
     if (len(sample.response) == 0) and not sample.tokens:
         sample.tokens = payload["input_ids"]
 
-    if x := output["meta_info"].get("output_token_logprobs"):
+    if isinstance(x := output["meta_info"].get("output_token_logprobs"), TokenLogprobs):
+        # Flat arrays from the HTTP worker: two buffer-to-list conversions,
+        # no per-token Python records to walk.
+        new_response_tokens, new_response_log_probs = x.tokens(), x.logprobs()
+    elif x:
         new_response_tokens = [item[1] for item in x]
         new_response_log_probs = [item[0] for item in x]
     else:
         new_response_tokens, new_response_log_probs = [], []
+
+    if payload.get("return_sampling_mask", False):
+        new_response_log_probs = append_sampling_metadata(
+            sample,
+            new_response_tokens,
+            output["meta_info"],
+            sampling_logprobs_mode=payload.get("sampling_logprobs_mode", "selected"),
+        )
 
     # Update sample with tokens directly - avoiding re-tokenization
     sample.tokens = sample.tokens + new_response_tokens
@@ -98,6 +124,13 @@ async def update_sample_from_response(
     if sample.rollout_log_probs is None:
         sample.rollout_log_probs = []
     sample.rollout_log_probs += new_response_log_probs
+    if payload.get("top_logprobs_num") or payload.get("sampling_logprobs_mode") == "support":
+        append_rollout_topk_logprobs(
+            sample,
+            output["meta_info"],
+            args.rollout_top_logprobs_num,
+            sampling_logprobs_mode=payload.get("sampling_logprobs_mode", "selected"),
+        )
 
     if update_loss_mask:
         if sample.loss_mask is None:
@@ -112,8 +145,8 @@ async def update_sample_from_response(
     sample.update_from_meta_info(args, output["meta_info"])
 
 
-def _decode_topk_buffer(info: str, num_tokens: int, num_layers: int, topk: int) -> np.ndarray:
-    x = np.frombuffer(pybase64.b64decode(info.encode("ascii")), dtype=np.int32)
+def _decode_topk_buffer(info: str | np.ndarray, num_tokens: int, num_layers: int, topk: int) -> np.ndarray:
+    x = decode_int32_buffer(info)
     if num_tokens <= 0:
         return np.empty((0, num_layers, max(0, topk)), dtype=np.int32)
     if topk == -1:  # indexer: topk dim recovered from buffer length
@@ -125,7 +158,12 @@ def get_routed_experts_from_response(args, output, num_tokens: int):
     info = output["meta_info"].get("routed_experts")
     if info is None:
         return None
-    return _decode_topk_buffer(info, num_tokens, args.num_layers, -1)
+    routed_experts = _decode_topk_buffer(info, num_tokens, args.num_layers, -1)
+    assert routed_experts.size == 0 or routed_experts.any(), (
+        "routed_experts payload is all zeros: the sglang engine did not capture routed experts "
+        "(topk-bypassing --moe-runner-backend such as flashinfer_trtllm?)."
+    )
+    return routed_experts
 
 
 def get_indexer_topk_from_response(args, output, sample):
@@ -136,5 +174,10 @@ def get_indexer_topk_from_response(args, output, sample):
     assert num_layers is not None, (
         "Server returned indexer_topk without indexer_topk_num_layers; "
         "sglang-miles must include the layer count in meta_info."
+    )
+    expected_num_streams = getattr(args, "rollout_indexer_topk_num_streams", None)
+    assert expected_num_streams is None or num_layers == expected_num_streams, (
+        f"Server returned indexer_topk with {num_layers} streams but the model has "
+        f"{expected_num_streams} indexer layers; replaying it would map streams to the wrong layers."
     )
     return _decode_topk_buffer(info, len(sample.tokens) - 1, num_layers, -1)

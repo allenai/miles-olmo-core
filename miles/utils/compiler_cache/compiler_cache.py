@@ -3,6 +3,7 @@
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -24,6 +25,7 @@ FAMILIES = {
 }
 HEX = re.compile(r"[0-9a-f]{64}")
 SOURCE_SUFFIXES = {".py", ".c", ".cpp", ".h", ".hpp", ".cu", ".cuh", ".so"}
+CORE_TRITON_SCOPE = "core-triton-v2"
 NON_COMPILE_MILES = {
     "hf_checkpoint",
     "save",
@@ -108,10 +110,17 @@ def sha256(path):
     return result.hexdigest()
 
 
-def source_identity(root):
+def source_identity(root, *, excluded_paths=(), exclude_tests=False):
     files = {}
     for path in sorted(root.rglob("*")):
-        if any(part in {".git", "__pycache__", ".venv"} for part in path.relative_to(root).parts):
+        relative = path.relative_to(root)
+        if any(part in {".git", "__pycache__", ".venv"} for part in relative.parts):
+            continue
+        if any(relative.is_relative_to(excluded) for excluded in excluded_paths):
+            continue
+        if exclude_tests and (
+            "tests" in relative.parts or path.name.startswith("test_") or path.name.endswith("_test.py")
+        ):
             continue
         if path.is_symlink():
             raise ValueError(f"Source code symlink requires an explicit resolved source root: {path}")
@@ -122,7 +131,60 @@ def source_identity(root):
     return {"sha256": digest(files), "files": len(files)}
 
 
-def fingerprint(*, image, runtime_lock, sources, model_config, run_config, toolchain, compiler_env):
+def core_application_source(root):
+    """Keep Core's application code; omit standalone evaluation, OPD and tests."""
+    return source_identity(root, excluded_paths=("miles/evaluation", "miles/distillation"), exclude_tests=True)
+
+
+def _core_triton_inputs(runtime_lock, settings, toolchain):
+    """Normalize proven non-kernel differences only for the Core Triton path.
+
+    Triton's own entry keys still distinguish compiled specializations. Preserve
+    unknown fields, trainer ranks, parallel geometry and compiler/environment
+    controls; this is not a compatibility policy for the experimental families.
+    """
+    lock = json.loads(encoded(runtime_lock))
+    hardware = json.loads(encoded(toolchain))
+    unused_sources = {"megatron-lm", "megatron-bridge", "olmo-megatron"}
+    if "source_patches" in lock:
+        lock["source_patches"] = [
+            patch
+            for patch in lock["source_patches"]
+            if not (patch.get("source") in unused_sources and patch.get("target") in unused_sources)
+        ]
+        if not lock["source_patches"]:
+            del lock["source_patches"]
+    referenced_sources = {
+        patch.get(field) for patch in lock.get("source_patches", []) for field in ("source", "target")
+    }
+    for name in unused_sources - referenced_sources:
+        lock.get("sources", {}).pop(name, None)
+    for key in ("max_policy_lag", "max_run_seconds"):
+        settings.get("core", {}).pop(key, None)
+    miles = settings.get("miles", {})
+    for key in (
+        "global_batch_size",
+        "rollout_batch_size",
+        "n_samples_per_prompt",
+        "rollout_num_gpus",
+        "sglang_server_concurrency",
+        "async_max_concurrent_samples",
+    ):
+        miles.pop(key, None)
+    # Only known single-GPU serving workers share a role key. Physical slot IDs
+    # and other visible identical GPUs do not change that engine's kernels.
+    slot = settings.get("worker_slot", "")
+    if miles.get("rollout_num_gpus_per_engine") == 1 and re.fullmatch(
+        r"inference-engine-(?:all-)?\d+-\d+-\d+-\d+", slot
+    ):
+        devices = hardware.get("torch_hardware", {}).get("gpus", [])
+        if devices and all(device == devices[0] for device in devices):
+            settings["worker_slot"] = "inference-engine-tp1"
+            hardware["torch_hardware"]["gpus"] = devices[:1]
+    return lock, settings, hardware
+
+
+def fingerprint(*, image, runtime_lock, sources, model_config, run_config, toolchain, compiler_env, scope="strict"):
     if not re.fullmatch(r"(?:sha256:[0-9a-f]{64}|[0-9A-HJKMNP-TV-Z]{26})", image):
         raise ValueError("Use an immutable Docker SHA256 or Beaker image ID")
     required = {"olmo-core", "miles", "open-instruct", "olmo-sglang"}
@@ -135,6 +197,10 @@ def fingerprint(*, image, runtime_lock, sources, model_config, run_config, toolc
         settings.get("miles", {}).pop(key, None)
     for key in NON_COMPILE_CORE:
         settings.get("core", {}).pop(key, None)
+    if scope == CORE_TRITON_SCOPE:
+        runtime_lock, settings, toolchain = _core_triton_inputs(runtime_lock, settings, toolchain)
+    elif scope != "strict":
+        raise ValueError(f"Unknown compiler-cache compatibility scope: {scope}")
     identity = {
         "schema_version": SCHEMA,
         "backend": "open-instruct-miles-olmo-core",
@@ -147,6 +213,8 @@ def fingerprint(*, image, runtime_lock, sources, model_config, run_config, toolc
         "compiler_env": compiler_env,
         "cache_families": FAMILIES,
     }
+    if scope != "strict":
+        identity["compatibility_scope"] = scope
     return digest(identity), identity
 
 
@@ -217,11 +285,67 @@ def relocate_triton(root, destination=None):
     return count
 
 
-def snapshot(source, destination, family):
-    before = inventory(source)
-    shutil.copytree(source, destination, dirs_exist_ok=True)
-    if inventory(destination) != before or inventory(source) != before:
-        raise ValueError("Compiler cache changed during snapshot")
+def _snapshot_completed_triton_groups(source, destination):
+    """Copy independently complete groups while another kernel is compiling.
+
+    Triton commits a kernel's child-path manifest last. Standalone runtime shared
+    libraries and autotuning records are single-file atomic cache writes. Unknown
+    formats remain cold; cross-group references are not qualified here.
+    """
+    skipped = []
+    destination.mkdir(parents=True, exist_ok=True)
+    for group in sorted(source.iterdir()):
+        if group.is_symlink() or not group.is_dir():
+            raise ValueError("Partial Triton snapshots require directory-isolated kernel groups")
+        try:
+            before = inventory(group)
+        except FileNotFoundError:
+            # Atomic compiler writes can disappear between enumeration and hashing.
+            skipped.append(group.name)
+            continue
+        manifests = [name for name in before if PurePosixPath(name).name.startswith("__grp__")]
+        standalone = len(before) == 1 and next(iter(before)).endswith((".so", ".autotune.json"))
+        transient = any(any(part.startswith("tmp.") for part in PurePosixPath(name).parts) for name in before)
+        if not before or transient or (not manifests and not standalone):
+            skipped.append(group.name)
+            continue
+        with tempfile.TemporaryDirectory(prefix=".kernel-", dir=destination.parent) as temporary:
+            staged = Path(temporary) / group.name
+            try:
+                shutil.copytree(group, staged)
+                if inventory(staged) != before or inventory(group) != before:
+                    skipped.append(group.name)
+                    continue
+            except (FileNotFoundError, shutil.Error):
+                skipped.append(group.name)
+                continue
+            for name in manifests:
+                data = json.loads((staged / name).read_text())
+                if set(data) != {"child_paths"} or not isinstance(data["child_paths"], dict):
+                    raise ValueError("Unknown Triton group metadata format")
+                for child in data["child_paths"].values():
+                    original = Path(child)
+                    if not original.is_absolute() or not original.is_relative_to(group):
+                        raise ValueError("Partial Triton snapshot cannot include cross-group metadata")
+                    if original.relative_to(group).as_posix() not in before:
+                        raise ValueError("Triton group references a missing artifact")
+            os.rename(staged, destination / group.name)
+    return skipped
+
+
+def snapshot(source, destination, family, *, partial_triton=False):
+    if family == "tilelang" and any(path.is_file() for path in source.glob("**/.staging/**/*")):
+        raise ValueError("TileLang publication deferred: an atomic kernel export is in progress")
+    skipped = []
+    if partial_triton and family == "triton" and all(p.is_dir() and not p.is_symlink() for p in source.iterdir()):
+        skipped = _snapshot_completed_triton_groups(source, destination)
+    else:
+        before = inventory(source)
+        shutil.copytree(source, destination, dirs_exist_ok=True)
+        if inventory(destination) != before or inventory(source) != before:
+            raise ValueError("Compiler cache changed during snapshot")
+    if family == "tilelang" and any(path.is_file() for path in source.glob("**/.staging/**/*")):
+        raise ValueError("TileLang publication deferred: an atomic kernel export is in progress")
     if family == "triton":
         # Relocate copied absolute paths through the original namespace before
         # canonicalizing them; only the documented group JSON is rewritten.
@@ -248,6 +372,7 @@ def snapshot(source, destination, family):
                 if marker in data:
                     raise ValueError(f"Unqualified embedded private-cache path: {family}/{path.name}")
                 tail = data[-len(marker) :]
+    return skipped
 
 
 def artifact_root(shared, key, family):
@@ -404,16 +529,84 @@ def metadata_signature(root):
     return digest(files)
 
 
-def publish(shared, local, key, family, *, progress=None, max_storage_bytes=DEFAULT_MAX_STORAGE_BYTES):
+def _same_autotune_candidates(existing, incoming):
+    """Allow timing noise for identical Triton tuning keys and candidates.
+
+    Keep the first published measurements. A different candidate set, unknown
+    format or malformed timing remains a conflict rather than an implicit repair.
+    """
+
+    def candidates(path):
+        data = json.loads(path.read_text())
+        if set(data) != {"key", "configs_timings"} or not isinstance(data["key"], list) or not data["key"]:
+            raise ValueError("Unknown autotune record")
+        if not isinstance(data["configs_timings"], list) or not data["configs_timings"]:
+            raise ValueError("Missing autotune candidates")
+        configs = []
+        for config, timing in data["configs_timings"]:
+            if not isinstance(config, dict) or not config:
+                raise ValueError("Invalid autotune candidate")
+            values = timing if isinstance(timing, list) else [timing]
+            if not values or any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in values):
+                raise ValueError("Invalid autotune timing")
+            configs.append(config)
+        return data["key"], configs
+
+    try:
+        return candidates(existing) == candidates(incoming)
+    except (ValueError, TypeError, KeyError, OSError):
+        return False
+
+
+def _conflicting_triton_groups(existing, incoming, stage, incoming_root):
+    """Reject whole incoming kernel groups; never mix their files with old bytes."""
+    conflicts = set()
+    for name in existing.keys() & incoming.keys():
+        if existing[name] == incoming[name]:
+            continue
+        if (
+            name.endswith(".autotune.json")
+            and existing[name]["executable"] == incoming[name]["executable"]
+            and _same_autotune_candidates(stage / name, incoming_root / name)
+        ):
+            continue
+        conflicts.add(PurePosixPath(name).parts[0])
+    # Per-group rejection is safe only for self-contained groups. Preserve the
+    # strict failure for unknown metadata that references another kernel group.
+    if conflicts:
+        for root in (stage, incoming_root):
+            for path in root.rglob("__grp__*"):
+                group = path.relative_to(root).parts[0]
+                children = json.loads(path.read_text())["child_paths"].values()
+                if any(PurePosixPath(child).parts[0] != group for child in children):
+                    raise ValueError("Cannot isolate conflicting cross-group Triton metadata")
+    return conflicts
+
+
+def publish(
+    shared,
+    local,
+    key,
+    family,
+    *,
+    progress=None,
+    max_storage_bytes=DEFAULT_MAX_STORAGE_BYTES,
+    isolate_triton_conflicts=False,
+    partial_triton=False,
+):
     """Publish a verified snapshot, bounded across all families of this key.
 
-    Live Triton writers are allowed: snapshot validation rejects concurrent changes.
+    Live Triton writers are allowed: validation rejects concurrent changes, or
+    skips individual changing groups with the qualified partial snapshot policy.
     Other families require their own writer synchronization before publication.
     """
+    if (isolate_triton_conflicts or partial_triton) and family != "triton":
+        raise ValueError("Partial snapshots and conflict isolation are qualified only for Triton")
     if type(max_storage_bytes) is not int or max_storage_bytes < 0:
         raise ValueError("max_storage_bytes must be a nonnegative integer")
     started = time.monotonic()
     phases = {}
+    reused_autotune_records = 0
     phase = "prepare"
     phase_started = started
 
@@ -456,10 +649,25 @@ def publish(shared, local, key, family, *, progress=None, max_storage_bytes=DEFA
             existing = inventory(stage)
             with tempfile.TemporaryDirectory(prefix=".incoming-", dir=local) as incoming_directory:
                 incoming_root = Path(incoming_directory)
-                snapshot(local / family, incoming_root, family)
+                skipped = snapshot(local / family, incoming_root, family, partial_triton=partial_triton)
                 incoming = inventory(incoming_root)
+                conflicts = (
+                    _conflicting_triton_groups(existing, incoming, stage, incoming_root)
+                    if isolate_triton_conflicts
+                    else set()
+                )
                 for name, record in incoming.items():
+                    if PurePosixPath(name).parts[0] in conflicts:
+                        continue
                     if name in existing and existing[name] != record:
+                        if (
+                            family == "triton"
+                            and name.endswith(".autotune.json")
+                            and existing[name]["executable"] == record["executable"]
+                            and _same_autotune_candidates(stage / name, incoming_root / name)
+                        ):
+                            reused_autotune_records += 1
+                            continue
                         raise ValueError(f"Conflicting compiler-cache key: {family}/{name}")
                     if name not in existing:
                         target = stage / name
@@ -467,7 +675,12 @@ def publish(shared, local, key, family, *, progress=None, max_storage_bytes=DEFA
                         shutil.copy2(incoming_root / name, target)
             files = inventory(stage)
             if not files:
-                return {"family": family, "status": "empty", "seconds": time.monotonic() - started}
+                return {
+                    "family": family,
+                    "status": "empty",
+                    "skipped_live_groups": skipped,
+                    "seconds": time.monotonic() - started,
+                }
             generation = digest(files)
             generations = base / "generations"
             generations.mkdir(exist_ok=True)
@@ -528,6 +741,9 @@ def publish(shared, local, key, family, *, progress=None, max_storage_bytes=DEFA
                 "storage_bytes": storage_bytes(key_root),
                 "max_storage_bytes": max_storage_bytes,
                 "recency_recorded": recency_recorded,
+                "reused_autotune_records": reused_autotune_records,
+                "rejected_incoming_groups": sorted(conflicts),
+                "skipped_live_groups": skipped,
                 "phase_seconds": phases,
                 "seconds": time.monotonic() - started,
             }

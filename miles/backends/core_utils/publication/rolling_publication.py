@@ -77,7 +77,7 @@ class RollingPublication:
         await asyncio.wait_for(
             asyncio.gather(*(w.deliver.remote(snapshot) for w in self.deliveries.values())), timeout
         )
-        await self.manager.core_engine_drain.remote(
+        await self.manager.core_engine_drain(
             "initialize", urls=urls, incarnations=incarnations, deliveries=self.deliveries, version=self.version
         )
 
@@ -87,10 +87,10 @@ class RollingPublication:
         if self.version is None:
             raise RuntimeError("rolling publication has not been initialized")
         self.version += 1
-        return await self.manager.core_engine_drain.remote("step", version=self.version)
+        return await self.manager.core_engine_drain("step", version=self.version)
 
     async def publish(self):
-        await self.manager.core_engine_drain.remote("capacity")
+        await self.manager.core_engine_drain("capacity")
         snapshot = (await self.learner.execute_workers("capture_weight_snapshot"))[0]
         if snapshot.version != self.version:
             raise RuntimeError("captured snapshot disagrees with the completed optimizer step")
@@ -100,7 +100,7 @@ class RollingPublication:
                 self._window_task = None
             info = await self.inference.start_update_weights() if self._window_task is None else None
             try:
-                result = await self.manager.core_engine_drain.remote("publish", snapshot=snapshot)
+                result = await self.manager.core_engine_drain("publish", snapshot=snapshot)
             except BaseException:
                 if info is not None:
                     await self.inference.abort_update_weights()
@@ -120,7 +120,7 @@ class RollingPublication:
         try:
             while True:
                 serial = self._publication_serial
-                await self.manager.core_engine_drain.remote("barrier")
+                await self.manager.core_engine_drain("barrier")
                 async with self._publication_lock:
                     if serial == self._publication_serial:
                         released = True
@@ -133,14 +133,14 @@ class RollingPublication:
             raise
 
     async def quiesce(self):
-        result = await self.manager.core_engine_drain.remote("quiesce")
+        result = await self.manager.core_engine_drain("quiesce")
         if self._window_task is not None:
             await self._window_task
             self._window_task = None
         return result
 
     async def resume(self):
-        return await self.manager.core_engine_drain.remote("resume")
+        return await self.manager.core_engine_drain("resume")
 
     async def close(self, *, failed):
         try:

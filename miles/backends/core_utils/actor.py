@@ -13,10 +13,11 @@ import torch
 from safetensors import torch as safetensors_torch
 from torch import distributed as dist
 
-from miles.backends.core_utils import checkpoint, contract, data, expert_schedule
+from miles.backends.core_utils import checkpoint, contract, data, expert_schedule, layer_profile
 from miles.backends.core_utils import metrics as training_metrics
 from miles.backends.core_utils import (
     models,
+    observability,
     packing,
     performance,
     replay_diagnostics,
@@ -26,31 +27,43 @@ from miles.backends.core_utils import (
 )
 from miles.backends.core_utils import scoring as config
 from miles.backends.core_utils import stopping
-from miles.backends.core_utils.publication import engine_delivery, policy_refresh, publication
+from miles.backends.core_utils.publication import engine_delivery, policy_refresh, publication, transport
 from miles.backends.core_utils.publication.state import PolicyClock
 from miles.backends.core_utils.timing import startup_stage
-from miles.backends.fsdp_utils import update_weight_utils
-from miles.backends.megatron_utils.ft.types import TrainStepOutcome, TrainStepOutput
-from miles.backends.training_utils import data as miles_data
-from miles.backends.training_utils import loss as miles_loss
 from miles.backends.training_utils import parallel
+from miles.backends.training_utils.data import rollout as miles_data
+from miles.backends.training_utils.loss import objective as miles_loss
+from miles.backends.training_utils.types import TrainStepOutcome, TrainStepOutput
 from miles.ray.train_actor import TrainRayActor
 from miles.utils import async_utils, distributed_utils, logger_utils
 from miles.utils.ft_utils.process_group_utils import GroupInfo
 from miles.utils.function_registry import load_function
-from miles.utils.hf_config import HF_EXPORT_COMPLETE_MARKER
+from miles.utils.hf_utils.config import HF_EXPORT_COMPLETE_MARKER
 from miles.utils.processing_utils import load_tokenizer
 
 logger = logger_utils.setup_logger(__name__)
 
 
 class OLMoCoreTrainRayActor(TrainRayActor):
-    def init(self, args, role, with_ref=False, with_opd_teacher=False, *, recv_ckpt_src_rank=None, indep_dp_info=None):
+    def init(
+        self,
+        args,
+        role,
+        with_ref=False,
+        with_opd_teacher=False,
+        *,
+        recv_ckpt_src_rank=None,
+        indep_dp_info=None,
+        indep_dp_store_addr=None,
+    ):
         if role != "actor" or with_opd_teacher or recv_ckpt_src_rank is not None:
             raise ValueError("Core backend supports the policy actor without trainer-cell recovery")
+        if indep_dp_store_addr is not None or (indep_dp_info is not None and indep_dp_info.quorum_id != 0):
+            raise ValueError("Core backend does not support independent-DP recovery")
         with startup_stage(args, "distributed_init"):
-            super().init(args, role, with_ref=with_ref, with_opd_teacher=False)
+            super()._init_common(args, role, with_ref=with_ref, with_opd_teacher=False)
         self._agree(lambda: training_metrics.init_tracking(args))
+        self._observed_response_tokens = 0
         torch.manual_seed(args.seed)
         world = dist.get_world_size()
         rank = dist.get_rank()
@@ -81,11 +94,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         with startup_stage(args, "native_restore", device=torch.cuda):
             checkpoint.restore(self)
         self.train_module._trainer.global_step = self.clock.completed_steps
-        updater = (
-            update_weight_utils.UpdateWeightFromTensor
-            if args.colocate
-            else update_weight_utils.UpdateWeightFromDistributed
-        )
+        updater = transport.TensorUpdater if args.colocate else transport.DistributedUpdater
         if not args.colocate and args.olmo_core.weight_sync_mode == "flattened":
             updater = publication.FlattenedDistributedUpdater
         self.weight_updater = updater(args, self.model)
@@ -169,6 +178,13 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             contract.record(self.args, {"event": "scores", "rollout_id": rollout_id, "source": source, **profile}),
         )
         if self.args.olmo_core.publication_mode == "refresh":
+            self._agree(lambda: policy_refresh.validate_batch(rollout))
+            profile["behavior_metrics"] = observability.behavior_metrics(
+                rollout,
+                current_version=self.clock.completed_steps,
+                clip_low=self.args.tis_clip_low,
+                clip_high=self.args.tis_clip,
+            )
             refresh_profile = policy_refresh.score_metrics(
                 rollout,
                 current_version=self.clock.completed_steps,
@@ -269,9 +285,12 @@ class OLMoCoreTrainRayActor(TrainRayActor):
     def train(self, rollout_id, rollout_data_ref, external_data=None, *, witness_info=None, attempt=0):
         if attempt or witness_info is not None or external_data is not None:
             raise ValueError("Trainer retry, witnesses, and external critic data are not supported")
+        preparation_started = time.perf_counter()
         rollout, store = miles_data.get_rollout_data(self.args, rollout_data_ref)
+        fetched_at = time.perf_counter()
         with store:
             steps = self._batch_steps(rollout)
+            prepared_at = time.perf_counter()
             batches = [batch for step in steps for batch in step]
             local_batch = self.args.global_batch_size // dist.get_world_size()
             if self.args.use_rollout_routing_replay:
@@ -280,6 +299,17 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                 self._agree(lambda: policy_refresh.validate_batch(rollout))
             versions = self._agree(lambda: data.policy_versions(rollout))
             self._agree(lambda: self.clock.validate_versions(versions, self.args.olmo_core.max_policy_lag))
+            contract.record(
+                self.args,
+                {
+                    "event": "batch_preparation",
+                    "rollout_id": rollout_id,
+                    "fetch_seconds": fetched_at - preparation_started,
+                    "prepare_seconds": prepared_at - fetched_at,
+                    "validate_seconds": time.perf_counter() - prepared_at,
+                    "prepared_packs": sum(map(len, steps)),
+                },
+            )
             decision = self._scoring_pass()
             checked = self._scoring_check_due(decision)
             standalone = decision.standalone or checked
@@ -305,12 +335,14 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             if self.ref_module is not None:
                 rollout["ref_log_probs"] = self._score(self.ref_module, batches, use_replay=False)
             with self._actor_forward_skipped(not standalone):
-                self._train_steps(rollout, rollout_id, local_batch, decision, checked, difference, agreement, profile)
+                self._train_steps(
+                    rollout, rollout_id, local_batch, decision, checked, difference, agreement, profile, steps
+                )
             self.clock.next_rollout_id = rollout_id + 1
         self._heartbeat.bump()
         return TrainStepOutput(outcome=cast(TrainStepOutcome, TrainStepOutcome.NORMAL))
 
-    def _train_steps(self, rollout, rollout_id, local_batch, decision, checked, difference, agreement, profile):
+    def _train_steps(self, rollout, rollout_id, local_batch, decision, checked, difference, agreement, profile, steps):
         # Without the standalone pass, old log-probabilities come from the training
         # forward itself. That is exact only at unchanged weights, which the caller
         # guarantees by admitting exactly one optimizer step per collection.
@@ -319,13 +351,19 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         miles_loss.compute_advantages_and_returns(self.args, rollout)
         self._agree(lambda: contract.validate_training_data(rollout))
         advantages = training_metrics.advantage_metrics(rollout)
-        for step_batches in self._batch_steps(rollout):
+        for step_batches in packing.bind_training_fields(steps, rollout):
             expert_metrics = None
-            if self.args.olmo_core.expert_balanced_packing:
+            profile_interval = getattr(self.args.olmo_core, "layer_profile_interval", 0)
+            profile_due = profile_interval > 0 and self.clock.completed_steps % profile_interval == 0
+            dispatch_started = time.perf_counter()
+            if self.args.olmo_core.expert_balanced_packing or (profile_due and self.args.use_rollout_routing_replay):
                 local_loads = self._agree(lambda batches=step_batches: expert_schedule.local_loads(self.args, batches))
                 expert_metrics = expert_schedule.realized_measurements(
                     local_loads, self.args.olmo_core.expert_parallel_size
                 )
+                expert_metrics["layer_ids"] = expert_schedule.model_layout(
+                    self.args.hf_checkpoint, self.args.olmo_core.expert_balance_layer_stride
+                )[3]
                 logger.info(
                     "Core expert balance: %s",
                     contract.record(
@@ -338,6 +376,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                         },
                     ),
                 )
+            dispatch_seconds = time.perf_counter() - dispatch_started
             if self.args.olmo_core.sequence_packing:
                 budget = self.args.olmo_core.packing_max_tokens or self.args.olmo_core.max_sequence_length
                 logger.info(
@@ -365,6 +404,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             probe = contract.ParameterProbe(self.train_module._miles_named_parameters) if diagnostic else None
             lr_used = self.lr_scheduler.get_last_lr()
             self._agree(lambda: contract.validate_schedule(self.clock, self.lr_scheduler))
+            allocator_before = torch.cuda.memory_stats()
             torch.cuda.reset_peak_memory_stats()
             started = time.perf_counter()
             contract.auxiliary_metrics(self.model, reset=True)
@@ -451,9 +491,14 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                 metric_template.update(values)
                 return loss, values
 
-            metrics = self.train_module.train_batch_with_loss(
-                step_batches + stopping_batches, objective, self._replay_context
-            )
+            train_started = time.perf_counter()
+            with layer_profile.LayerProfile(self.model, profile_due) as layers:
+                metrics = self.train_module.train_batch_with_loss(
+                    step_batches + stopping_batches, objective, self._replay_context
+                )
+            trained_at = time.perf_counter()
+            layer_report = layer_profile.collect_across_ranks(layers)
+            measured_at = time.perf_counter()
             if readiness is not None and self.args.save:
                 stopping.save_readiness(self.args.save, self.clock.completed_steps, dist.get_rank(), readiness)
             if capture:
@@ -486,7 +531,9 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             aux_metrics = self._agree(lambda: contract.auxiliary_metrics(self.model))
             local_router_load = self._agree(lambda: router_load.snapshot(self.model))
             router_metrics = router_load.collect(local_router_load, self.args.olmo_core.expert_parallel_size)
+            optimizer_started = time.perf_counter()
             self.train_module.optim_step()
+            optimized_at = time.perf_counter()
             try:
                 contract.validate_step_transition(self.clock, self.optimizer, step_batches[0]["tokens"].device)
             except ValueError:
@@ -552,7 +599,35 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                     normalization.world_size,
                 )
             )
-            summary.update(model_tokens=normalization.model_tokens, active_response_tokens=normalization.active_tokens)
+            summary.update(
+                {
+                    "profile/dispatch_measurement_seconds": dispatch_seconds,
+                    "profile/forward_backward_host_seconds": trained_at - train_started,
+                    "profile/layer_collection_seconds": measured_at - trained_at,
+                    "profile/post_backward_checks_seconds": optimizer_started - measured_at,
+                    "profile/optimizer_host_seconds": optimized_at - optimizer_started,
+                }
+            )
+            if layer_report is not None:
+                summary.update(layer_report["metrics"])
+                contract.record(
+                    self.args,
+                    {
+                        "event": "layer_timing",
+                        "rollout_id": rollout_id,
+                        "step": self.clock.completed_steps,
+                        "activation_checkpointing": self.args.olmo_core.activation_checkpointing,
+                        **layer_report,
+                    },
+                )
+            if self._observed_response_tokens is not None:
+                self._observed_response_tokens += normalization.active_tokens
+                summary["run_consumed_response_tokens"] = self._observed_response_tokens
+            summary.update(
+                model_tokens=normalization.model_tokens,
+                active_response_tokens=normalization.active_tokens,
+            )
+            summary.update(observability.allocator_metrics(allocator_before, device=step_batches[0]["tokens"].device))
 
             if self.args.olmo_core.sequence_packing:
                 summary.update(
@@ -580,6 +655,11 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                     ),
                 )
             if expert_metrics is not None:
+                for layer, values in zip(expert_metrics["layer_ids"], expert_metrics["layers"], strict=True):
+                    summary[f"packing/layers/{layer}/max_pack_destination_skew"] = values["max_pack_destination_skew"]
+                    summary[f"packing/layers/{layer}/max_pack_destination_assignments"] = values[
+                        "max_pack_destination_assignments"
+                    ]
                 summary.update(
                     {
                         "packing/expert_dispatch_skew_mean": expert_metrics["skew_mean"],
@@ -790,18 +870,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         updater = getattr(self, "weight_updater", None)
         if updater is None:
             return
-        group = getattr(updater, "_model_update_groups", None)
-        if group is None:
-            return
-        pending = [
-            async_utils.submit(engine.destroy_weights_update_group(updater._group_name))
-            for engine in updater.rollout_engines
-        ]
-        try:
-            dist.destroy_process_group(group)
-        finally:
-            async_utils.wait_futures(pending)
-        updater._model_update_groups = None
+        updater.close()
 
     def capture_evaluation_snapshot(self, rollout_id, target):
         target = Path(target)

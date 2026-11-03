@@ -61,8 +61,13 @@ async def wait_server_healthy(server_url, api_key):
 @dataclasses.dataclass(frozen=True)
 class SGLangApiClient:
     server_url: str
+    api_key: str | None = None
 
-    async def _make_request(self, endpoint: str, payload: dict | None = None):
+    @property
+    def _headers(self) -> dict[str, str]:
+        return _compute_headers(self.api_key)
+
+    async def _make_request(self, endpoint: str, payload: dict | None = None, *, timeout: float | None = None):
         """Make a POST request to the specified endpoint with the given payload.
 
         Args:
@@ -73,13 +78,18 @@ class SGLangApiClient:
             The JSON response from the server
         """
         url = f"{self.server_url}/{endpoint}"
-        response = await infra_timeouts.request(GeneralHttpClientProvider.client(), "post", url, json=payload or {})
+        bound: dict[str, float] = {} if timeout is None else dict(timeout=timeout)
+        response = await infra_timeouts.request(
+            GeneralHttpClientProvider.client(), "post", url, json=payload or {}, headers=self._headers, **bound
+        )
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
             if hasattr(e, "add_note"):
                 e.add_note(f"{response.text=}")
             raise
+        if not response.content:
+            return None
         return response.json()
 
     async def health_generate(self, timeout: float = 5.0) -> bool:
@@ -98,6 +108,7 @@ class SGLangApiClient:
             GeneralHttpClientProvider.client(),
             "get",
             f"{self.server_url}/health_generate",
+            headers=self._headers,
             timeout=timeout,
         )
         response.raise_for_status()
@@ -137,6 +148,7 @@ class SGLangApiClient:
             "get",
             f"{self.server_url}/get_remote_instance_transfer_engine_info",
             params={"rank": rank},
+            headers=self._headers,
             timeout=5.0,
         )
         response.raise_for_status()
@@ -148,6 +160,7 @@ class SGLangApiClient:
             "get",
             f"{self.server_url}/parallelism_config",
             params={"rank": rank},
+            headers=self._headers,
             timeout=5.0,
         )
         response.raise_for_status()
@@ -158,6 +171,7 @@ class SGLangApiClient:
             GeneralHttpClientProvider.client(),
             "get",
             f"{self.server_url}/server_info",
+            headers=self._headers,
             timeout=5.0,
         )
         response.raise_for_status()
@@ -244,7 +258,7 @@ class SGLangApiClient:
         for _ in range(60):
             try:
                 response = await infra_timeouts.request(
-                    GeneralHttpClientProvider.client(), "get", f"{self.server_url}/flush_cache"
+                    GeneralHttpClientProvider.client(), "get", f"{self.server_url}/flush_cache", headers=self._headers
                 )
                 if response.status_code == 200:
                     break
@@ -260,7 +274,7 @@ class SGLangApiClient:
         # new sglang change api from /get_weight_version to /model_info
         for endpoint in ("/model_info", "/get_weight_version"):
             response = await infra_timeouts.request(
-                GeneralHttpClientProvider.client(), "get", f"{self.server_url}{endpoint}"
+                GeneralHttpClientProvider.client(), "get", f"{self.server_url}{endpoint}", headers=self._headers
             )
             if response.status_code == 200:
                 return response.json()["weight_version"]
@@ -365,6 +379,7 @@ class SGLangApiClient:
         flush_cache=False,
         weight_version: str | None = None,
         selector: str = "all",
+        load_format: str | None = None,
     ):
         payload = {
             "names": names,
@@ -376,6 +391,8 @@ class SGLangApiClient:
         }
         if weight_version is not None:
             payload["weight_version"] = weight_version
+        if load_format is not None:
+            payload["load_format"] = load_format
         return await self._make_request(
             "update_weights_from_distributed",
             payload,
@@ -387,16 +404,24 @@ class SGLangApiClient:
             "post",
             f"{self.server_url}/pause_generation",
             json={"mode": mode},
+            headers=self._headers,
         )
         response.raise_for_status()
         return response
 
     async def continue_generation(self):
         response = await infra_timeouts.request(
-            GeneralHttpClientProvider.client(), "post", f"{self.server_url}/continue_generation", json={}
+            GeneralHttpClientProvider.client(),
+            "post",
+            f"{self.server_url}/continue_generation",
+            json={},
+            headers=self._headers,
         )
         response.raise_for_status()
         return response
+
+    async def abort_all_requests(self, timeout: float | None = None):
+        return await self._make_request("abort_request", {"abort_all": True}, timeout=timeout)
 
     async def begin_weight_update(self, selector: str = "all", sync_base: bool = True):
         """Open a weight-update session on the engine. sync_base=False declares an
@@ -441,13 +466,18 @@ class SGLangApiClient:
                 "with_stack": with_stack,
                 "record_shapes": record_shapes,
             },
+            headers=self._headers,
         )
         response.raise_for_status()
         return response
 
     async def stop_profile(self):
         response = await infra_timeouts.request(
-            GeneralHttpClientProvider.client(), "post", f"{self.server_url}/stop_profile", json={}
+            GeneralHttpClientProvider.client(),
+            "post",
+            f"{self.server_url}/stop_profile",
+            json={},
+            headers=self._headers,
         )
         response.raise_for_status()
         return response

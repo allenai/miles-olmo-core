@@ -20,12 +20,13 @@ from pathlib import Path
 import pytest
 import torch
 import torch.distributed as dist
+from tests.fast.backends.training_utils.loss.fork_snapshot_metrics import update_current_forward_metrics
 
-from miles.backends.training_utils.loss import compute_advantages_and_returns, loss_function
-from miles.backends.training_utils.loss_hub import math_utils
-from miles.backends.training_utils.loss_hub.corrections import icepop_function, vanilla_tis_function
-from miles.backends.training_utils.loss_hub.logit_processors import get_log_probs_and_entropy, get_values
-from miles.backends.training_utils.loss_hub.losses import policy_loss_function, sft_loss_function, value_loss_function
+from miles.backends.training_utils.loss.hub import math_utils
+from miles.backends.training_utils.loss.hub.corrections import icepop_function, vanilla_tis_function
+from miles.backends.training_utils.loss.hub.logit_processors import get_log_probs_and_entropy, get_values
+from miles.backends.training_utils.loss.hub.losses import policy_loss_function, sft_loss_function, value_loss_function
+from miles.backends.training_utils.loss.objective import compute_advantages_and_returns, loss_function
 
 from .loss_test_utils import (
     args_from_dict,
@@ -151,7 +152,7 @@ def mode(request):
 
 
 def _get_sum_of_sample_mean(batch, args, parallel_state):
-    from miles.backends.training_utils.cp_utils import get_sum_of_sample_mean
+    from miles.backends.training_utils.data.context_parallel import get_sum_of_sample_mean
 
     return get_sum_of_sample_mean(
         batch["total_lengths"],
@@ -252,7 +253,9 @@ def run_all(args, parallel_state, inputs):
     return outputs
 
 
-def _reference_unsharded_log_probs(logits, tokens, process_group, *, sampling_mask=None):
+def _reference_unsharded_log_probs(
+    logits, tokens, process_group, *, sampling_mask=None, debug_unified_grad_fused_logprob=False
+):
     """Independent high-precision reference for the single-rank CE path."""
     logits = logits.double()
     if sampling_mask is not None:
@@ -300,11 +303,12 @@ class TestLossSnapshot:
             assert path.exists(), f"Snapshot not found: {path}"
             saved_inputs, saved_outputs = load_snapshot(path)
             saved_args = args_from_dict(saved_inputs["args_dict"])
+            update_current_forward_metrics(saved_args, saved_inputs, saved_outputs)
             outputs = run_all(saved_args, parallel_state, saved_inputs)
             if not saved_args.true_on_policy_mode:
                 # The archived fused Megatron CE rounds its backward result to
                 # bf16. Validate the fork's fp32 gradients against an independent
-                # reference, retaining every frozen forward-value assertion and
+                # reference, retaining every frozen loss-value assertion and
                 # the same strict tolerance for gradients.
                 with monkeypatch.context() as patch:
                     patch.setattr(math_utils, "compute_log_probs", _reference_unsharded_log_probs)

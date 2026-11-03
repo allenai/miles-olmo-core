@@ -48,8 +48,10 @@ def identity():
     }
 
 
-def test_fingerprint_tracks_compile_inputs_but_not_weights_outputs():
+@pytest.mark.parametrize("scope", ["strict", cache.CORE_TRITON_SCOPE])
+def test_fingerprint_tracks_compile_inputs_but_not_weights_outputs(scope):
     args = identity()
+    args["scope"] = scope
     baseline = cache.fingerprint(**args)[0]
     args["run_config"]["miles"].update(save="run-b", hf_checkpoint="different-weights", wandb_group="different")
     args["run_config"]["core"]["reward_config"] = "/another/reward.json"
@@ -179,8 +181,10 @@ def test_operational_changes_reuse_published_cache(tmp_path, group, changes):
         ("miles", "sglang_future_kernel_option", True),
     ],
 )
-def test_compile_and_unknown_options_still_invalidate(group, key, value):
+@pytest.mark.parametrize("scope", ["strict", cache.CORE_TRITON_SCOPE])
+def test_compile_and_unknown_options_still_invalidate(group, key, value, scope):
     args = identity()
+    args["scope"] = scope
     before = cache.fingerprint(**args)[0]
     args["run_config"][group][key] = value
     assert cache.fingerprint(**args)[0] != before
@@ -561,9 +565,9 @@ def test_publication_stages_tree_locally_and_upload_failure_keeps_current(tmp_pa
     original_snapshot = cache.snapshot
     original_copy = cache.shutil.copy2
 
-    def snapshot(source, destination, family):
+    def snapshot(source, destination, family, **kwargs):
         assert destination.is_relative_to(local)
-        return original_snapshot(source, destination, family)
+        return original_snapshot(source, destination, family, **kwargs)
 
     def failed_upload(source, destination, *args, **kwargs):
         if Path(destination).is_relative_to(shared):

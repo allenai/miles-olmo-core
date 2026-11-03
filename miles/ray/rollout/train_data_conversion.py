@@ -4,9 +4,10 @@ from typing import Any
 import torch
 
 from miles.rollout.never_give_up import chain_rewards_and_std
+from miles.rollout.generate_utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_sample
 from miles.utils import object_store
 from miles.utils.dp_schedule import build_dp_schedule, has_full_schedule_config
-from miles.utils.multi_lora import is_multi_lora_enabled
+from miles.utils.lora.utils import is_multi_lora_enabled
 from miles.utils.object_store import ValueSpec
 from miles.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from miles.utils.timer import Timer
@@ -19,6 +20,9 @@ ROLLOUT_DATA_TENSOR_DTYPES = {
     "target_tokens": "int32",
     "loss_masks": "int32",
     "rollout_log_probs": "float32",
+    "rollout_topk_token_ids": "int32",
+    "rollout_topk_lengths": "int32",
+    "rollout_topk_log_probs": "float32",
     "rollout_sampling_mask_ids": "int32",
     "rollout_sampling_mask_offsets": "int64",
     "teacher_log_probs": "float32",
@@ -94,9 +98,7 @@ def convert_samples_to_train_data(
         if sample.loss_mask is None:
             sample.loss_mask = [1] * sample.response_length
 
-        assert (
-            len(sample.loss_mask) == sample.response_length
-        ), f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
+        assert len(sample.loss_mask) == sample.response_length, f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
         if sample.remove_sample:
             sample.loss_mask = [0] * sample.response_length
         loss_masks.append(sample.loss_mask)
@@ -116,6 +118,17 @@ def convert_samples_to_train_data(
     if samples[0].rollout_log_probs is not None:
         train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
 
+    if k := args.rollout_top_logprobs_num:
+        for sample in samples:
+            for field in ("rollout_topk_token_ids", "rollout_topk_log_probs", "rollout_log_probs"):
+                if getattr(sample, field) is None:
+                    raise ValueError(f"Rollout top-k logprobs collection requires {field}; sample_index={sample.index}. Custom rollout producers must record probabilities during generation.")
+        if args.ci_test:
+            for sample in samples:
+                validate_rollout_topk_logprobs_sample(sample, k)
+        train_data["rollout_topk_token_ids"] = [sample.rollout_topk_token_ids for sample in samples]
+        train_data["rollout_topk_log_probs"] = [sample.rollout_topk_log_probs for sample in samples]
+
     has_sampling_mask = any(sample.rollout_sampling_mask is not None for sample in samples)
     if has_sampling_mask:
         sampling_mask_ids = []
@@ -123,10 +136,7 @@ def convert_samples_to_train_data(
         for position, sample in enumerate(samples):
             sample.validate()
             if sample.rollout_sampling_mask is None:
-                raise ValueError(
-                    "sampling-mask data must be present for every training sample; "
-                    f"missing at position={position}, sample_index={sample.index}, status={sample.status}"
-                )
+                raise ValueError(f"sampling-mask data must be present for every training sample; missing at position={position}, sample_index={sample.index}, status={sample.status}")
             ids, offsets = sample.rollout_sampling_mask._as_tensors()
 
             sampling_mask_ids.append(ids)
@@ -134,12 +144,18 @@ def convert_samples_to_train_data(
 
         train_data["rollout_sampling_mask_ids"] = sampling_mask_ids
         train_data["rollout_sampling_mask_offsets"] = sampling_mask_offsets
+        if k and args.loss_type == "score_centering" and args.rollout_sampling_logprobs_mode == "support":
+            _compact_candidate_ids(train_data)
 
     if samples[0].rollout_routed_experts is not None:
         train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
+    elif getattr(args, "use_rollout_routing_replay", False):
+        raise ValueError("--use-rollout-routing-replay is set but the rollout samples carry no rollout_routed_experts: the engine response meta_info lacked 'routed_experts'.")
 
     if samples[0].rollout_indexer_topk is not None:
         train_data["rollout_indexer_topk"] = [sample.rollout_indexer_topk for sample in samples]
+    elif getattr(args, "use_rollout_indexer_replay", False):
+        raise ValueError("--use-rollout-indexer-replay is set but the rollout samples carry no rollout_indexer_topk: the engine response meta_info lacked 'indexer_topk'.")
 
     if samples[0].train_metadata is not None:
         train_data["metadata"] = [sample.train_metadata for sample in samples]
@@ -167,6 +183,37 @@ def convert_samples_to_train_data(
     return train_data
 
 
+def _compact_candidate_ids(data: dict) -> None:
+    """Share ordered support IDs in training batches; preserve other producer layouts."""
+    lengths = []
+    for dense, logps, support, offsets in zip(
+        data["rollout_topk_token_ids"],
+        data["rollout_topk_log_probs"],
+        data["rollout_sampling_mask_ids"],
+        data["rollout_sampling_mask_offsets"],
+        strict=True,
+    ):
+        dense, logps = torch.as_tensor(dense), torch.as_tensor(logps)
+        if dense.ndim != 2 or dense.shape != logps.shape or dense.size(0) != offsets.numel() - 1:
+            return
+        valid = dense >= 0
+        count = valid.sum(-1, dtype=torch.int32)
+        columns = torch.arange(dense.size(1))
+        prefix = columns < count[:, None]
+        if not torch.equal(valid, prefix) or not (dense[~prefix] == -1).all():
+            return
+        if not (count[count > 0] == offsets.diff()[count > 0]).all():
+            return
+        positions = offsets[:-1, None] + columns
+        if not torch.equal(dense[prefix], support[positions[prefix]]):
+            return
+        if not torch.isneginf(logps[count == 0]).all():
+            return
+        lengths.append(count)
+    data["rollout_topk_lengths"] = lengths
+    del data["rollout_topk_token_ids"]
+
+
 def _compute_rollout_mask_sums(rollout_ids: list[int], loss_masks: list[list[int]]) -> list[int]:
     """Whole-rollout loss-mask total per sample: every sibling of one rollout carries
     the sum over all of that rollout's samples, so the loss reducer reconstructs one
@@ -181,9 +228,7 @@ def _reward_group_segments(args: Any, samples: list[Sample], prompt_group_sizes:
     """Return the flattened row indices for each prompt reward group."""
     # Multi-LoRA records explicit prompt boundaries before flattening.
     if prompt_group_sizes is not None:
-        assert sum(prompt_group_sizes) == len(
-            samples
-        ), f"prompt group sizes sum to {sum(prompt_group_sizes)}, but got {len(samples)} rewards"
+        assert sum(prompt_group_sizes) == len(samples), f"prompt group sizes sum to {sum(prompt_group_sizes)}, but got {len(samples)} rewards"
         groups: list[list[int]] = []
         start = 0
         for size in prompt_group_sizes:
@@ -204,10 +249,7 @@ def _reward_group_segments(args: Any, samples: list[Sample], prompt_group_sizes:
     # Legacy fixed-fanout batches store each prompt's segments contiguously.
     expected_samples = args.n_samples_per_prompt * args.rollout_batch_size
     if len(samples) == expected_samples:
-        return [
-            list(range(start, start + args.n_samples_per_prompt))
-            for start in range(0, len(samples), args.n_samples_per_prompt)
-        ]
+        return [list(range(start, start + args.n_samples_per_prompt)) for start in range(0, len(samples), args.n_samples_per_prompt)]
     # Without prompt identities or a complete fixed layout, use one reward group.
     return [list(range(len(samples)))]
 
@@ -240,10 +282,7 @@ def _normalize_rewards_by_rollout(
         for rollout_key, rollout_segments in rollout_segment_groups:
             sibling_rewards = [raw_rewards[segment_index] for segment_index in rollout_segments]
             if any(reward != sibling_rewards[0] for reward in sibling_rewards[1:]):
-                raise ValueError(
-                    f"all samples in rollout {rollout_key!r} must share one reward; "
-                    f"rows {rollout_segments} have rewards {sibling_rewards}"
-                )
+                raise ValueError(f"all samples in rollout {rollout_key!r} must share one reward; rows {rollout_segments} have rewards {sibling_rewards}")
             shared_rewards.append(sibling_rewards[0])
 
         rollout_rewards = torch.tensor(shared_rewards, dtype=torch.float)
@@ -257,9 +296,7 @@ def _normalize_rewards_by_rollout(
             if rollout_std > 0:
                 normalized_rollout_rewards = normalized_rollout_rewards / (rollout_std + 1e-6)
 
-        for (_, rollout_segments), normalized_reward in zip(
-            rollout_segment_groups, normalized_rollout_rewards.tolist(), strict=True
-        ):
+        for (_, rollout_segments), normalized_reward in zip(rollout_segment_groups, normalized_rollout_rewards.tolist(), strict=True):
             for segment_index in rollout_segments:
                 normalized_rewards[segment_index] = normalized_reward
 
@@ -311,9 +348,7 @@ def can_schedule_on_rollout_side(args, data: dict[str, Any], train_parallel_conf
     return len(set(data["rollout_ids"])) >= global_batch_size
 
 
-def split_train_data_by_dp_scheduled_raw(
-    args, data: dict[str, Any], *, train_parallel_config: dict
-) -> list[dict[str, Any]]:
+def split_train_data_by_dp_scheduled_raw(args, data: dict[str, Any], *, train_parallel_config: dict) -> list[dict[str, Any]]:
     """DP split with the micro-batch schedule precomputed on the rollout side."""
     total_lengths = [len(t) for t in data["tokens"]]
     data["total_lengths"] = total_lengths
@@ -326,10 +361,7 @@ def split_train_data_by_dp_scheduled_raw(
         global_batch_size=global_batch_size,
         rollout_indices=data["rollout_ids"],
     )
-    logger.info(
-        f"Rollout-side DP schedule: num_samples={len(total_lengths)}, "
-        f"num_rollouts={num_rollouts}, num_microbatches={num_microbatches}"
-    )
+    logger.info(f"Rollout-side DP schedule: num_samples={len(total_lengths)}, num_rollouts={num_rollouts}, num_microbatches={num_microbatches}")
 
     shards = _package_shards(args, data, partitions)
     for rank, shard in enumerate(shards):
@@ -378,6 +410,9 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "rollout_ids",
             "rollout_mask_sums",
             "rollout_log_probs",
+            "rollout_topk_token_ids",
+            "rollout_topk_lengths",
+            "rollout_topk_log_probs",
             "rollout_sampling_mask_ids",
             "rollout_sampling_mask_offsets",
             "rollout_routed_experts",

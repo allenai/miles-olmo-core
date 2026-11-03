@@ -1,0 +1,61 @@
+"""Optional Triton compilation timings through its supported listener API."""
+
+import importlib
+import json
+import math
+import os
+import time
+
+from miles.utils import logger_utils
+from miles.utils.compiler_cache import compiler_cache as cache
+
+logger = logger_utils.setup_logger(__name__)
+
+
+def numeric_specialization(src):
+    """Expose shape/flag constants, never arbitrary string or object contents."""
+    names = getattr(getattr(src, "fn", None), "arg_names", ())
+    result = {}
+    for key, constant in getattr(src, "constants", {}).items():
+        value = getattr(constant, "value", constant)
+        if value is not None and type(value) not in (int, float, bool):
+            continue
+        if type(value) is float and not math.isfinite(value):
+            continue
+        name = str(key)
+        path = key if isinstance(key, tuple) else (key,)
+        if path and isinstance(path[0], int) and 0 <= path[0] < len(names):
+            name = names[path[0]] + "".join(f"[{part}]" for part in path[1:])
+        result[name] = value
+    return result
+
+
+def install(local):
+    knobs = importlib.import_module("triton.knobs")
+    previous = knobs.compilation.listener
+    if getattr(previous, "_miles_cache_observer", False):
+        return
+
+    def listener(*, src, metadata, metadata_group, times, cache_hit):
+        if previous is not None:
+            previous(src=src, metadata=metadata, metadata_group=metadata_group, times=times, cache_hit=cache_hit)
+        try:
+            stages = dict(times.lowering_stages)
+            record = {
+                "event": "compile_hit" if cache_hit else "compile_miss",
+                "timestamp": time.time(),
+                "kernel": src.name,
+                "source_digest": cache.digest(getattr(getattr(src, "fn", None), "cache_key", None)),
+                "signature": {str(key): str(value) for key, value in getattr(src, "signature", {}).items()},
+                "specialization_digest": cache.digest(str(getattr(src, "constants", {}))),
+                "numeric_specialization": numeric_specialization(src),
+                "compiler_microseconds": times.ir_initialization + sum(stages.values()) + times.store_results,
+                "lowering_microseconds": stages,
+            }
+            with (local / f"activity-{os.getpid()}.jsonl").open("a") as stream:
+                stream.write(json.dumps(record) + "\n")
+        except (OSError, AttributeError, TypeError, ValueError) as error:
+            logger.warning("Could not record compiler timing: %s", error)
+
+    listener._miles_cache_observer = True
+    knobs.compilation.listener = listener

@@ -44,9 +44,8 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          # 3.11 required for BaseException.add_note (PEP 678), used in miles
-          # source (e.g. miles/rollout/generate_utils/sample_utils.py).
-          python-version: '3.11'
+          # Match the Miles Docker runtime.
+          python-version: '3.12'
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -76,6 +75,14 @@ jobs:
             [ -z "$SGLANG_PR" ] && SGLANG_PR="$LOCK_SGLANG"
             [ -z "$MEGATRON_PR" ] && MEGATRON_PR="$LOCK_MEGATRON"
             echo "release-lock.json present: sglang=$LOCK_SGLANG megatron=$LOCK_MEGATRON"
+          fi
+          # Keep hosted CPU checks reproducible while the fork advances separately
+          # from upstream. Explicit overrides and release locks above still win.
+          if [ -f tests/ci/cpu-dependency-lock.json ]; then
+            CPU_SGLANG=$(python3 -c "import json; print(json.load(open('tests/ci/cpu-dependency-lock.json'))['sglang_commit'])")
+            CPU_MEGATRON=$(python3 -c "import json; print(json.load(open('tests/ci/cpu-dependency-lock.json'))['megatron_commit'])")
+            [ -z "$SGLANG_PR" ] && SGLANG_PR="$CPU_SGLANG"
+            [ -z "$MEGATRON_PR" ] && MEGATRON_PR="$CPU_MEGATRON"
           fi
           [ -z "$MEGATRON_PR" ] && MEGATRON_PR="miles-main"
           [ -z "$SGLANG_PR" ] && SGLANG_PR="sglang-miles"
@@ -117,7 +124,17 @@ jobs:
           UV_SYSTEM_PYTHON: "1"
         run: |
           uv pip install -r requirements.txt -r tests/ci/requirements-ci-cpu.txt
-          python tests/ci/verify_source_resolution.py
+
+      - name: Install Megatron Bridge override
+        if: ${{ github.event.inputs.ci_megatron_bridge_pr != '' || contains(github.event.pull_request.body, 'ci-megatron-bridge-pr:') }}
+        uses: ./.github/actions/install-megatron-bridge
+        with:
+          ref: ${{ github.event.inputs.ci_megatron_bridge_pr || '' }}
+          pr_body: ${{ github.event.pull_request.body || '' }}
+
+      - name: Verify source resolution
+        shell: bash
+        run: python tests/ci/verify_source_resolution.py
 
       - name: Install Helm
         uses: azure/setup-helm@v4

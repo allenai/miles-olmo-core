@@ -1,11 +1,11 @@
 diff --git a/python/sglang/kernels/ops/attention/fla/chunk.py b/python/sglang/kernels/ops/attention/fla/chunk.py
-index 8acb9d1..562944e 100644
+index f4b892f68b..0ee9f09a5b 100644
 --- a/python/sglang/kernels/ops/attention/fla/chunk.py
 +++ b/python/sglang/kernels/ops/attention/fla/chunk.py
-@@ -44,12 +44,14 @@ def chunk_gated_delta_rule_fwd(
-     initial_state_indices: torch.Tensor,
+@@ -45,12 +45,14 @@ def chunk_gated_delta_rule_fwd(
      cu_seqlens: Optional[torch.LongTensor] = None,
      chunk_indices: torch.LongTensor | None = None,
+     inplace_update: bool = True,
 +    vllm_compatible: bool = False,
  ):
      g = chunk_local_cumsum(
@@ -17,7 +17,7 @@ index 8acb9d1..562944e 100644
      w, u, A = chunk_gated_delta_rule_fwd_intra(
          k=k,
          v=v,
-@@ -57,6 +59,7 @@ def chunk_gated_delta_rule_fwd(
+@@ -58,6 +60,7 @@ def chunk_gated_delta_rule_fwd(
          beta=beta,
          cu_seqlens=cu_seqlens,
          chunk_indices=chunk_indices,
@@ -25,10 +25,10 @@ index 8acb9d1..562944e 100644
      )
  
      h, v_new = chunk_gated_delta_rule_fwd_h(
-@@ -101,10 +104,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
-         initial_state_indices: torch.Tensor,
+@@ -103,10 +106,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
          cu_seqlens: Optional[torch.LongTensor] = None,
          use_qk_l2norm_in_kernel: bool = False,
+         inplace_update: bool = True,
 +        vllm_compatible: bool = False,
      ):
 -        q_orig = q
@@ -37,42 +37,42 @@ index 8acb9d1..562944e 100644
          if use_qk_l2norm_in_kernel:
              q = l2norm_fwd(q)
              k = l2norm_fwd(k)
-@@ -125,6 +126,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
-             initial_state_indices=initial_state_indices,
+@@ -128,6 +129,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
              cu_seqlens=cu_seqlens,
              chunk_indices=chunk_indices,
+             inplace_update=inplace_update,
 +            vllm_compatible=vllm_compatible,
          )
          return o.to(q.dtype), h
  
-@@ -142,6 +144,7 @@ def chunk_gated_delta_rule(
-     cu_seqlens: Optional[torch.LongTensor] = None,
+@@ -146,6 +148,7 @@ def chunk_gated_delta_rule(
      head_first: bool = False,
      use_qk_l2norm_in_kernel: bool = False,
+     inplace_update: bool = True,
 +    vllm_compatible: bool = False,
  ):
      r"""
      Args:
-@@ -170,6 +173,9 @@ def chunk_gated_delta_rule(
-         head_first (Optional[bool]):
-             Whether the inputs are in the head-first format, which is not supported for variable-length inputs.
+@@ -176,6 +179,9 @@ def chunk_gated_delta_rule(
              Default: `False`.
+         inplace_update (Optional[bool]):
+             Whether to write final states back to `initial_state`. Default: `True`.
 +        vllm_compatible (bool):
 +            Round beta*K to the key dtype before the Gram product and use IEEE
 +            block merges. Opt-in BF16 arithmetic for Olmicro; default: `False`.
  
      Returns:
          o (torch.Tensor):
-@@ -256,6 +262,7 @@ def chunk_gated_delta_rule(
-         initial_state_indices,
+@@ -263,6 +269,7 @@ def chunk_gated_delta_rule(
          cu_seqlens,
          use_qk_l2norm_in_kernel,
+         inplace_update,
 +        vllm_compatible,
      )
      if head_first:
          o = rearrange(o, "b t h ... -> b h t ...")
 diff --git a/python/sglang/kernels/ops/attention/fla/chunk_fwd.py b/python/sglang/kernels/ops/attention/fla/chunk_fwd.py
-index 828ddc4..ad88bcc 100644
+index 4e7b068106..bd089f6d73 100644
 --- a/python/sglang/kernels/ops/attention/fla/chunk_fwd.py
 +++ b/python/sglang/kernels/ops/attention/fla/chunk_fwd.py
 @@ -53,6 +53,8 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
@@ -84,7 +84,7 @@ index 828ddc4..ad88bcc 100644
  ):
      """
      Fused kernel: compute beta * K @ K^T (lower triangular) + solve_tril (I+A)^{-1} in one pass.
-@@ -143,46 +145,65 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
+@@ -145,46 +147,65 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
              k, (T, K), (Hg * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0)
          )
          b_k0 = tl.load(p_k0, boundary_check=(0, 1))
@@ -160,7 +160,7 @@ index 828ddc4..ad88bcc 100644
      if USE_G:
          # diagonal blocks: g_diff = g_i - g_j within sub-chunk
          b_A00 *= safe_exp(b_g0[:, None] - b_g0[None, :])
-@@ -268,39 +289,39 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
+@@ -270,39 +291,39 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
      ############################################################################
  
      b_Ai10 = -tl.dot(
@@ -216,7 +216,7 @@ index 828ddc4..ad88bcc 100644
      )
  
      ############################################################################
-@@ -344,6 +365,7 @@ def chunk_gated_delta_rule_fwd_intra(
+@@ -346,6 +367,7 @@ def chunk_gated_delta_rule_fwd_intra(
      cu_seqlens: torch.LongTensor | None = None,
      chunk_size: int = 64,
      chunk_indices: torch.LongTensor | None = None,
@@ -224,7 +224,7 @@ index 828ddc4..ad88bcc 100644
  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
      r"""
      GDN intra-chunk forward: fused kkt + solve_tril + recompute_w_u.
-@@ -401,6 +423,8 @@ def chunk_gated_delta_rule_fwd_intra(
+@@ -403,6 +425,8 @@ def chunk_gated_delta_rule_fwd_intra(
          K=K,
          BT=BT,
          BC=BC,
@@ -234,7 +234,7 @@ index 828ddc4..ad88bcc 100644
  
      # Step 2: recompute_w_u
 diff --git a/python/sglang/kernels/ops/attention/fla/fused_gdn_gating.py b/python/sglang/kernels/ops/attention/fla/fused_gdn_gating.py
-index 16cdf8f..83894f1 100644
+index 16cdf8f7b8..83894f165a 100644
 --- a/python/sglang/kernels/ops/attention/fla/fused_gdn_gating.py
 +++ b/python/sglang/kernels/ops/attention/fla/fused_gdn_gating.py
 @@ -22,6 +22,7 @@ def fused_gdn_gating_kernel(
@@ -273,10 +273,10 @@ index 16cdf8f..83894f1 100644
      )
      return g, beta_output
 diff --git a/python/sglang/kernels/ops/attention/fla/fused_recurrent.py b/python/sglang/kernels/ops/attention/fla/fused_recurrent.py
-index 5ffdea7..2256c2e 100644
+index 1a59ad0643..174272c35c 100644
 --- a/python/sglang/kernels/ops/attention/fla/fused_recurrent.py
 +++ b/python/sglang/kernels/ops/attention/fla/fused_recurrent.py
-@@ -207,6 +207,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
+@@ -208,6 +208,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
      BK: tl.constexpr,
      BV: tl.constexpr,
      SOFTPLUS_THRESHOLD: tl.constexpr,
@@ -284,7 +284,7 @@ index 5ffdea7..2256c2e 100644
      USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
  ):
      i_v, i_nh = tl.program_id(0), tl.program_id(1)
-@@ -251,7 +252,12 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
+@@ -252,7 +253,12 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
      x = a_val + dt_bias_val
      softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
      g_val = -tl.exp(A_log_val) * softplus_x
@@ -298,7 +298,7 @@ index 5ffdea7..2256c2e 100644
  
      b_h *= exp(g_val)
      b_v -= tl.sum(b_h * b_k[None, :], 1)
-@@ -276,6 +282,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
+@@ -277,6 +283,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
      out: torch.Tensor,
      ssm_state_indices: torch.Tensor,
      use_qk_l2norm_in_kernel: bool = False,
@@ -306,7 +306,7 @@ index 5ffdea7..2256c2e 100644
  ) -> tuple[torch.Tensor, torch.Tensor]:
      if mixed_qkv.ndim != 2:
          raise ValueError(
-@@ -395,6 +402,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
+@@ -396,6 +403,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
          BK=BK,
          BV=BV,
          SOFTPLUS_THRESHOLD=20.0,
@@ -315,28 +315,28 @@ index 5ffdea7..2256c2e 100644
          num_warps=num_warps,
          num_stages=num_stages,
 diff --git a/python/sglang/srt/configs/__init__.py b/python/sglang/srt/configs/__init__.py
-index 54b5fa4..c9b045e 100644
+index 06239f17ee..6ef7641a6c 100644
 --- a/python/sglang/srt/configs/__init__.py
 +++ b/python/sglang/srt/configs/__init__.py
-@@ -35,6 +35,7 @@ from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
- from sglang.srt.configs.lfm2_vl import Lfm2VlConfig
- from sglang.srt.configs.locate_anything import LocateAnythingConfig
- from sglang.srt.configs.longcat_flash import LongcatFlashConfig
+@@ -55,6 +55,7 @@ from sglang.srt.configs.longcat_flash import LongcatFlashConfig
+ from sglang.srt.configs.mamba import FalconMambaConfig, MambaConfig
+ from sglang.srt.configs.mamba2 import Mamba2Config
+ from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 +from sglang.srt.configs.mainline_ladder import MainlineLadderConfig
  from sglang.srt.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
  from sglang.srt.configs.minimax_vl import MiniMaxM3VLConfig
  from sglang.srt.configs.muse_glimmer import (
-@@ -87,6 +88,7 @@ __all__ = [
-     "KimiK25Config",
-     "LagunaConfig",
+@@ -124,6 +125,7 @@ __all__ = [
      "Qwen3NextConfig",
+     "Qwen4ExpConfig",
+     "Qwen4ExpTextConfig",
 +    "MainlineLadderConfig",
      "Qwen3_5Config",
      "Qwen3_5MoeConfig",
      "Qwen3_5TextConfig",
 diff --git a/python/sglang/srt/configs/mainline_ladder.py b/python/sglang/srt/configs/mainline_ladder.py
 new file mode 100644
-index 0000000..265978f
+index 0000000000..265978fa71
 --- /dev/null
 +++ b/python/sglang/srt/configs/mainline_ladder.py
 @@ -0,0 +1,30 @@
@@ -371,10 +371,10 @@ index 0000000..265978f
 +    def layers_block_type(self):
 +        return ["attention" if k == "full_attention" else k for k in self.layer_types]
 diff --git a/python/sglang/srt/layers/attention/linear/gdn_backend.py b/python/sglang/srt/layers/attention/linear/gdn_backend.py
-index 7a0d1ee..63ec420 100644
+index 15ac8abac0..b5c4624ac0 100644
 --- a/python/sglang/srt/layers/attention/linear/gdn_backend.py
 +++ b/python/sglang/srt/layers/attention/linear/gdn_backend.py
-@@ -403,6 +403,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
+@@ -651,6 +651,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
          if _is_hip and isinstance(mixed_qkv, torch.Tensor) and mixed_qkv.shape[0] == 0:
              return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
  
@@ -387,7 +387,7 @@ index 7a0d1ee..63ec420 100644
          layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
          conv_states = layer_cache.conv[0]
          ssm_states = layer_cache.temporal
-@@ -417,6 +423,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
+@@ -665,6 +671,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
          # kernel folds the ring into temporal[slot] on the snapshot steps.
          replayssm_force_flush = self.forward_metadata.replayssm_force_flush
          replayssm_d = layer_cache.replayssm_d
@@ -396,7 +396,7 @@ index 7a0d1ee..63ec420 100644
          replayssm_k = layer_cache.replayssm_k
          replayssm_g = layer_cache.replayssm_g
  
-@@ -440,6 +448,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
+@@ -836,6 +844,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                  A_log=layer.A_log,
                  dt_bias=layer.dt_bias,
                  scale=layer.head_k_dim**-0.5,
@@ -404,7 +404,7 @@ index 7a0d1ee..63ec420 100644
                  ssm_states=ssm_states,
                  cache_indices=cache_indices,
                  num_v_heads=layer.num_v_heads,
-@@ -685,7 +694,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
+@@ -1098,7 +1107,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
                      retrieve_parent_token=retrieve_parent_token,
                  )
          else:
@@ -425,7 +425,7 @@ index 7a0d1ee..63ec420 100644
              core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                  q=query,
                  k=key,
-@@ -695,6 +716,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
+@@ -1108,6 +1129,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                  ssm_states=ssm_states_contig,
                  cache_indices=state_cache_indices,
                  query_start_loc=query_start_loc,
@@ -434,7 +434,7 @@ index 7a0d1ee..63ec420 100644
                      forward_metadata.state_checkpoint_cu_starts
                  ),
 diff --git a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
-index c694222..ffe4d4d 100644
+index 0e5c0e10ca..f1e637b2a9 100644
 --- a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
 +++ b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
 @@ -129,6 +129,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
@@ -445,9 +445,9 @@ index c694222..ffe4d4d 100644
          )
  
          # Convert [B, 1, HV, V] → [1, B, HV, V] to match existing output
-@@ -185,6 +186,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
-             recurrent_state = ssm_states[cache_indices]
-             recurrent_state_indices_args = {}
+@@ -200,6 +201,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
+             # control. Its existing behavior is equivalent to True.
+             inplace_update_args = {}
  
 +        compatibility_kwargs = (
 +            {"vllm_compatible": True} if kwargs.get("vllm_compatible", False) else {}
@@ -455,17 +455,17 @@ index c694222..ffe4d4d 100644
          return chunk_gated_delta_rule(
              q=q,
              k=k,
-@@ -196,6 +200,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
-             head_first=False,
+@@ -212,6 +216,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
              use_qk_l2norm_in_kernel=True,
              **recurrent_state_indices_args,
+             **inplace_update_args,
 +            **compatibility_kwargs,
          )
  
      def target_verify(
 diff --git a/python/sglang/srt/models/mainline_ladder.py b/python/sglang/srt/models/mainline_ladder.py
 new file mode 100644
-index 0000000..54a9eee
+index 0000000000..54a9eeedbd
 --- /dev/null
 +++ b/python/sglang/srt/models/mainline_ladder.py
 @@ -0,0 +1,319 @@
@@ -789,28 +789,28 @@ index 0000000..54a9eee
 +
 +EntryClass = MainlineLadderForCausalLM
 diff --git a/python/sglang/srt/utils/hf_transformers/common.py b/python/sglang/srt/utils/hf_transformers/common.py
-index de12659..53cd53a 100644
+index b8d202b750..ab2ffb7eba 100644
 --- a/python/sglang/srt/utils/hf_transformers/common.py
 +++ b/python/sglang/srt/utils/hf_transformers/common.py
-@@ -48,6 +48,7 @@ from sglang.srt.configs import (
-     LagunaConfig,
-     LocateAnythingConfig,
-     LongcatFlashConfig,
+@@ -67,6 +67,7 @@ from sglang.srt.configs import (
+     Mamba2Config,
+     MambaConfig,
+     MiniCPMHybridConfig,
 +    MainlineLadderConfig,
      MiniCPMV4_6Config,
      MiniCPMV4_6VisionConfig,
      MiniMaxM3VLConfig,
-@@ -108,6 +109,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
-         KimiK3Config,
-         KimiLinearConfig,
+@@ -142,6 +143,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
          Qwen3NextConfig,
+         Qwen4ExpConfig,
+         Qwen4ExpTextConfig,
 +        MainlineLadderConfig,
          FalconH1Config,
-         GraniteMoeHybridConfig,
-         DotsVLMConfig,
+         FalconMambaConfig,
+         Mamba2Config,
 diff --git a/test/manual/olmicro/README.md b/test/manual/olmicro/README.md
 new file mode 100644
-index 0000000..2d4a73b
+index 0000000000..2d4a73b7dd
 --- /dev/null
 +++ b/test/manual/olmicro/README.md
 @@ -0,0 +1,132 @@
@@ -948,7 +948,7 @@ index 0000000..2d4a73b
 +publication and a full RL update remain separate training qualification gates.
 diff --git a/test/manual/olmicro/probe_backend.py b/test/manual/olmicro/probe_backend.py
 new file mode 100644
-index 0000000..60779cd
+index 0000000000..60779cd603
 --- /dev/null
 +++ b/test/manual/olmicro/probe_backend.py
 @@ -0,0 +1,285 @@
@@ -1239,7 +1239,7 @@ index 0000000..60779cd
 +    main()
 diff --git a/test/manual/olmicro/probe_distribution.py b/test/manual/olmicro/probe_distribution.py
 new file mode 100644
-index 0000000..cff4b90
+index 0000000000..cff4b90eea
 --- /dev/null
 +++ b/test/manual/olmicro/probe_distribution.py
 @@ -0,0 +1,166 @@
@@ -1411,7 +1411,7 @@ index 0000000..cff4b90
 +    main()
 diff --git a/test/manual/olmicro/test_activation.py b/test/manual/olmicro/test_activation.py
 new file mode 100644
-index 0000000..305555c
+index 0000000000..305555c7f4
 --- /dev/null
 +++ b/test/manual/olmicro/test_activation.py
 @@ -0,0 +1,18 @@
@@ -1435,7 +1435,7 @@ index 0000000..305555c
 +    assert (without_rounding != expected).float().mean().item() > 0.1
 diff --git a/test/manual/olmicro/test_beta_scale.py b/test/manual/olmicro/test_beta_scale.py
 new file mode 100644
-index 0000000..760753a
+index 0000000000..760753a1de
 --- /dev/null
 +++ b/test/manual/olmicro/test_beta_scale.py
 @@ -0,0 +1,83 @@
@@ -1524,7 +1524,7 @@ index 0000000..760753a
 +    )
 diff --git a/test/manual/olmicro/test_chunk_precision.py b/test/manual/olmicro/test_chunk_precision.py
 new file mode 100644
-index 0000000..463e12e
+index 0000000000..463e12e771
 --- /dev/null
 +++ b/test/manual/olmicro/test_chunk_precision.py
 @@ -0,0 +1,44 @@
@@ -1574,7 +1574,7 @@ index 0000000..463e12e
 +        )
 diff --git a/test/manual/olmicro/test_config.py b/test/manual/olmicro/test_config.py
 new file mode 100644
-index 0000000..162a9c6
+index 0000000000..162a9c6e2b
 --- /dev/null
 +++ b/test/manual/olmicro/test_config.py
 @@ -0,0 +1,23 @@
@@ -1603,7 +1603,7 @@ index 0000000..162a9c6
 +        MainlineLadderConfig(layer_types=layers, num_hidden_layers=2)
 diff --git a/test/manual/olmicro/test_distribution.py b/test/manual/olmicro/test_distribution.py
 new file mode 100644
-index 0000000..438d2a4
+index 0000000000..438d2a4489
 --- /dev/null
 +++ b/test/manual/olmicro/test_distribution.py
 @@ -0,0 +1,36 @@
@@ -1645,7 +1645,7 @@ index 0000000..438d2a4
 +        compare(record(), b)
 diff --git a/test/manual/olmicro/test_norm.py b/test/manual/olmicro/test_norm.py
 new file mode 100644
-index 0000000..9cfbe11
+index 0000000000..9cfbe11734
 --- /dev/null
 +++ b/test/manual/olmicro/test_norm.py
 @@ -0,0 +1,39 @@
@@ -1690,7 +1690,7 @@ index 0000000..9cfbe11
 +    assert (actual == expected).float().mean().item() > 0.9999
 diff --git a/test/manual/olmicro/test_probe_backend.py b/test/manual/olmicro/test_probe_backend.py
 new file mode 100644
-index 0000000..bb5a786
+index 0000000000..bb5a78620d
 --- /dev/null
 +++ b/test/manual/olmicro/test_probe_backend.py
 @@ -0,0 +1,67 @@
@@ -1763,7 +1763,7 @@ index 0000000..bb5a786
 +        probe._compare(_record(), right)
 diff --git a/test/manual/olmicro/test_weight_loading.py b/test/manual/olmicro/test_weight_loading.py
 new file mode 100644
-index 0000000..012daf9
+index 0000000000..012daf9514
 --- /dev/null
 +++ b/test/manual/olmicro/test_weight_loading.py
 @@ -0,0 +1,110 @@

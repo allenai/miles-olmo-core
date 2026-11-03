@@ -4,12 +4,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from miles.backends.training_utils.loss_hub import losses as loss_utils
+from miles.backends.training_utils.loss.hub import losses as loss_utils
 
 
 def _make_args(*, use_rollout_logprobs: bool) -> Namespace:
     return Namespace(
         use_rollout_logprobs=use_rollout_logprobs,
+        use_sampling_support_replay=False,
         skip_actor_forward_only=False,
         use_opsm=False,
         advantage_estimator="ppo",
@@ -67,18 +68,18 @@ def _patch_single_rank_loss_helpers(monkeypatch):
             torch.tensor([0.40, 0.80], dtype=torch.float32),
             torch.tensor([0.10, 0.20], dtype=torch.float32),
             torch.tensor([0.40, 0.80], dtype=torch.float32),
-            0.45,
+            0.0,
         ),
         (
             True,
             torch.tensor([0.50, 1.00], dtype=torch.float32),
             torch.tensor([0.10, 0.20], dtype=torch.float32),
             torch.tensor([0.40, 0.80], dtype=torch.float32),
-            0.0,
+            0.15,
         ),
     ],
 )
-def test_train_rollout_logprob_abs_diff_uses_policy_loss_reference_logprobs(
+def test_train_rollout_logprob_abs_diff_uses_current_forward_independent_of_ppo_reference(
     monkeypatch,
     use_rollout_logprobs: bool,
     train_log_probs: torch.Tensor,

@@ -65,3 +65,26 @@ def measurements(batches, max_tokens):
         "fill_fraction": sum(tokens) / (len(batches) * max_tokens),
         "samples_per_pack": samples / len(batches),
     }
+
+
+def bind_training_fields(steps, rollout):
+    """Attach newly computed scores/advantages to existing packs in sample order.
+
+    Packing is order preserving. Token storage, document boundaries and replay
+    payloads stay owned by the prepared batch; no second validation or GPU cat.
+    """
+    count = len(rollout["tokens"])
+    fields = {
+        key: value
+        for key, value in rollout.items()
+        if isinstance(value, list) and len(value) == count and key not in ("tokens", "max_seq_lens")
+    }
+    cursor = 0
+    for step in steps:
+        for batch in step:
+            size = len(batch["total_lengths"])
+            batch.update({key: value[cursor : cursor + size] for key, value in fields.items()})
+            cursor += size
+    if cursor != count:
+        raise ValueError("Prepared packs do not cover the rollout")
+    return steps

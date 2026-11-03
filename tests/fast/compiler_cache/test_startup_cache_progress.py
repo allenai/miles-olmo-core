@@ -1,6 +1,7 @@
 """Warm compiler caches are published after completed training collections while workers stay live."""
 
 import asyncio
+import errno
 import json
 import shutil
 import tempfile
@@ -69,12 +70,48 @@ def test_final_publication_still_removes_the_private_copy(live_worker):
     assert not local.exists()
 
 
+@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EROFS, errno.EACCES])
+def test_publication_io_failure_warns_and_retains_retryable_local_cache(live_worker, monkeypatch, caplog, code):
+    local, shared, report = live_worker
+    original = cache.publish
+
+    def unavailable(*args, **kwargs):
+        raise OSError(code, "shared cache unavailable", str(shared))
+
+    monkeypatch.setattr(cache, "publish", unavailable)
+    assert startup_cache.publish_worker(report, retain_local=True)["publish"]["status"] == "rejected"
+    assert (local / "triton/group/kernel.so").read_bytes() == b"compiled"
+    assert not (local / "publication-state.json").exists()
+    assert str(shared) in caplog.text and f"errno={code}" in caplog.text
+    assert any(r.levelname == "WARNING" and "PUBLICATION FAILED" in r.message for r in caplog.records)
+    monkeypatch.setattr(cache, "publish", original)
+    assert startup_cache.publish_worker(report, retain_local=True)["publish"]["status"] == "published"
+
+
 def test_progress_schedule_first_collection_then_elapsed_time():
     assert startup_cache.progress_due(None, 100)
     assert not startup_cache.progress_due(100, 699)
     assert startup_cache.progress_due(100, 700)
     assert not startup_cache.progress_due(100, 110, interval=30)
     assert startup_cache.progress_due(100, 130, interval=30)
+
+
+def test_live_snapshot_deferral_is_informational_and_retryable(live_worker, monkeypatch, caplog):
+    local, _, report = live_worker
+    original = cache.publish
+    caplog.set_level("INFO", logger=startup_cache.__name__)
+
+    def defer(*args, **kwargs):
+        raise ValueError("Compiler cache changed during snapshot")
+
+    monkeypatch.setattr(cache, "publish", defer)
+    result = startup_cache.publish_worker(report, retain_local=True)
+    assert result["publish"]["status"] == "rejected"
+    assert "changed during snapshot" in caplog.text
+    assert not any(r.levelname == "WARNING" for r in caplog.records)
+    assert local.exists()
+    monkeypatch.setattr(cache, "publish", original)
+    assert startup_cache.publish_worker(report, retain_local=True)["publish"]["status"] == "published"
 
 
 def _policy(tmp_path, workers=1):
@@ -86,6 +123,44 @@ def _policy(tmp_path, workers=1):
         )
     (report_dir / "cold.json").write_text(json.dumps(dict(slot="cold", restore={"status": "cold"})))
     return dict(report_dir=str(report_dir), shared=str(tmp_path / "shared"))
+
+
+@pytest.mark.parametrize("damage", ["truncated", "encoding", "unreadable", "non_object"])
+def test_bad_report_does_not_block_live_or_final_publication(tmp_path, monkeypatch, caplog, damage):
+    policy = _policy(tmp_path)
+    bad = Path(policy["report_dir"]) / "bad.json"
+    bad.write_bytes({"truncated": b'{"slot": "broken', "encoding": b"\xff", "non_object": b"[]"}.get(damage, b"{}"))
+    original = Path.read_text
+    calls = []
+
+    def read(path, *args, **kwargs):
+        if path == bad and damage == "unreadable":
+            raise OSError(errno.EACCES, "report unreadable", str(path))
+        return original(path, *args, **kwargs)
+
+    async def publish(workers, *, retain_local=False):
+        calls.append(([worker["slot"] for worker in workers], retain_local))
+        return [{"slot": worker["slot"], "publish": {"status": "published"}} for worker in workers]
+
+    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setattr(startup_cache, "_publish_all", publish)
+    args = SimpleNamespace(olmo_core_startup_cache=policy, save=str(tmp_path / "save"))
+
+    async def scenario():
+        await startup_cache.publish_progress(args, 0)
+        await startup_cache.finish(args, success=True)
+
+    asyncio.run(scenario())
+    assert calls == [(["rank0"], True), (["rank0"], False)]
+    for name in ("compiler-cache-progress.json", "compiler-cache.json"):
+        report = json.loads((Path(args.save) / name).read_text())
+        if "publications" in report:
+            report = report["publications"][0]
+        assert "publication_error" not in report
+        assert any(worker.get("publish", {}).get("status") == "published" for worker in report["workers"])
+    assert bad.exists()
+    assert str(bad) in caplog.text
+    assert any(r.levelname == "WARNING" and "SKIPPING UNREADABLE" in r.message for r in caplog.records)
 
 
 def test_publish_progress_runs_in_background_without_overlap(tmp_path, monkeypatch):

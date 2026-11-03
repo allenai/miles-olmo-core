@@ -10,7 +10,7 @@ from olmo_core.optim import OLMoDDPOptimizerConfig
 from olmo_core.train.train_module import transformer as train_transformer
 from olmo_core.train.train_module.transformer import config as train_config
 
-from miles.backends.core_utils import data, fla_compat
+from miles.backends.core_utils import data, fla_compat, fla_conv_compat
 from miles.backends.core_utils.timing import startup_stage
 
 
@@ -31,6 +31,7 @@ def model_config_from_hf(hf, options):
 def prepare_model_config(config, hf, options):
     if "linear_attention" in (getattr(hf, "layer_types", None) or []):
         fla_compat.install_kda_triton_compat()
+        fla_conv_compat.install()
     config.recompute_each_block = options.activation_checkpointing
     blocks = list(config.block.values()) if isinstance(config.block, dict) else [config.block]
     for block in [*blocks, *(config.block_overrides or {}).values()]:

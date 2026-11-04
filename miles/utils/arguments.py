@@ -1578,6 +1578,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             reset_arg(parser, "--seed", type=int, default=1234)
             reset_arg(parser, "--clip-grad", type=float, default=1.0)
             reset_arg(parser, "--calculate-per-token-loss", action="store_true")
+            parser.add_argument(
+                "--loss-constant-token-denominator",
+                type=int,
+                default=None,
+                help=(
+                    "With --calculate-per-token-loss, divide each optimizer step's summed token loss by "
+                    "(samples in the step x this value) instead of the step's active-token count, as in "
+                    "Dr. GRPO. Usually --rollout-max-response-len. olmo_core backend only."
+                ),
+            )
             reset_arg(parser, "--lr", type=float, default=1e-6)
 
             parser.add_argument(
@@ -3276,6 +3286,13 @@ def miles_validate_args(args):
         raise ValueError(f"Unknown --update-weight-transfer-mode {mode!r}")
     if mode == "broadcast_packed" and (args.train_backend != "megatron" or args.colocate):
         raise ValueError("broadcast_packed requires Megatron non-colocated weight transfer")
+    if args.loss_constant_token_denominator is not None:
+        if not args.calculate_per_token_loss:
+            raise ValueError("--loss-constant-token-denominator requires --calculate-per-token-loss")
+        if args.loss_constant_token_denominator <= 0:
+            raise ValueError("--loss-constant-token-denominator must be positive")
+        if args.train_backend != "olmo_core":
+            raise ValueError("--loss-constant-token-denominator only supports --train-backend olmo_core")
     validate_dashboard_args(args)
 
     args.ft_components = _resolve_ft_components(args)

@@ -17,16 +17,24 @@ class StepNormalization:
     token_denominator: int
     model_tokens: int
     world_size: int
+    constant_token_denominator: int | None = None
 
     @property
     def auxiliary_denominator(self):
         return self.model_tokens / self.world_size
 
+    @property
+    def token_loss_denominator(self):
+        """Active tokens by default; samples x a fixed length for a constant (Dr. GRPO) denominator."""
+        if self.constant_token_denominator is None:
+            return self.token_denominator
+        return self.samples * self.constant_token_denominator
+
     def scale_token_loss(self, loss):
-        return loss * self.world_size / self.token_denominator
+        return loss * self.world_size / self.token_loss_denominator
 
 
-def step_normalization(batches, global_batch_size):
+def step_normalization(batches, global_batch_size, constant_token_denominator=None):
     """Match MILES' clamped per-sample token denominator and Core rank averaging."""
     masks = [mask for batch in batches for mask in batch["loss_masks"]]
     counts = torch.tensor(
@@ -43,7 +51,9 @@ def step_normalization(batches, global_batch_size):
     samples, active, denominator, model_tokens = counts.tolist()
     if samples != global_batch_size or active == 0 or model_tokens < active:
         raise ValueError(f"Invalid optimizer batch counts: {counts.tolist()}, expected {global_batch_size} samples")
-    return StepNormalization(samples, active, denominator, model_tokens, dist.get_world_size())
+    return StepNormalization(
+        samples, active, denominator, model_tokens, dist.get_world_size(), constant_token_denominator
+    )
 
 
 def validate_training_data(rollout):

@@ -23,7 +23,7 @@ import httpx
 
 from miles.backends.core_utils import async_capacity, infra_timeouts
 from miles.backends.core_utils.rollout import pipeline_observer, rollout_errors
-from miles.backends.core_utils.rollout.errors import GenerationInterrupted, PromptPoolExhausted
+from miles.backends.core_utils.rollout.errors import FINITE_POOL_PROVIDERS, GenerationInterrupted, PromptPoolExhausted
 from miles.rollout.fully_async_rollout import FullyAsyncRolloutFn
 from miles.rollout.inference_rollout.inference_rollout_train import get_worker_urls
 from miles.rollout.submission_scheduler import make_submission_scheduler
@@ -61,7 +61,7 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         for warning in capacity["warnings"]:
             logger.warning("Async capacity: %s", warning)
         self._pool_exposure = (
-            getattr(getattr(self.args, "olmo_core", None), "prompt_provider", None) == "pool_exposure"
+            getattr(getattr(self.args, "olmo_core", None), "prompt_provider", None) in FINITE_POOL_PROVIDERS
         )
         self._active_tasks: set[asyncio.Task[Any]] = set()
         self._producer_idle = asyncio.Event()

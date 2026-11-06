@@ -1,5 +1,8 @@
 """Generation lifecycle errors shared by Core rollout workers."""
 
+# Application providers supported by the finite-drain and training-feedback protocol.
+FINITE_POOL_PROVIDERS = ("pools", "pool_exposure")
+
 
 class GenerationInterrupted(RuntimeError):
     """A producer must quiesce before resuming under a new policy."""

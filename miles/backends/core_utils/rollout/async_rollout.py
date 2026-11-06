@@ -23,7 +23,7 @@ import httpx
 
 from miles.backends.core_utils import async_capacity, infra_timeouts
 from miles.backends.core_utils.rollout import pipeline_observer, rollout_errors
-from miles.backends.core_utils.rollout.errors import GenerationInterrupted
+from miles.backends.core_utils.rollout.errors import GenerationInterrupted, PromptPoolExhausted
 from miles.rollout.fully_async_rollout import FullyAsyncRolloutFn
 from miles.rollout.inference_rollout.inference_rollout_train import get_worker_urls
 from miles.rollout.submission_scheduler import make_submission_scheduler
@@ -60,6 +60,9 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         logger.info("Async pipeline capacity: %s", capacity)
         for warning in capacity["warnings"]:
             logger.warning("Async capacity: %s", warning)
+        self._pool_exposure = (
+            getattr(getattr(self.args, "olmo_core", None), "prompt_provider", None) == "pool_exposure"
+        )
         self._active_tasks: set[asyncio.Task[Any]] = set()
         self._producer_idle = asyncio.Event()
         self._producer_idle.set()
@@ -187,7 +190,9 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         try:
             while True:
                 done, _ = await asyncio.wait(
-                    {queue_get, cast(asyncio.Task, self._worker)}, timeout=30, return_when=asyncio.FIRST_COMPLETED
+                    {queue_get, cast(asyncio.Task, self._worker)},
+                    timeout=0.5 if getattr(self, "_pool_exposure", False) else 30,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
                 if self._worker in done:
                     self._worker.result()
@@ -197,7 +202,14 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                     recorded = True
                     self._record_dequeued(entry)
                     return entry
-                logger.warning("No completed async rollout groups for 30 seconds")
+                if (
+                    getattr(self.data_source, "pool_exhausted", lambda: False)()
+                    and not self._active_tasks
+                    and not self._ready_completion_counts
+                ):
+                    raise PromptPoolExhausted("All named prompt pools exhausted")
+                if not getattr(self, "_pool_exposure", False):
+                    logger.warning("No completed async rollout groups for 30 seconds")
         finally:
             if not queue_get.done():
                 queue_get.cancel()
@@ -246,8 +258,7 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         # particular, do not spin on queue-full or no-healthy-worker responses.
         self._retry_after = time.monotonic() + rollout_errors.RETRY_DELAY_SECONDS
         logger.warning(
-            "Async group %s generation failed: category=%s detail=%s; "
-            "pristine prompts requeued for regeneration (isolated_group_retry=%d/%d requeued_groups=%d)",
+            "Async group %s generation failed: category=%s detail=%s; pristine prompts requeued for regeneration (isolated_group_retry=%d/%d requeued_groups=%d)",
             group_index,
             category,
             rollout_errors.failure_description(error),
@@ -390,7 +401,14 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                     while self._scheduler.has_capacity(
                         pending_groups=len(active), group_budget=self._max_in_flight_groups()
                     ):
-                        active.add(self._submit_managed_group())
+                        try:
+                            active.add(self._submit_managed_group())
+                        except StopIteration:
+                            if not getattr(self, "_pool_exposure", False):
+                                raise
+                            # Finite application providers may be empty while outstanding
+                            # completions still update replay eligibility. Keep draining.
+                            break
                     self._active_tasks = active
 
                 if not active:

@@ -235,6 +235,12 @@ def comparable_model_config(value, *, parent=None):
             if item not in ("static", "dynamic"):
                 raise ValueError("Invalid saved routed-expert row_specialization")
             continue
+        if parent == "routed_experts" and key == "fused_no_grad_activation":
+            if type(item) is not bool:
+                raise ValueError("Invalid saved routed-expert fused_no_grad_activation")
+            # Execution strategy, not parameter/optimizer geometry. Older checkpoints
+            # omit it; MILES now selects eager scoring while preserving eager rounding.
+            continue
         if parent == "routed_experts" and key == "match_eager_rounding":
             if type(item) is not bool:
                 raise ValueError("Invalid saved routed-expert match_eager_rounding")

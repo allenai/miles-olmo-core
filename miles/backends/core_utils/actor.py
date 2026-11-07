@@ -206,9 +206,18 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         )
         dist.all_reduce(sums)
         dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
-        return self._agree(
+        report = self._agree(
             lambda: contract.validate_scoring_check(sums, maximum, self.args.olmo_core.scoring_check_tolerance)
         )
+        if report["warning"]:
+            logger.warning(
+                "Standalone scoring differs from the training forward: mean_abs %.6g exceeds warning "
+                "tolerance %.6g but not fatal tolerance %.6g; continuing",
+                report["mean_abs"],
+                report["tolerance"],
+                report["fatal_tolerance"],
+            )
+        return report
 
     def _get_parallel_config(self):
         return self.train_parallel_config

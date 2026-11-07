@@ -6,9 +6,7 @@ import torch
 from miles.backends.core_utils import contract
 
 
-@pytest.mark.parametrize(
-    ("mean", "warning"), [(0.0, False), (0.001, False), (0.00350197, True), (0.01, True)]
-)
+@pytest.mark.parametrize(("mean", "warning"), [(0.0, False), (0.001, False), (0.00350197, True), (0.01, True)])
 def test_scoring_warning_band(mean, warning):
     report = contract.validate_scoring_check(
         torch.tensor([mean, 1, 0], dtype=torch.float64), torch.tensor(mean), tolerance=0.001

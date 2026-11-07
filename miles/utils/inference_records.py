@@ -79,11 +79,7 @@ def task_identity(metadata, prompt):
     final user message and is a grouping hint, never an identity.
     """
     metadata = metadata if isinstance(metadata, dict) else {}
-    verifiers = [
-        {"name": spec.get("name"), "target": spec.get("target")}
-        for spec in metadata.get("verifiers") or []
-        if isinstance(spec, dict)
-    ]
+    verifiers = [{"name": spec.get("name"), "target": spec.get("target")} for spec in metadata.get("verifiers") or [] if isinstance(spec, dict)]
     query = metadata.get("query")
     return {
         "task_key": sha256({"basis": "rendered", "prompt": prompt, "verifiers": verifiers}),
@@ -150,21 +146,14 @@ def policy_scope(versions, fresh_run):
 def response_record(sample, text, fresh_run):
     metadata = sample.metadata or {}
     versions = sorted(
-        (
-            {str(value) for value in policy_versions.versions(sample.weight_versions, allow_empty=True)}
-            if sample.weight_versions
-            else set()
-        ),
+        ({str(value) for value in policy_versions.versions(sample.weight_versions, allow_empty=True)} if sample.weight_versions else set()),
         key=_version_order,
     )
     status = getattr(sample.status, "value", str(sample.status))
     record = {
         "index": sample.index,
         "reward": sample.reward,
-        "reward_components": [
-            {key: item.get(key) for key in ("name", "score", "weight")}
-            for item in metadata.get("reward_components") or []
-        ],
+        "reward_components": [{key: item.get(key) for key in ("name", "score", "weight")} for item in metadata.get("reward_components") or []],
         "validity": validity(metadata),
         "response_tokens": sample.response_length,
         "status": status,
@@ -264,11 +253,11 @@ class Recorder:
                 "recorded_unix": time.time(),
                 **identity,
                 # Exact input and task under one protocol: the pooling unit for evidence.
-                "input_key": sha256(
-                    {"task": identity["task_key"], "tokens": token_sha256, "protocol": self.protocol_sha256}
-                ),
+                "input_key": sha256({"task": identity["task_key"], "tokens": token_sha256, "protocol": self.protocol_sha256}),
                 "prompt_token_sha256": token_sha256,
-                "prepared_sample_id": metadata.get("prepared_sample_id"),
+                # Source-prepared bundles use sample_id; task preparation uses
+                # prepared_sample_id. Preserve the explicit prepared ID when both exist.
+                "prepared_sample_id": metadata.get("prepared_sample_id") or metadata.get("sample_id"),
                 "source_dataset": metadata.get("source_dataset"),
                 "source_row": metadata.get("source_row"),
                 "verifiers": [spec.get("name") for spec in metadata.get("verifiers") or [] if isinstance(spec, dict)],

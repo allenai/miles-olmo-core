@@ -44,8 +44,14 @@ def prepare_model_config(config, hf, options):
             router.lb_loss_count_source = options.router_aux_count_source
         experts = getattr(block, "routed_experts", None)
         if experts is not None:
+            if not hasattr(experts, "fused_no_grad_activation"):
+                raise ValueError("Eager policy scoring requires an updated Core runtime; rebuild from runtime.lock.json")
+            # Scoring retains no gradients but uses the same activation arithmetic
+            # as training. This is a backend correctness choice, not a request knob.
+            experts.fused_no_grad_activation = False
             experts.row_specialization = options.row_specialization
-            # Policy scoring must use the same SiLU rounding as eager training.
+            # Retain the historical numerical setting for checkpoint compatibility;
+            # the eager activation above does not use the fused rounding option.
             experts.match_eager_rounding = True
 
 

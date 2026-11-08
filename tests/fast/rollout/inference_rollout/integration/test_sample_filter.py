@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import Mock
 
 import pytest
@@ -7,10 +8,12 @@ from tests.fast.rollout.inference_rollout.integration.utils import (
     load_and_call_train,
 )
 
+from miles.rollout import submission_scheduler
 from miles.utils.function_registry import function_registry
 
 # Data with only 2 reward=1 samples out of 4.
-# This ensures all 4 samples must be generated to collect 2 valid ones.
+# The test waits for the whole batch so rejected samples reach the callbacks
+# even when both valid samples finish first.
 _FILTER_TEST_DATA_ROWS = [
     {"input": "What is 1+7?", "label": "8"},  # reward=1
     {"input": "What is 1+8?", "label": "wrong"},  # reward=0
@@ -43,10 +46,17 @@ _FILTER_TEST_DATA_ROWS = [
     ],
     indirect=True,
 )
-def test_sample_filter_and_all_samples_process(rollout_env):
+def test_sample_filter_and_all_samples_process(rollout_env, monkeypatch):
     env = rollout_env
     sample_filter_mock = Mock()
     all_samples_process_mock = Mock()
+
+    async def wait_for_batch(self, pendings):
+        return await asyncio.wait(pendings, return_when=asyncio.ALL_COMPLETED)
+
+    # This test covers callback contents, not early rollout termination. Without
+    # a batch barrier, the two valid samples can finish first and abort the rest.
+    monkeypatch.setattr(submission_scheduler.GroupLevelSubmission, "wait_for_progress", wait_for_batch)
 
     with (
         function_registry.temporary("test:filter_by_reward", filter_by_reward),
@@ -64,4 +74,6 @@ def test_sample_filter_and_all_samples_process(rollout_env):
     _, all_samples, data_source = all_samples_process_mock.call_args[0]
     assert data_source is not None
 
-    assert len(all_samples) > len(filtered_data), "all_samples_process should see more samples than sample_filter"
+    assert [group[0].index for group in filtered_data] == [0, 3]
+    assert [group[0].index for group in all_samples] == [0, 1, 2, 3]
+    assert [group[0].reward for group in all_samples] == [1, 0, 0, 1]

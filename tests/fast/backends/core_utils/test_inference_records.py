@@ -264,3 +264,18 @@ def test_missing_checkpoint_disables_recording_without_raising(tmp_path, caplog)
     records.record_group([sample(0, 1.0)], decision="passed")
     assert records.unavailable and records.metrics()["rollout/records/dropped_total"] == 1
     assert "Inference records disabled" in caplog.text
+
+
+@pytest.mark.parametrize("prepared_id", [None, "explicit-prepared"])
+def test_source_bundle_prompt_identity_is_recorded(tmp_path, prepared_id):
+    args = make_args(tmp_path)
+    recorder = create_recorder(args)
+    group = [sample(i, 0.0) for i in range(4)]
+    for item in group:
+        item.metadata.pop("prepared_sample_id")
+        item.metadata["sample_id"] = "source-bundle-id"
+        if prepared_id is not None:
+            item.metadata["prepared_sample_id"] = prepared_id
+    recorder.record_group(group, decision="accepted")
+    drain(recorder)
+    assert rows(recorder.directory)[0]["prepared_sample_id"] == (prepared_id or "source-bundle-id")

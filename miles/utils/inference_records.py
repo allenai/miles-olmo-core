@@ -268,7 +268,9 @@ class Recorder:
                     {"task": identity["task_key"], "tokens": token_sha256, "protocol": self.protocol_sha256}
                 ),
                 "prompt_token_sha256": token_sha256,
-                "prepared_sample_id": metadata.get("prepared_sample_id"),
+                # Source-prepared bundles use sample_id; task preparation uses
+                # prepared_sample_id. Preserve the explicit prepared ID when both exist.
+                "prepared_sample_id": metadata.get("prepared_sample_id") or metadata.get("sample_id"),
                 "source_dataset": metadata.get("source_dataset"),
                 "source_row": metadata.get("source_row"),
                 "verifiers": [spec.get("name") for spec in metadata.get("verifiers") or [] if isinstance(spec, dict)],

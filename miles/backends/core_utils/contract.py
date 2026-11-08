@@ -163,7 +163,9 @@ def validate_scoring_check(sums, maximum, tolerance):
     }
     if mean_abs > tolerance:
         raise ValueError(
-            f"Standalone scoring differs from the training forward: mean_abs {mean_abs:.6g} exceeds {tolerance:.6g}"
+            f"Standalone scoring differs from the training forward: mean_abs {mean_abs:.6g} "
+            f"exceeds tolerance {tolerance:.6g} "
+            f"(max_abs {float(maximum):.6g}; active_tokens {tokens})"
         )
     return report
 

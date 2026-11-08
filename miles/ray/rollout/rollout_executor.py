@@ -145,6 +145,11 @@ class RolloutExecutor:
         )
 
     @rpc(enabled=False)
+    async def core_commit_exposure(self, rollout_id: int):
+        """Application feedback after the learner confirms a completed update."""
+        return self.data_source.commit_training_batch(rollout_id)
+
+    @rpc(enabled=False)
     async def core_prefetch(self, rollout_id: int):
         if getattr(self, "_core_prepared_batch", None) is not None:
             raise RuntimeError("Only one prepared batch may be outstanding")
@@ -234,6 +239,8 @@ class RolloutExecutor:
         log_rollout_data(
             rollout_id, self.args, data, metrics, time.time() - start_time, trainer_model_id=trainer_model_id
         )
+        if (stage := getattr(self.data_source, "stage_training_batch", None)) is not None:
+            stage(rollout_id, data)
         conversion_started = time.perf_counter()
         data = convert_samples_to_train_data(
             self.args,

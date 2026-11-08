@@ -18,7 +18,9 @@ from miles.backends.training_utils.parallel import GroupInfo, ParallelState, set
 @pytest.mark.parametrize("excluded_length", [0, 3])
 def test_masked_reinforce_returns_preserve_active_responses(gamma, kl_coef, excluded_length):
     group = GroupInfo(rank=0, size=1, group=None)
-    set_parallel_state(ParallelState(**{key: group for key in ("intra_dp", "intra_dp_cp", "cp", "tp", "pp", "ep", "etp", "indep_dp")}))
+    set_parallel_state(
+        ParallelState(**{key: group for key in ("intra_dp", "intra_dp_cp", "cp", "tp", "pp", "ep", "etp", "indep_dp")})
+    )
     args = Namespace(advantage_estimator="reinforce_plus_plus", gamma=gamma, kl_coef=kl_coef)
     active_kl = torch.tensor([0.2, 0.4, 0.6])
     active_mask = torch.tensor([1.0, 1.0, 0.0])
@@ -51,7 +53,9 @@ def _cp_worker(rank, world_size, port):
     try:
         group = GroupInfo(rank=rank, size=world_size, group=dist.group.WORLD)
         trivial = GroupInfo(rank=0, size=1, group=None)
-        state = ParallelState(**{key: trivial for key in ("intra_dp", "intra_dp_cp", "cp", "tp", "pp", "ep", "etp", "indep_dp")})
+        state = ParallelState(
+            **{key: trivial for key in ("intra_dp", "intra_dp_cp", "cp", "tp", "pp", "ep", "etp", "indep_dp")}
+        )
         state.cp = group
         set_parallel_state(state)
         args = Namespace(advantage_estimator="reinforce_plus_plus", gamma=1.0, kl_coef=0.0)

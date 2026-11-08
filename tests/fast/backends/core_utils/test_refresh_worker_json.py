@@ -38,11 +38,13 @@ def test_refresh_uses_worker_parsing_and_preserves_replay(monkeypatch, tmp_path,
         ensure_ascii=False,
     ).encode()
     requests = []
+    routing_keys = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             requests.append(payload["rid"])
+            routing_keys.append(self.headers.get("X-SMG-Routing-Key"))
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -67,6 +69,7 @@ def test_refresh_uses_worker_parsing_and_preserves_replay(monkeypatch, tmp_path,
         http_post_num_cpus=1,
         olmo_core=SimpleNamespace(pipeline_observation_interval=2, refresh_request_timeout=30),
         save=str(tmp_path),
+        sglang_router_policy="consistent_hashing",
         sglang_router_ip="127.0.0.1",
         sglang_router_port=server.server_port,
         rollout_max_response_len=length,
@@ -117,6 +120,7 @@ def test_refresh_uses_worker_parsing_and_preserves_replay(monkeypatch, tmp_path,
         assert len(received_arrays) == 4
         assert len(received_records) == 4 and all(len(r) == length for r in received_records)
         assert len(set(requests)) == len(requests) == 4
+        assert routing_keys == ["prompt:0"] * 4
         paths = list(tmp_path.glob("http_post_worker_*.jsonl"))
         assert len(paths) == 2
         assert all(not p.stem.endswith(f"_{os.getpid()}") for p in paths)

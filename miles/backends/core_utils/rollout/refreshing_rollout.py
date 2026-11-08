@@ -10,7 +10,7 @@ import httpx
 
 from miles.backends.core_utils import infra_timeouts
 from miles.backends.core_utils.publication import policy_refresh
-from miles.backends.core_utils.rollout import pipeline_observer, rollout_errors, sibling_timing
+from miles.backends.core_utils.rollout import pipeline_observer, refresh_routing, rollout_errors, sibling_timing
 from miles.backends.core_utils.rollout.async_rollout import ManagedFullyAsyncRolloutFn
 from miles.backends.core_utils.rollout.errors import GenerationRequestTimeout
 from miles.backends.core_utils.rollout.generation_admission import GenerationAdmission
@@ -137,7 +137,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
                     url,
                     payload,
                     max_retries=1,
-                    headers={"x-miles-request-id": payload["rid"]},
+                    headers=refresh_routing.request_headers(input.args, sample, payload["rid"]),
                     decode_routed_experts=payload.get("return_routed_experts", False),
                     compact_token_logprobs=True,
                 ),

@@ -1,4 +1,4 @@
-"""The scoring-reuse audit warns on small drift and stops on a tenfold breach."""
+"""The scoring-reuse audit stops when drift exceeds the configured tolerance."""
 
 import pytest
 import torch
@@ -6,26 +6,34 @@ import torch
 from miles.backends.core_utils import contract
 
 
-@pytest.mark.parametrize(("mean", "warning"), [(0.0, False), (0.001, False), (0.00350197, True), (0.01, True)])
-def test_scoring_warning_band(mean, warning):
+@pytest.mark.parametrize("mean", [0.0, 0.0009, 0.001])
+def test_scoring_at_or_below_tolerance(mean):
     report = contract.validate_scoring_check(
         torch.tensor([mean, 1, 0], dtype=torch.float64), torch.tensor(mean), tolerance=0.001
     )
-    assert report["warning"] is warning
-    assert report["fatal_tolerance"] == 0.01
+    assert report["tolerance"] == 0.001
     assert report["mean_abs"] == mean
 
 
-def test_scoring_fatal_threshold():
-    with pytest.raises(ValueError, match="exceeds fatal tolerance 0.01"):
+@pytest.mark.parametrize("mean", [0.001001, 0.00350197, 0.01, 0.01001])
+def test_scoring_above_tolerance_is_fatal(mean):
+    # Include the original observed discrepancy: it must no longer just warn.
+    with pytest.raises(ValueError, match="exceeds tolerance 0.001"):
         contract.validate_scoring_check(
-            torch.tensor([0.01001, 1, 1], dtype=torch.float64), torch.tensor(0.01001), tolerance=0.001
+            torch.tensor([mean, 1, 1], dtype=torch.float64), torch.tensor(mean), tolerance=0.001
         )
 
 
-def test_custom_warning_threshold_scales_fatal_threshold():
-    report = contract.validate_scoring_check(torch.tensor([0.04, 2, 2]), torch.tensor(0.02), tolerance=0.01)
-    assert report["warning"] and report["fatal_tolerance"] == 0.1
+@pytest.mark.parametrize("tolerance", [0.0001, 0.01])
+def test_custom_tolerance_applies_to_reduced_mean(tolerance):
+    report = contract.validate_scoring_check(
+        torch.tensor([2 * tolerance, 2, 1], dtype=torch.float64), torch.tensor(2 * tolerance), tolerance
+    )
+    assert report["mean_abs"] == tolerance
+    with pytest.raises(ValueError, match="exceeds tolerance"):
+        contract.validate_scoring_check(
+            torch.tensor([2.1 * tolerance, 2, 1], dtype=torch.float64), torch.tensor(2 * tolerance), tolerance
+        )
 
 
 def test_nonfinite_scores_remain_fatal():

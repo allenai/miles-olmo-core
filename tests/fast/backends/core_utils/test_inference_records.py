@@ -17,7 +17,9 @@ class Status(enum.Enum):
     TRUNCATED = "truncated"
 
 
-def sample(index, reward, *, prompt="<system>Be brief.</system><user>What is 6 * 7?</user>", versions=("0",), **kwargs):
+def sample(
+    index, reward, *, prompt="<system>Be brief.</system><user>What is 6 * 7?</user>", versions=("0",), **kwargs
+):
     return SimpleNamespace(
         group_index=11,
         index=index,
@@ -74,7 +76,12 @@ def drain(records):
 
 
 def rows(directory, kind="group"):
-    return [row for path in sorted(directory.glob("records-*.jsonl")) for row in map(json.loads, path.read_text().splitlines()) if row["kind"] == kind]
+    return [
+        row
+        for path in sorted(directory.glob("records-*.jsonl"))
+        for row in map(json.loads, path.read_text().splitlines())
+        if row["kind"] == kind
+    ]
 
 
 def create_recorder(args):
@@ -93,8 +100,12 @@ def create_recorder(args):
 
 def test_task_key_includes_full_context_and_targets():
     first = inference_records.task_identity(sample(0, 1.0).metadata, "<system>Be brief.</system><user>Q</user>")
-    other_system = inference_records.task_identity(sample(0, 1.0).metadata, "<system>Show work.</system><user>Q</user>")
-    other_target = inference_records.task_identity(sample(0, 1.0, target="41").metadata, "<system>Be brief.</system><user>Q</user>")
+    other_system = inference_records.task_identity(
+        sample(0, 1.0).metadata, "<system>Show work.</system><user>Q</user>"
+    )
+    other_target = inference_records.task_identity(
+        sample(0, 1.0, target="41").metadata, "<system>Be brief.</system><user>Q</user>"
+    )
     assert first["task_key"] != other_system["task_key"]
     assert first["task_key"] != other_target["task_key"]
     # The final-message hash is only a grouping hint and deliberately matches.

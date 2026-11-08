@@ -3,9 +3,9 @@
 import asyncio
 
 import pytest
+from tests.fast.backends.core_utils import test_prepared_batch_reservation
 
 from miles.backends.core_utils.rollout.errors import PromptPoolExhausted
-from tests.fast.backends.core_utils import test_prepared_batch_reservation
 
 producer = test_prepared_batch_reservation.producer
 seed = test_prepared_batch_reservation.seed

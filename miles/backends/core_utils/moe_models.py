@@ -45,7 +45,9 @@ def prepare_model_config(config, hf, options):
         experts = getattr(block, "routed_experts", None)
         if experts is not None:
             if not hasattr(experts, "fused_no_grad_activation"):
-                raise ValueError("Eager policy scoring requires an updated Core runtime; rebuild from runtime.lock.json")
+                raise ValueError(
+                    "Eager policy scoring requires an updated Core runtime; rebuild from runtime.lock.json"
+                )
             # Scoring retains no gradients but uses the same activation arithmetic
             # as training. This is a backend correctness choice, not a request knob.
             experts.fused_no_grad_activation = False

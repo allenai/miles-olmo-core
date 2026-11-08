@@ -148,7 +148,7 @@ def scoring_check(standalone, training, masks):
 
 
 def validate_scoring_check(sums, maximum, tolerance):
-    """Warn above tolerance; fail above ten times tolerance on the reduced mean."""
+    """Fail on a globally reduced mean above tolerance; report the reduced statistics."""
     tokens = int(sums[1])
     if not tokens:
         raise ValueError("No active tokens for scoring check")
@@ -160,14 +160,12 @@ def validate_scoring_check(sums, maximum, tolerance):
         "tokens_above_edge": int(sums[2]),
         "edge": SCORING_CHECK_EDGE,
         "tolerance": tolerance,
-        "fatal_tolerance": 10 * tolerance,
-        "warning": mean_abs > tolerance,
     }
-    if mean_abs > report["fatal_tolerance"]:
+    if mean_abs > tolerance:
         raise ValueError(
             f"Standalone scoring differs from the training forward: mean_abs {mean_abs:.6g} "
-            f"exceeds fatal tolerance {report['fatal_tolerance']:.6g} "
-            f"(warning tolerance {tolerance:.6g}; max_abs {float(maximum):.6g}; active_tokens {tokens})"
+            f"exceeds tolerance {tolerance:.6g} "
+            f"(max_abs {float(maximum):.6g}; active_tokens {tokens})"
         )
     return report
 

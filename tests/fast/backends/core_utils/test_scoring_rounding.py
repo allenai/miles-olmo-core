@@ -10,7 +10,10 @@ from miles.backends.core_utils import checkpoint, moe_models
 
 
 def test_scoring_rounding_enabled_for_named_blocks_and_overrides():
-    blocks = [SimpleNamespace(routed_experts=SimpleNamespace(match_eager_rounding=False, fused_no_grad_activation=True)) for _ in range(3)]
+    blocks = [
+        SimpleNamespace(routed_experts=SimpleNamespace(match_eager_rounding=False, fused_no_grad_activation=True))
+        for _ in range(3)
+    ]
     config = SimpleNamespace(block={"kda": blocks[0], "attention": blocks[1]}, block_overrides={7: blocks[2]})
     options = SimpleNamespace(activation_checkpointing=False, row_specialization="dynamic")
     moe_models.prepare_model_config(config, SimpleNamespace(layer_types=[]), options)

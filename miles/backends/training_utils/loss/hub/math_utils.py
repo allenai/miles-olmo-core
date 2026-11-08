@@ -509,6 +509,14 @@ def get_reinforce_plus_plus_returns(
     for i in range(len(rewards)):
         local_kl_chunk = kl[i]
         total_len, response_len = total_lengths[i], response_lengths[i]
+        full_mask = loss_masks[i]
+        # Excluded responses have no terminal trainable token. Preserve their
+        # local shape with zero returns, including CP ranks with empty chunks.
+        # The full response mask is shared across CP ranks, so they all skip
+        # the collective for the same responses.
+        if not full_mask.any():
+            final_returns_chunks.append(torch.zeros_like(local_kl_chunk))
+            continue
 
         if cp_size > 1:
             # Step 1,2:Gather all chunks and token_offsets from all ranks and reconstruct the full response tensor by splitting and placing each part
@@ -518,8 +526,6 @@ def get_reinforce_plus_plus_returns(
 
         # Step 3: Compute returns on full response kl tensor.
         token_level_rewards = -kl_coef * full_kl_response
-        full_mask = loss_masks[i]
-        assert full_mask.sum().item() > 0, f"Sequence at index {i} is fully masked."
         last_idx = full_mask.nonzero(as_tuple=True)[0][-1]
         token_level_rewards[last_idx] += rewards[i]
 

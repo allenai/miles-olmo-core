@@ -67,10 +67,14 @@ def response_received(sample, request_id, meta):
             record[destination] = value
     # queue_time can describe a later retraction in this runtime, so do not use
     # it as the initial queue wait. Preserve it only as a raw engine observation.
-    for key in ("queue_time", "e2e_latency", "num_retractions"):
+    for key in ("queue_time", "e2e_latency", "num_retractions", "cached_tokens", "prompt_tokens", "completion_tokens"):
         value = meta.get(key)
         if type(value) in (float, int) and math.isfinite(value) and value >= 0:
             record["engine_reported_" + key] = value
+    if isinstance(meta.get("weight_versions"), list):
+        record["engine_weight_versions"] = [dict(span) for span in meta["weight_versions"]]
+    if isinstance(meta.get("weight_version"), (str, int)):
+        record["engine_weight_version"] = meta["weight_version"]
 
 
 def finished(sample, outcome):

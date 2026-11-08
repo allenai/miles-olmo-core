@@ -1,0 +1,17 @@
+# Experimental policy-cache integration
+
+Core's retained-state publication keeps requests alive across policy updates. This branch adds an opt-in handshake with a versioned SGLang prefix cache, so new requests can share prefixes without inheriting another policy's cache state. It also fixes refresh transport's omission of routing headers, which otherwise prevents a configured sibling-affinity policy from reaching the router.
+
+The routing fix is independent of the experimental cache protocol. Refresh now uses the shared `compute_routing_headers` helper. For `consistent_hashing`, samples without an explicit routing key receive a key derived from their prompt-group identity; siblings share the key while request IDs remain distinct. Explicit routing keys and the existing manual-routing validation are preserved. Round-robin remains unchanged.
+
+The opt-in serving control is `--sglang-enable-policy-versioned-cache`, supplied by the companion SGLang branch. Enable the radix cache, choose `--sglang-router-policy consistent_hashing` and `--sglang-schedule-policy lpm`, and retain `--pause-generation-mode in_place` for the first comparison. SGLang's built-in in-batch scheduler deprioritizes cold duplicates; this is not a guarantee that their prefills are coalesced.
+
+When enabled, Core reads each engine's cache epoch before publication and verifies exactly one committed increment after finalization and before resume. Unsupported engines, missing state, uncommitted epochs and incorrect increments fail closed. Default cache-off publication makes no extra readback calls. Resolved server-group overrides are checked for weight-updated engines, preserving the existing guard against unversioned cache reuse.
+
+The companion SGLang branch is based on upstream main `2d94e564f4`; this MILES branch is based on main `b290af8`. These source changes have CPU regression coverage, but are not yet an integrated GPU image. MILES' existing SGLang pin contains APIs absent from upstream main (including the DeepSeek V4/V4.1 encoder modules). Use an explicitly qualified runtime port or complete the runtime compatibility work before advancing the production pins. Do not treat installing arbitrary upstream main as a compatible upgrade.
+
+The Open Instruct compiler's native-option snapshot and in-place guard also need updating together with the qualified runtime pins. They intentionally remain unchanged until that runtime is established. Existing training configurations and running experiments are unaffected.
+
+Before training use, require a real weight-update cache correctness test on the supported hybrid model and a cache-off/cache-on eight-sibling throughput comparison. Hold model, routing, prompt sizes, running-request limits and recurrent/KV budgets fixed. See the companion SGLang document `docs/developer_guide/policy_versioned_prefix_cache.md` for the protocol and lifecycle cases.
+
+Validation on this branch: 40 CPU tests passed for publication ordering, failed-update fencing, configuration guards, cache-epoch readback and sibling routing. The refresh HTTP-worker integration test also passed on a local four-CPU, zero-GPU Ray cluster, verifying that routing headers reach the server while request IDs remain distinct. Ruff, Black and `git diff --check` passed. These MILES tests used the existing pinned SGLang API; the companion cache implementation was tested separately on SGLang main. This is not an end-to-end GPU qualification.

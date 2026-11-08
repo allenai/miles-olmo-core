@@ -1,7 +1,9 @@
 """Generation lifecycle errors shared by Core rollout workers."""
 
 # Application providers supported by the finite-drain and training-feedback protocol.
-FINITE_POOL_PROVIDERS = ("pools", "pool_exposure")
+FINITE_POOL_PROVIDERS = ("pools",)
+# Drop handlers notify feedback providers before retiring recovery ownership.
+EXPLICIT_DISCARD_FEEDBACK = True
 
 
 class GenerationInterrupted(RuntimeError):

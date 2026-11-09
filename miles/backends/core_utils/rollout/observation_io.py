@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 from miles.utils import logger_utils
@@ -16,46 +17,80 @@ def _append(rows):
             stream.write(json.dumps(row, allow_nan=False) + "\n")
 
 
-class ObservationWriter:
-    """One submitted write at a time; callers await completion and retain ownership.
+async def _finish_on_cancel(awaitable):
+    """Join owned admission/flush work even under repeated cancellation."""
+    pending = asyncio.create_task(awaitable)
+    try:
+        return await asyncio.shield(pending)
+    except asyncio.CancelledError:
+        while not pending.done():
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not pending.cancelled() and (error := pending.exception()) is not None:
+            logger.error("Observation operation failed during cancellation: %r", error)
+        raise
 
-    Group callers are bounded by the producer's admission budget. Observers
-    submit one sample at a time. Cancellation joins a submitted filesystem write
-    before propagating; it never abandons a thread or races a later append.
-    Rows must be detached snapshots, not live producer/Sample objects.
+
+class ObservationWriter:
+    """FIFO background writes with at most 128 outstanding batches by default.
+
+    append() waits only for queue capacity, never for its own filesystem write.
+    The cap includes the active batch. A single executor thread preserves order;
+    the admission lock keeps full-queue waiters in order. Cancellation retains
+    the caller's row by finishing admission, without waiting for that row's I/O.
+    Rows must be detached snapshots. Stop/join submitters before close().
     """
 
-    def __init__(self):
+    def __init__(self, max_pending=128):
+        if max_pending < 1:
+            raise ValueError("Observation queue capacity must be positive")
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rollout-observations")
         self._lock = asyncio.Lock()
+        self._pending = deque()
+        self._max_pending = max_pending
         self._closed = False
 
-    async def append(self, rows):
-        # Shield the lock wait as well: cancelled groups still leave a record.
-        pending = asyncio.create_task(self._append_serial(rows))
-        try:
-            await asyncio.shield(pending)
-        except asyncio.CancelledError:
-            while not pending.done():
-                try:
-                    await asyncio.shield(pending)
-                except asyncio.CancelledError:
-                    continue
-                except Exception:
-                    break
-            if not pending.cancelled() and (error := pending.exception()) is not None:
-                logger.error("Observation write failed during cancellation: %r", error)
-            raise
+    def _reap(self):
+        while self._pending and self._pending[0].done():
+            future = self._pending.popleft()
+            if (error := future.exception()) is not None:
+                logger.error("Observation write unavailable: %r", error)
 
-    async def _append_serial(self, rows):
+    async def append(self, rows):
+        if rows:
+            await _finish_on_cancel(self._enqueue(tuple(rows)))
+
+    async def _enqueue(self, rows):
         async with self._lock:
+            self._reap()
+            while not self._closed and len(self._pending) >= self._max_pending:
+                try:
+                    await asyncio.wrap_future(self._pending[0])
+                except Exception:
+                    pass  # Report the failed batch once in _reap; retain later rows.
+                self._reap()
             if self._closed:
                 raise RuntimeError("Observation writer is closed")
-            await asyncio.wrap_future(self._pool.submit(_append, rows))
+            self._pending.append(self._pool.submit(_append, rows))
+
+    async def _flush(self):
+        await asyncio.gather(*(asyncio.wrap_future(f) for f in tuple(self._pending)), return_exceptions=True)
+        self._reap()
+
+    async def flush(self):
+        """Drain batches accepted before this call; report failures without raising."""
+        await _finish_on_cancel(self._flush())
 
     async def close(self):
         self._closed = True
-        await asyncio.to_thread(self._pool.shutdown, wait=True)
+        try:
+            await _finish_on_cancel(asyncio.to_thread(self._pool.shutdown, wait=True))
+        finally:
+            self._reap()
 
 
 def for_producer(producer):

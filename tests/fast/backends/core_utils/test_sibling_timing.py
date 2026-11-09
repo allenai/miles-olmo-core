@@ -111,7 +111,7 @@ async def test_artifact_failure_does_not_break_generation(tmp_path, caplog):
         await sibling_timing.write_group(producer, sibling_timing.start_group(samples()), "completed")
     finally:
         await observation_io.close(producer)
-    assert "Sibling timing observation unavailable" in caplog.text
+    assert "Observation write unavailable" in caplog.text
 
 
 def test_consumed_metrics_include_later_complete_observations_and_exclude_partial_groups():

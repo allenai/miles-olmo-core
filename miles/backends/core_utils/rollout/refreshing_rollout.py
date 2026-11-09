@@ -10,7 +10,13 @@ import httpx
 
 from miles.backends.core_utils import infra_timeouts
 from miles.backends.core_utils.publication import policy_refresh
-from miles.backends.core_utils.rollout import pipeline_observer, refresh_routing, rollout_errors, sibling_timing
+from miles.backends.core_utils.rollout import (
+    pipeline_observer,
+    prompt_preparation,
+    refresh_routing,
+    rollout_errors,
+    sibling_timing,
+)
 from miles.backends.core_utils.rollout.async_rollout import ManagedFullyAsyncRolloutFn
 from miles.backends.core_utils.rollout.errors import GenerationRequestTimeout
 from miles.backends.core_utils.rollout.generation_admission import GenerationAdmission
@@ -46,6 +52,16 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         self._refreshing = False
         self._boundary_capacity = None
         self._refresh_started = None
+        # Clone during construction, before generation starts. The worker never
+        # reads the original tokenizer while another path may be using it.
+        self._prompt_preparer = prompt_preparation.PromptPreparer(lambda: copy.deepcopy(self.state.tokenizer))
+        self._prepared_prompt_ids = {}
+
+    async def dispose(self):
+        try:
+            await super().dispose()
+        finally:
+            await self._prompt_preparer.close()
 
     async def begin_refresh(self):
         # Compatibility for older Core drivers. New drivers publish without
@@ -77,11 +93,20 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         records = sibling_timing.start_group(prompt_group) if observed else None
         outcome = "completed"
         try:
+            if all(isinstance(sample.prompt, str) for sample in prompt_group):
+                started = time.monotonic()
+                prepared = await self._prompt_preparer.prepare(sample.prompt for sample in prompt_group)
+                self._prepared_prompt_ids.update((id(sample), prepared[sample.prompt]) for sample in prompt_group)
+                if records is not None:
+                    for record in records:
+                        record["prompt_preparation_seconds"] = time.monotonic() - started
             return await super()._generate_group(prompt_group)
         except BaseException as error:
             outcome = type(error).__name__
             raise
         finally:
+            for sample in prompt_group:
+                self._prepared_prompt_ids.pop(id(sample), None)
             if records is not None:
                 sibling_timing.write_group(self.args, records, outcome)
 
@@ -98,9 +123,12 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
 
     async def _generate_response_impl(self, input):
         sample = input.sample
+        prepared = getattr(self, "_prepared_prompt_ids", {}).get(id(sample))
         payload, halt = compute_request_payload(
             input.args,
-            input_ids=compute_prompt_ids_from_sample(input.state, sample),
+            # Responses own their mutable token lists; the prepared prefix is
+            # immutable. Unrendered/direct generation paths stay unchanged.
+            input_ids=list(prepared) if prepared is not None else compute_prompt_ids_from_sample(input.state, sample),
             sampling_params=input.sampling_params,
         )
         if payload is None:

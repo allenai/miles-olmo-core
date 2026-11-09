@@ -384,6 +384,29 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                     self.data_source.acknowledge_groups([item.prompt_group])
                 self._producing_groups.pop(item.prompt_group[0].group_index, None)
 
+    async def _refill(self, active):
+        """Bound a refill wave and let delivery/publication callbacks run."""
+        for submitted in range(self._max_in_flight_groups()):
+            if (
+                not self._producer_resumed.is_set()
+                or self._stopping
+                or self._interrupted()
+                or time.monotonic() < self._retry_after
+                or not self._scheduler.has_capacity(
+                    pending_groups=len(active), group_budget=self._max_in_flight_groups()
+                )
+            ):
+                break
+            try:
+                active.add(self._submit_managed_group())
+            except StopIteration:
+                if not getattr(self, "_pool_exposure", False):
+                    raise
+                # Finite providers may need completions to update eligibility.
+                break
+            if (submitted + 1) % 4 == 0:
+                await asyncio.sleep(0)
+
     async def _worker_loop(self) -> None:
         """Generate continuously while retaining ownership of every child task."""
         observers = [
@@ -401,17 +424,7 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                 if self._interrupted():
                     raise GenerationInterrupted("rollout engine retired during async production")
                 if self._producer_resumed.is_set() and not self._stopping and time.monotonic() >= self._retry_after:
-                    while self._scheduler.has_capacity(
-                        pending_groups=len(active), group_budget=self._max_in_flight_groups()
-                    ):
-                        try:
-                            active.add(self._submit_managed_group())
-                        except StopIteration:
-                            if not getattr(self, "_pool_exposure", False):
-                                raise
-                            # Finite application providers may be empty while outstanding
-                            # completions still update replay eligibility. Keep draining.
-                            break
+                    await self._refill(active)
                     self._active_tasks = active
 
                 if not active:

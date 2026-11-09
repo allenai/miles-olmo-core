@@ -76,14 +76,22 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         observed = getattr(self.args.olmo_core, "pipeline_observation_interval", 0) > 0
         records = sibling_timing.start_group(prompt_group) if observed else None
         outcome = "completed"
+        failure = None
         try:
             return await super()._generate_group(prompt_group)
         except BaseException as error:
+            failure = error
             outcome = type(error).__name__
             raise
         finally:
             if records is not None:
-                await sibling_timing.write_group(self, records, outcome)
+                try:
+                    await sibling_timing.write_group(self, records, outcome)
+                except asyncio.CancelledError:
+                    # A concurrent shutdown must not replace a serving failure
+                    # with diagnostic-admission cancellation in retry accounting.
+                    if failure is None:
+                        raise
 
     async def _generate_response(self, input):
         sibling_timing.admitted(input.sample)

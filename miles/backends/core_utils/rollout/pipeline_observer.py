@@ -37,12 +37,18 @@ def completion_counts(entries):
 
 
 async def write_lifecycle(producer, event):
-    """Persist exact lifecycle boundaries separately from periodic samples."""
+    """Enqueue lifecycle boundaries separately from periodic samples.
+
+    Version 2 records managed shutdown_start after closing submission admission;
+    older unversioned records captured the state before that transition.
+    """
     if not getattr(producer.args, "save", None):
         return
     try:
         path = Path(producer.args.save) / "pipeline_lifecycle.jsonl"
-        await observation_io.for_producer(producer).append([(path, {"event": event, **snapshot(producer)})])
+        await observation_io.for_producer(producer).append(
+            [(path, {"schema_version": 2, "event": event, **snapshot(producer)})]
+        )
     except Exception:
         logger.exception("Pipeline lifecycle observation unavailable: %s", event)
 

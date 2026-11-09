@@ -7,7 +7,6 @@ Unsupported fields are null, not zero. The observer is owned by the producer tas
 
 import asyncio
 import hashlib
-import json
 import math
 import re
 import time
@@ -15,6 +14,7 @@ from pathlib import Path
 
 import httpx
 
+from miles.backends.core_utils.rollout import observation_io
 from miles.utils import logger_utils
 
 logger = logger_utils.setup_logger(__name__)
@@ -36,15 +36,19 @@ def completion_counts(entries):
     return counts
 
 
-def write_lifecycle(producer, event):
-    """Persist exact lifecycle boundaries separately from periodic samples."""
+async def write_lifecycle(producer, event):
+    """Enqueue lifecycle boundaries separately from periodic samples.
+
+    Version 2 records managed shutdown_start after closing submission admission;
+    older unversioned records captured the state before that transition.
+    """
     if not getattr(producer.args, "save", None):
         return
     try:
         path = Path(producer.args.save) / "pipeline_lifecycle.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as stream:
-            stream.write(json.dumps({"event": event, **snapshot(producer)}) + "\n")
+        await observation_io.for_producer(producer).append(
+            [(path, {"schema_version": 2, "event": event, **snapshot(producer)})]
+        )
     except Exception:
         logger.exception("Pipeline lifecycle observation unavailable: %s", event)
 
@@ -82,7 +86,11 @@ def snapshot(producer):
         "producer_ready": ready_counts,
         "producer_staged_completion_groups": staged_groups,
         "producer_unharvested_completion_groups": unharvested_groups,
-        "shutdown_unqueued": getattr(producer, "_shutdown_unqueued_counts", None),
+        "shutdown_unqueued": (
+            dict(producer._shutdown_unqueued_counts)
+            if getattr(producer, "_shutdown_unqueued_counts", None) is not None
+            else None
+        ),
         "completed_put_wait_seconds": getattr(producer, "_completed_put_wait_seconds", None),
         "completed_put_current_wait_seconds": (
             time.monotonic() - producer._completed_put_started
@@ -116,23 +124,21 @@ async def observe(producer):
         return
     path = Path(producer.args.save) / "pipeline_occupancy.jsonl"
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", buffering=1) as stream:
-            previous_wall, previous_cpu, previous_thread = time.monotonic(), time.process_time(), time.thread_time()
-            expected_wake = previous_wall
-            while True:
-                wall, cpu, thread = time.monotonic(), time.process_time(), time.thread_time()
-                record = snapshot(producer)
-                record.update(
-                    observation_elapsed_seconds=wall - previous_wall,
-                    event_loop_lag_seconds=max(0, wall - expected_wake),
-                    process_cpu_seconds=cpu - previous_cpu,
-                    event_loop_thread_cpu_seconds=thread - previous_thread,
-                )
-                stream.write(json.dumps(record) + "\n")
-                previous_wall, previous_cpu, previous_thread = wall, cpu, thread
-                expected_wake = time.monotonic() + interval
-                await asyncio.sleep(interval)
+        previous_wall, previous_cpu, previous_thread = time.monotonic(), time.process_time(), time.thread_time()
+        expected_wake = previous_wall
+        while True:
+            wall, cpu, thread = time.monotonic(), time.process_time(), time.thread_time()
+            record = snapshot(producer)
+            record.update(
+                observation_elapsed_seconds=wall - previous_wall,
+                event_loop_lag_seconds=max(0, wall - expected_wake),
+                process_cpu_seconds=cpu - previous_cpu,
+                event_loop_thread_cpu_seconds=thread - previous_thread,
+            )
+            await observation_io.for_producer(producer).append([(path, record)])
+            previous_wall, previous_cpu, previous_thread = wall, cpu, thread
+            expected_wake = time.monotonic() + interval
+            await asyncio.sleep(interval)
     except Exception:
         # Diagnostics must not terminate generation or change ownership.
         logger.exception("Pipeline occupancy observation stopped; remaining occupancy data is unavailable")
@@ -171,34 +177,33 @@ async def observe_engines(producer, get_urls):
         return
     path = Path(producer.args.save) / "engine_occupancy.jsonl"
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        writer = observation_io.for_producer(producer)
         async with httpx.AsyncClient(timeout=2.0) as client:
-            with path.open("a", buffering=1) as stream:
-                urls = []
+            urls = []
 
-                async def collect(url):
-                    record = dict(time_unix=time.time(), engine=url)
+            async def collect(url):
+                record = dict(time_unix=time.time(), engine=url)
+                try:
+                    response = await client.get(url + "/metrics")
+                    response.raise_for_status()
+                    record["series"] = engine_metrics(response.text)
+                except Exception as error:
+                    record["error"] = str(error)
+                return record
+
+            while True:
+                if not urls:
                     try:
-                        response = await client.get(url + "/metrics")
-                        response.raise_for_status()
-                        record["series"] = engine_metrics(response.text)
+                        urls = await asyncio.wait_for(get_urls(producer.args), timeout=2.0)
                     except Exception as error:
-                        record["error"] = str(error)
-                    return record
-
-                while True:
-                    if not urls:
-                        try:
-                            urls = await asyncio.wait_for(get_urls(producer.args), timeout=2.0)
-                        except Exception as error:
-                            stream.write(json.dumps(dict(time_unix=time.time(), discovery_error=str(error))) + "\n")
-                    for record in await asyncio.gather(*(collect(url) for url in urls)):
-                        # A large fleet can exceed the result collector's per-file
-                        # limit. Shard by endpoint without losing series labels.
-                        identity = hashlib.sha256(record["engine"].encode()).hexdigest()[:12]
-                        destination = path.with_name(f"engine_occupancy_{identity}.jsonl")
-                        with destination.open("a") as output:
-                            output.write(json.dumps(record) + "\n")
-                    await asyncio.sleep(max(5.0, interval))
+                        await writer.append([(path, dict(time_unix=time.time(), discovery_error=str(error)))])
+                rows = []
+                for record in await asyncio.gather(*(collect(url) for url in urls)):
+                    # Shard by endpoint without losing series labels.
+                    identity = hashlib.sha256(record["engine"].encode()).hexdigest()[:12]
+                    destination = path.with_name(f"engine_occupancy_{identity}.jsonl")
+                    rows.append((destination, record))
+                await writer.append(rows)
+                await asyncio.sleep(max(5.0, interval))
     except Exception:
         logger.exception("Engine occupancy observation stopped; remaining occupancy data is unavailable")

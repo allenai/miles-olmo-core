@@ -27,7 +27,13 @@ from miles.backends.core_utils import (
 )
 from miles.backends.core_utils import scoring as config
 from miles.backends.core_utils import stopping
-from miles.backends.core_utils.publication import engine_delivery, policy_refresh, publication, transport
+from miles.backends.core_utils.publication import (
+    cache_protocol,
+    engine_delivery,
+    policy_refresh,
+    publication,
+    transport,
+)
 from miles.backends.core_utils.publication.state import PolicyClock
 from miles.backends.core_utils.timing import startup_stage
 from miles.backends.training_utils import parallel
@@ -738,7 +744,17 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             self._engine_snapshot = dict(info.snapshot_cell_id_to_hashes)
         publication.trace("connect_complete", rank=dist.get_rank())
         engines = info.rollout_engines
+        verify_cache = cache_protocol.enabled(self.args)
         if dist.get_rank() == 0:
+            if verify_cache:
+                async_utils.wait_futures(
+                    [
+                        async_utils.submit(
+                            cache_protocol.validate_engine(engine, self.clock.completed_steps, committed=False)
+                        )
+                        for engine in engines
+                    ]
+                )
             session.pause_engines(self.args, engines)
             async_utils.wait_futures([async_utils.submit(engine.begin_weight_update()) for engine in engines])
         publication.trace("pause_barrier_start", rank=dist.get_rank())
@@ -795,6 +811,15 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                     for engine in engines
                 ]
             )
+            if verify_cache:
+                async_utils.wait_futures(
+                    [
+                        async_utils.submit(
+                            cache_protocol.validate_engine(engine, self.clock.completed_steps, committed=True)
+                        )
+                        for engine in engines
+                    ]
+                )
             async_utils.wait_futures([async_utils.submit(engine.continue_generation()) for engine in engines])
         dist.barrier()
         repeated_version = self.clock.published_step == self.clock.completed_steps

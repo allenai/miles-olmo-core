@@ -11,14 +11,14 @@ from numbers import Integral
 
 import torch
 
-from miles.backends.core_utils.publication import policy_versions
+from miles.backends.core_utils.publication import cache_protocol, policy_versions
 from miles.backends.sglang_utils import sglang_config
 from miles.utils.rollout_replay import TokenLogprobs
 from miles.utils.types import WeightVersionSpan, WeightVersionsPerCall
 
 
 def validate_pause_mode(args):
-    """Retain active-request state only without reusable cross-request prefixes."""
+    """Require the owned cache backend when retaining shared prefixes."""
     mode = getattr(args, "pause_generation_mode", "retract")
     if mode not in ("retract", "in_place"):
         raise ValueError("Core weight publication supports retract or in_place pause mode")
@@ -31,9 +31,12 @@ def validate_pause_mode(args):
 def validate_engine_cache_settings(args):
     """Check the same resolved override precedence used to launch policy engines."""
     default = getattr(args, "sglang_disable_radix_cache", False)
+    backend = getattr(args, "sglang_radix_cache_backend", None)
     if getattr(args, "sglang_config", None) is None:
-        if default is not True:
-            raise ValueError("Core in_place publication requires --sglang-disable-radix-cache")
+        if default is not True and backend != cache_protocol.BACKEND:
+            raise ValueError(
+                "Core in_place publication requires --sglang-disable-radix-cache or --sglang-radix-cache-backend=olmo_policy_versioned_v1"
+            )
         return
     # Resolve rather than reading raw YAML: model_path determines the default
     # update_weights flag, and eval/group settings can override the CLI. Frozen
@@ -45,9 +48,12 @@ def validate_engine_cache_settings(args):
         for index, group in enumerate(model.server_groups):
             if group.worker_type == "placeholder":
                 continue
-            if group.overrides.get("disable_radix_cache", default) is not True:
+            if (
+                group.overrides.get("disable_radix_cache", default) is not True
+                and group.overrides.get("radix_cache_backend", backend) != cache_protocol.BACKEND
+            ):
                 raise ValueError(
-                    "Core in_place publication requires effective disable_radix_cache=true "
+                    "Core in_place publication requires effective disable_radix_cache=true or radix_cache_backend=olmo_policy_versioned_v1 "
                     f"for weight-updated model {model.name!r}, server group {index} ({group.worker_type}); "
                     "sglang_config overrides take precedence over --sglang-disable-radix-cache"
                 )

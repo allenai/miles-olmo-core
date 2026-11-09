@@ -4,17 +4,19 @@ Core honors `pause_generation_mode=in_place` using the shared engine-pause helpe
 The default remains `retract`. In-place pauses active requests, transfers and
 finalizes weights, publishes the new version, and resumes without flushing their
 attention KV or hybrid recurrent state. It requires non-colocated serving and
-`sglang_disable_radix_cache=true`, so new requests cannot reuse old-weight prefixes.
+`sglang_disable_radix_cache=true` by default, so new requests cannot reuse old-weight prefixes.
+An opt-in alternative is our plugin backend described in
+[Policy-scoped prefix caching](core-policy-cache.md).
 For `--sglang-config`, validation resolves model and server-group settings using
 the launch precedence, including eval overrides, and checks every non-placeholder
-group whose model receives weight updates. A group cannot re-enable caching over
+group whose model receives weight updates. A group cannot re-enable ordinary unversioned caching over
 a safe CLI default. Frozen reference/judge models may still cache prefixes.
 The retract path flushes immediately after pausing, before transfer, matching the
 shared helper. Engine-drain publication is a separate path and is unchanged.
 Core rejects `abort` mode rather than silently treating it as `retract`; this
 affects synchronous configs because fully async runs already rejected `abort`.
 Runtime validation runs once at actor initialization. The companion Open Instruct
-launcher also rejects colocated layouts and cache-enabled profiles during config
+launcher also rejects colocated layouts and unqualified cache-enabled profiles during config
 compilation, before submitting a job.
 
 Retained state is intentionally computed partly under older weights. Original

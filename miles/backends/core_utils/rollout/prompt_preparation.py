@@ -13,15 +13,14 @@ class PromptPreparer:
     """
 
     def __init__(self, tokenizer_factory):
-        self._factory = tokenizer_factory
-        self._tokenizer = None
+        # Construct the private copy on the owner thread, before generation can
+        # use the original tokenizer. Only encoding touches it in the worker.
+        self._tokenizer = tokenizer_factory()
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rollout-tokenizer")
         self._lock = asyncio.Lock()
         self._closed = False
 
     def _encode(self, prompts):
-        if self._tokenizer is None:
-            self._tokenizer = self._factory()
         return {prompt: tuple(self._tokenizer.encode(prompt, add_special_tokens=False)) for prompt in prompts}
 
     async def prepare(self, prompts):

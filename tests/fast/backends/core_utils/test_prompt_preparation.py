@@ -1,6 +1,7 @@
 """Prompt preparation preserves tokens and cannot monopolize the producer loop."""
 
 import asyncio
+import json
 import threading
 from types import SimpleNamespace
 
@@ -24,7 +25,7 @@ def test_encoding_is_deduplicated_off_loop_and_scoped_to_one_call():
             return list(text.encode())
 
     def factory():
-        assert threading.get_ident() != loop_thread
+        assert threading.get_ident() == loop_thread
         return Tokenizer()
 
     async def scenario():
@@ -100,7 +101,7 @@ def test_encoding_error_propagates_and_releases_capacity():
 
 
 @pytest.mark.parametrize("paused", [False, True])
-def test_refresh_requests_share_encoding_but_not_mutable_tokens(monkeypatch, paused):
+def test_refresh_requests_share_encoding_but_not_mutable_tokens(monkeypatch, paused, tmp_path):
     calls, payloads = [], []
 
     class Tokenizer:
@@ -109,7 +110,8 @@ def test_refresh_requests_share_encoding_but_not_mutable_tokens(monkeypatch, pau
             return list(text.encode())
 
     args = SimpleNamespace(
-        olmo_core=SimpleNamespace(pipeline_observation_interval=0, refresh_request_timeout=10),
+        olmo_core=SimpleNamespace(pipeline_observation_interval=1, refresh_request_timeout=10),
+        save=str(tmp_path),
         sglang_router_ip="localhost",
         sglang_router_port=1234,
         sglang_router_policy="round_robin",
@@ -149,6 +151,7 @@ def test_refresh_requests_share_encoding_but_not_mutable_tokens(monkeypatch, pau
     async def scenario():
         fn = refreshing_rollout.RefreshingRolloutFn.__new__(refreshing_rollout.RefreshingRolloutFn)
         fn.args = args
+        fn._worker = None
         completed = []
         fn._scheduler = SimpleNamespace(sample_done_callback=lambda: completed.append(1))
         fn.state = SimpleNamespace(
@@ -181,6 +184,14 @@ def test_refresh_requests_share_encoding_but_not_mutable_tokens(monkeypatch, pau
             assert len(completed) == 8
             assert fn.state.generate_fn_semaphore.active == 0
             assert fn._prepared_prompt_ids == {}
+            await fn.dispose()
+            rows = [
+                json.loads(line)
+                for path in tmp_path.glob("sibling_timing_*.jsonl")
+                for line in path.read_text().splitlines()
+            ]
+            assert len(rows) == 1
+            assert all(r["prompt_preparation_seconds"] >= 0 for r in rows[0]["samples"])
         finally:
             await fn._prompt_preparer.close()
 

@@ -18,7 +18,9 @@ from miles.utils.processing_utils import load_tokenizer
 
 
 async def measure(tokenizer, prompts, siblings, prepared):
-    worker = prompt_preparation.PromptPreparer(lambda: copy.deepcopy(tokenizer))
+    started = time.perf_counter()
+    worker = prompt_preparation.PromptPreparer(lambda: copy.deepcopy(tokenizer)) if prepared else None
+    startup_seconds = time.perf_counter() - started
     heartbeat = []
     finished = asyncio.Event()
 
@@ -48,10 +50,12 @@ async def measure(tokenizer, prompts, siblings, prepared):
     finally:
         finished.set()
         await observer
-        await worker.close()
+        if worker is not None:
+            await worker.close()
     digest = hashlib.sha256(json.dumps(groups, separators=(",", ":")).encode()).hexdigest()
     return dict(
         mode="prepared" if prepared else "repeated",
+        tokenizer_startup_seconds=startup_seconds,
         wall_seconds=elapsed,
         event_loop_cpu_seconds=loop_cpu,
         max_heartbeat_gap_seconds=max(heartbeat),

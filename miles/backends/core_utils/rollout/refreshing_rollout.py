@@ -52,8 +52,8 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         self._refreshing = False
         self._boundary_capacity = None
         self._refresh_started = None
-        # Clone in the worker, preserving runtime tokenizer configuration while
-        # avoiding concurrent access to the tokenizer used by other paths.
+        # Clone during construction, before generation starts. The worker never
+        # reads the original tokenizer while another path may be using it.
         self._prompt_preparer = prompt_preparation.PromptPreparer(lambda: copy.deepcopy(self.state.tokenizer))
         self._prepared_prompt_ids = {}
 

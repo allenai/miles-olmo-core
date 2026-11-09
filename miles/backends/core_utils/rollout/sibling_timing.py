@@ -5,13 +5,14 @@ clocks supplied by SGLang; cross-engine skews assume synchronized host clocks.
 Missing measurements remain absent rather than being treated as zero.
 """
 
-import json
+import copy
 import math
 import statistics
 import time
 import uuid
 from pathlib import Path
 
+from miles.backends.core_utils.rollout import observation_io
 from miles.utils import logger_utils
 
 logger = logger_utils.setup_logger(__name__)
@@ -122,9 +123,9 @@ def summarize(records):
     return result
 
 
-def write_group(args, records, outcome):
+async def write_group(producer, records, outcome):
     """Include failed/cancelled and later-discarded groups, independently of W&B consumption."""
-    if not records or not getattr(args, "save", None):
+    if not records or not getattr(producer.args, "save", None):
         return
     try:
         row = dict(
@@ -134,14 +135,12 @@ def write_group(args, records, outcome):
             outcome=outcome,
             group_finished_unix=time.time(),
             group_finished_monotonic=time.monotonic(),
-            samples=records,
+            samples=copy.deepcopy(records),
             summary=summarize(records),
         )
         # Shard the qualification artifacts to reduce per-file result size.
-        path = Path(args.save) / f"sibling_timing_{records[0]['group_attempt'][0]}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as stream:
-            stream.write(json.dumps(row, allow_nan=False) + "\n")
+        path = Path(producer.args.save) / f"sibling_timing_{records[0]['group_attempt'][0]}.jsonl"
+        await observation_io.for_producer(producer).append([(path, row)])
     except Exception:
         logger.exception("Sibling timing observation unavailable")
 

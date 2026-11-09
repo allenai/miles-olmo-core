@@ -285,7 +285,7 @@ class DrainingRolloutFn(ManagedFullyAsyncRolloutFn):
             return await super().shutdown()
         if self._shutdown_complete:
             return
-        pipeline_observer.write_lifecycle(self, "shutdown_start")
+        await pipeline_observer.write_lifecycle(self, "shutdown_start")
         await self.prepare_publication()
         await self.controller.close()
         self._stopping = True
@@ -293,4 +293,4 @@ class DrainingRolloutFn(ManagedFullyAsyncRolloutFn):
             self._worker.cancel()
             await asyncio.gather(self._worker, return_exceptions=True)
         self._shutdown_complete = True
-        pipeline_observer.write_lifecycle(self, "shutdown_complete")
+        await pipeline_observer.write_lifecycle(self, "shutdown_complete")

@@ -83,7 +83,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             raise
         finally:
             if records is not None:
-                sibling_timing.write_group(self.args, records, outcome)
+                await sibling_timing.write_group(self, records, outcome)
 
     async def _generate_response(self, input):
         sibling_timing.admitted(input.sample)
@@ -201,7 +201,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
                 self.args.olmo_core.engine_drain_timeout,
                 operation="refresh generation drain",
             )
-        pipeline_observer.write_lifecycle(self, "generation_paused")
+        await pipeline_observer.write_lifecycle(self, "generation_paused")
         return []
 
     async def _wait_for_generation_idle(self):
@@ -237,7 +237,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         self._publication_paused = False
         self._generation_admission.resume()
         self._resume_if_buffer_allows()
-        pipeline_observer.write_lifecycle(self, "generation_resumed")
+        await pipeline_observer.write_lifecycle(self, "generation_resumed")
 
     def _resume_if_buffer_allows(self):
         if self._publication_paused or self._refreshing or self._stopping:
@@ -282,9 +282,9 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
     async def shutdown(self, *, abort=False):
         if self._shutdown_complete:
             return
-        pipeline_observer.write_lifecycle(self, "shutdown_start")
         quiesced = False
         try:
+            await pipeline_observer.write_lifecycle(self, "shutdown_start")
             if not abort:
                 await self.prepare_publication()
                 quiesced = True
@@ -301,4 +301,4 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
                 await asyncio.gather(self._worker, return_exceptions=True)
             self._shutdown_complete = True
             outcome = "shutdown_aborted" if abort else "shutdown_complete" if quiesced else "shutdown_incomplete"
-            pipeline_observer.write_lifecycle(self, outcome)
+            await pipeline_observer.write_lifecycle(self, outcome)

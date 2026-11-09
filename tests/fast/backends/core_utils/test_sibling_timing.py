@@ -3,7 +3,9 @@
 import json
 from types import SimpleNamespace
 
-from miles.backends.core_utils.rollout import sibling_timing
+import pytest
+
+from miles.backends.core_utils.rollout import observation_io, sibling_timing
 
 
 def samples(count=4):
@@ -64,7 +66,8 @@ def test_attempts_are_fresh_and_payload_provenance_is_preserved():
     assert values[0].metadata["existing"] == 1
 
 
-def test_only_numeric_engine_observations_are_retained_and_partial_groups_are_written(tmp_path):
+@pytest.mark.asyncio
+async def test_only_numeric_engine_observations_are_retained_and_partial_groups_are_written(tmp_path):
     values = samples(2)
     records = sibling_timing.start_group(values)
     sibling_timing.admitted(values[0])
@@ -85,7 +88,11 @@ def test_only_numeric_engine_observations_are_retained_and_partial_groups_are_wr
     )
     values[0].response_length = 5
     sibling_timing.finished(values[0], "completed")
-    sibling_timing.write_group(SimpleNamespace(save=str(tmp_path)), records, "ReadError")
+    producer = SimpleNamespace(args=SimpleNamespace(save=str(tmp_path)))
+    try:
+        await sibling_timing.write_group(producer, records, "ReadError")
+    finally:
+        await observation_io.close(producer)
     row = json.loads(next(tmp_path.glob("sibling_timing_*.jsonl")).read_text())
     assert row["outcome"] == "ReadError" and len(row["samples"]) == 2
     assert row["samples"][0]["request_id"] == "rid"
@@ -95,10 +102,15 @@ def test_only_numeric_engine_observations_are_retained_and_partial_groups_are_wr
     assert "private" not in json.dumps(row) and "output_token_logprobs" not in json.dumps(row)
 
 
-def test_artifact_failure_does_not_break_generation(tmp_path, caplog):
+@pytest.mark.asyncio
+async def test_artifact_failure_does_not_break_generation(tmp_path, caplog):
     bad = tmp_path / "file"
     bad.write_text("not a directory")
-    sibling_timing.write_group(SimpleNamespace(save=str(bad)), sibling_timing.start_group(samples()), "completed")
+    producer = SimpleNamespace(args=SimpleNamespace(save=str(bad)))
+    try:
+        await sibling_timing.write_group(producer, sibling_timing.start_group(samples()), "completed")
+    finally:
+        await observation_io.close(producer)
     assert "Sibling timing observation unavailable" in caplog.text
 
 

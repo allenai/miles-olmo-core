@@ -22,7 +22,7 @@ from typing import Any, cast
 import httpx
 
 from miles.backends.core_utils import async_capacity, infra_timeouts
-from miles.backends.core_utils.rollout import pipeline_observer, rollout_errors
+from miles.backends.core_utils.rollout import observation_io, pipeline_observer, rollout_errors
 from miles.backends.core_utils.rollout.errors import FINITE_POOL_PROVIDERS, GenerationInterrupted, PromptPoolExhausted
 from miles.rollout.fully_async_rollout import FullyAsyncRolloutFn
 from miles.rollout.inference_rollout.inference_rollout_train import get_worker_urls
@@ -90,6 +90,12 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
             # after draining a training batch. Feedback providers need that distinction.
             discard = getattr(self.data_source, "discard_groups", self.data_source.acknowledge_groups)
             self._handle_unused = lambda group: discard([group])
+
+    async def dispose(self):
+        try:
+            await super().dispose()
+        finally:
+            await observation_io.close(self)
 
     def _interrupted(self) -> bool:
         return bool(
@@ -536,11 +542,11 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
             logger.info("Fully-async producer shutdown skipped: worker was never started")
             return
 
-        pipeline_observer.write_lifecycle(self, "shutdown_start")
         logger.info("Stopping fully-async producer: active_groups=%d", len(self._active_tasks))
         self._stopping = True
         self._stop_requested.set()
         self._producer_resumed.clear()
+        await pipeline_observer.write_lifecycle(self, "shutdown_start")
         await self._wait_until_idle()
         if not self._worker.done():
             self._worker.cancel()
@@ -549,7 +555,7 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         else:
             self._worker.result()
         self._shutdown_complete = True
-        pipeline_observer.write_lifecycle(self, "shutdown_complete")
+        await pipeline_observer.write_lifecycle(self, "shutdown_complete")
         logger.info("Fully-async producer shutdown complete: active_groups=0")
 
     async def _call_eval(self, input: Any) -> Any:

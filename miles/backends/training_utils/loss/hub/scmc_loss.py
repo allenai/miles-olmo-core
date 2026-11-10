@@ -1,4 +1,4 @@
-"""SCMC loss and its uncentered importance-weighted baseline."""
+"""MILES score-centering loss with IID Monte Carlo probes."""
 
 import torch
 
@@ -62,8 +62,3 @@ def _loss(args, batch, logits, reduce, *, centered):
 
 def scmc_loss_function(args, batch, logits, sum_of_sample_mean):
     return _loss(args, batch, logits, sum_of_sample_mean, centered=True)
-
-
-def uncentered_importance_loss_function(args, batch, logits, sum_of_sample_mean):
-    """Matched MIS/IcePop baseline, with no candidate transfer or candidate scoring."""
-    return _loss(args, batch, logits, sum_of_sample_mean, centered=False)

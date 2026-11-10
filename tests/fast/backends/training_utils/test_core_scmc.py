@@ -1,4 +1,4 @@
-"""MC score centering: exact IcePop gradients and the real training dispatcher."""
+"""MC score centering: native REINFORCE gradients and the real training dispatcher."""
 
 import numpy as np
 import pytest
@@ -11,7 +11,8 @@ from miles.backends.training_utils.loss.hub.score_centering.monte_carlo import m
 
 
 @pytest.mark.parametrize("width", [32, 64, 128])
-def test_exact_icepop_gradient_with_repeated_probes_and_rejected_actions(width):
+@pytest.mark.parametrize("mode", ["none", "tis", "mis"])
+def test_native_score_gradient_with_repeated_probes(width, mode):
     gen = torch.Generator().manual_seed(17)
     z = torch.randn(4, 11, generator=gen, dtype=torch.float64, requires_grad=True)
     q = torch.randn(4, 11, generator=gen, dtype=torch.float64).log_softmax(-1)
@@ -30,17 +31,23 @@ def test_exact_icepop_gradient_with_repeated_probes_and_rejected_actions(width):
         probe_logp=probe_p,
         probe_logq=probe_q,
         probe_valid=torch.ones_like(ids, dtype=torch.bool),
+        mode=mode,
         mis_low=0.5,
         mis_high=2.0,
     )
-    delta = lp - lq
-    keep = active & (delta.detach() >= np.log(0.5)) & (delta.detach() <= np.log(2.0))
-    base = -adv * torch.where(keep, delta, 0.0).exp() * keep
     with torch.no_grad():
-        d = probe_p - probe_q
-        weights = d.masked_fill((d < np.log(0.5)) | (d > np.log(2.0)), -torch.inf).exp()
-    correction = (weights * probe_p).mean(-1)
-    expected = base + active * adv * (correction - correction.detach())
+
+        def weights(delta):
+            if mode == "none":
+                return torch.ones_like(delta)
+            if mode == "tis":
+                return delta.clamp(max=np.log(2.0)).exp()
+            return delta.masked_fill((delta < np.log(0.5)) | (delta > np.log(2.0)), -torch.inf).exp()
+
+        sampled_weight = weights(lp - lq)
+        probe_weight = weights(probe_p - probe_q)
+    correction = (probe_weight * probe_p).mean(-1)
+    expected = active * adv * (-sampled_weight * lp + correction)
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(
         torch.autograd.grad(actual.sum(), z, retain_graph=True)[0], torch.autograd.grad(expected.sum(), z)[0]

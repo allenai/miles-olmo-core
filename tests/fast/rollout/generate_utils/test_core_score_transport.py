@@ -28,6 +28,7 @@ from miles.utils.types import Sample
 
 def args_for(mode="topk", transport="array", k=32, **extra):
     return _args(
+        use_miles_router=extra.pop("use_miles_router", True),
         rollout_score_mode=mode,
         rollout_score_transport=transport,
         rollout_top_logprobs_num=k,
@@ -186,3 +187,10 @@ def test_sct_still_rejects_duplicate_ids():
     append_rollout_topk_logprobs(sample, output["meta_info"], 32, transport="array")
     with pytest.raises(ValueError, match="Duplicate"):
         validate_rollout_topk_logprobs_sample(sample, 32)
+
+
+@pytest.mark.parametrize("transport", ["flat", "array"])
+def test_packed_scores_reject_schema_filtering_router(transport):
+    args = args_for(transport=transport, use_miles_router=False)
+    with pytest.raises(ValueError, match="use-miles-router"):
+        validate_rollout_topk_logprobs_args(args)

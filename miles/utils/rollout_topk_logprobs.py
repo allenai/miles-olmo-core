@@ -29,6 +29,8 @@ def validate_rollout_topk_logprobs_args(args: Any) -> None:
     if mode == "mc" and (k not in (32, 64, 128) or transport != "array"):
         raise ValueError("SCMC requires 32, 64 or 128 candidates and --rollout-score-transport array")
     if transport != "nested":
+        if not getattr(args, "use_miles_router", False):
+            raise ValueError("Packed scores require --use-miles-router; the pinned SGLang router drops score fields")
         if args.rollout_sampling_logprobs_mode != "selected":
             raise ValueError("Packed score transport requires unfiltered sampling (top_k=-1, top_p=1)")
         for option in ("use_session_server", "sglang_speculative_algorithm"):

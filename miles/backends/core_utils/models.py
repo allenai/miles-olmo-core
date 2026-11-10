@@ -58,7 +58,7 @@ class MetricSink:
         self.metrics[key] = float(value.detach().item() if isinstance(value, torch.Tensor) else value)
 
 
-def build_train_module(args, source=None):
+def build_train_module(args, source=None, *, reference=False):
     source = source or args.hf_checkpoint
     # AutoConfig cannot identify the custom MoE family until it is registered.
     # Read the descriptor first so ordinary Olmo 3 never loads the MoE backend.
@@ -85,6 +85,10 @@ def build_train_module(args, source=None):
         device=torch.device("cuda", torch.cuda.current_device()),
         max_grad_norm=args.clip_grad,
     )
+    # MoE optimizer state and DDP gradient buffers are allocated eagerly.
+    # Dense Core has no eval_only constructor; preserve its existing reference path.
+    if reference and kind == "moe":
+        common["eval_only"] = True
     optim = dict(
         lr=args.lr, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps, weight_decay=args.weight_decay
     )
@@ -96,6 +100,8 @@ def build_train_module(args, source=None):
         module = backend.build_train_module(
             args, common=common, optim=optim, hf_config=hf, hf_state=hf_model.state_dict()
         )
+    if reference:
+        module.model.requires_grad_(False)
     router_objective.install(module.model, args.olmo_core)
     module._trainer = MetricSink()
     module._miles_model_backend = kind

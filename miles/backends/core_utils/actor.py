@@ -414,6 +414,9 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             self._agree(lambda: contract.validate_schedule(self.clock, self.lr_scheduler))
             allocator_before = torch.cuda.memory_stats()
             torch.cuda.reset_peak_memory_stats()
+            synchronize_timing = getattr(self.args.olmo_core, "synchronize_step_timing", False)
+            if synchronize_timing:
+                torch.cuda.synchronize()
             started = time.perf_counter()
             contract.auxiliary_metrics(self.model, reset=True)
             self.train_module.zero_grads()
@@ -504,6 +507,8 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                 metrics = self.train_module.train_batch_with_loss(
                     step_batches + stopping_batches, objective, self._replay_context
                 )
+            if synchronize_timing:
+                torch.cuda.synchronize()
             trained_at = time.perf_counter()
             layer_report = layer_profile.collect_across_ranks(layers)
             measured_at = time.perf_counter()
@@ -541,6 +546,8 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             router_metrics = router_load.collect(local_router_load, self.args.olmo_core.expert_parallel_size)
             optimizer_started = time.perf_counter()
             self.train_module.optim_step()
+            if synchronize_timing:
+                torch.cuda.synchronize()
             optimized_at = time.perf_counter()
             try:
                 contract.validate_step_transition(self.clock, self.optimizer, step_batches[0]["tokens"].device)

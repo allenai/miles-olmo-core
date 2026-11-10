@@ -480,6 +480,7 @@ def run_forward_backward_pass(
                 "rollout_topk_token_ids",
                 "rollout_topk_lengths",
                 "rollout_topk_log_probs",
+                "rollout_score_mode",
                 "max_seq_lens",
                 "witness_ids",
                 "opd_reverse_kl",

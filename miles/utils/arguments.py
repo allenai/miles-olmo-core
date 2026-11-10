@@ -701,6 +701,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollout-score-mode",
+                choices=["topk", "mc"],
+                default="topk",
+                help="Candidate extraction: topk (SCT) or independent draws with replacement (SCMC). Does not set sampling top-k.",
+            )
+            parser.add_argument(
+                "--rollout-score-transport",
+                choices=["nested", "flat", "array"],
+                default="nested",
+                help="Candidate transport: nested JSON, flat/base64, or array-preserving base64 (patched Python SGLang).",
+            )
+            parser.add_argument(
                 "--rollout-max-context-len",
                 type=int,
                 default=None,

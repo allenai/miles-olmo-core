@@ -18,8 +18,22 @@ def validate_rollout_topk_logprobs_args(args: Any) -> None:
     k = args.rollout_top_logprobs_num
     if k < 0:
         raise ValueError(f"--rollout-top-logprobs-num must be non-negative, got {k}")
+    mode = getattr(args, "rollout_score_mode", "topk")
+    transport = getattr(args, "rollout_score_transport", "nested")
+    if mode not in ("topk", "mc") or transport not in ("nested", "flat", "array"):
+        raise ValueError("Unknown rollout score mode or transport")
     if not k:
+        if mode != "topk" or transport != "nested":
+            raise ValueError("Rollout score mode/transport requires --rollout-top-logprobs-num > 0")
         return
+    if mode == "mc" and (k not in (32, 64, 128) or transport != "array"):
+        raise ValueError("SCMC requires 32, 64 or 128 candidates and --rollout-score-transport array")
+    if transport != "nested":
+        if args.rollout_sampling_logprobs_mode != "selected":
+            raise ValueError("Packed score transport requires unfiltered sampling (top_k=-1, top_p=1)")
+        for option in ("use_session_server", "sglang_speculative_algorithm"):
+            if getattr(args, option, None):
+                raise ValueError(f"Packed score transport does not support --{option.replace('_', '-')}")
     if args.rollout_sampling_logprobs_mode == "support" and k < args.rollout_top_k:
         raise ValueError(
             "Filtered rollout sampling requires --rollout-top-logprobs-num >= --rollout-top-k "

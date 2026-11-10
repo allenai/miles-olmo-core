@@ -121,6 +121,8 @@ def convert_samples_to_train_data(
 
     if k := args.rollout_top_logprobs_num:
         for sample in samples:
+            if sample.rollout_score_mode != getattr(args, "rollout_score_mode", "topk"):
+                raise ValueError("Rollout candidate mode differs from the configured estimator")
             for field in ("rollout_topk_token_ids", "rollout_topk_log_probs", "rollout_log_probs"):
                 if getattr(sample, field) is None:
                     raise ValueError(
@@ -130,6 +132,7 @@ def convert_samples_to_train_data(
         if args.ci_test:
             for sample in samples:
                 validate_rollout_topk_logprobs_sample(sample, k)
+        train_data["rollout_score_mode"] = [sample.rollout_score_mode for sample in samples]
         train_data["rollout_topk_token_ids"] = [sample.rollout_topk_token_ids for sample in samples]
         train_data["rollout_topk_log_probs"] = [sample.rollout_topk_log_probs for sample in samples]
 
@@ -437,6 +440,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "rollout_topk_token_ids",
             "rollout_topk_lengths",
             "rollout_topk_log_probs",
+            "rollout_score_mode",
             "rollout_sampling_mask_ids",
             "rollout_sampling_mask_offsets",
             "rollout_routed_experts",

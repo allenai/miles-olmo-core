@@ -90,9 +90,9 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         self.optimizer = self.train_module.optim
         self.lr_scheduler = scheduler.CoreLRScheduler(args, self.optimizer)
         self.clock = PolicyClock()
-        self.ref_module = models.build_train_module(args, source=args.ref_load)[0] if with_ref else None
-        if self.ref_module is not None:
-            self.ref_module.model.requires_grad_(False)
+        self.ref_module = (
+            models.build_train_module(args, source=args.ref_load, reference=True)[0] if with_ref else None
+        )
         with startup_stage(args, "native_restore", device=torch.cuda):
             checkpoint.restore(self)
         self.train_module._trainer.global_step = self.clock.completed_steps

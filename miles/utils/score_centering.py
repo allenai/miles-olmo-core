@@ -10,6 +10,9 @@ from miles.utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_sam
 def validate_score_centering_args(args: Namespace) -> None:
     if getattr(args, "loss_type", None) != "score_centering":
         return
+    # Score centering's probability correction needs unrounded rollout logits.
+    # As in upstream #4031, this requirement wins over the base server default.
+    args.sglang_enable_fp32_lm_head = True
     if args.rollout_top_logprobs_num <= 0:
         raise ValueError("Score centering requires a positive --rollout-top-logprobs-num")
     if not math.isfinite(args.score_centering_tis_clip) or args.score_centering_tis_clip <= 0:

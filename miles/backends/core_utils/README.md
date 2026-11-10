@@ -54,3 +54,20 @@ The move intentionally preserves existing large training methods and lifecycle
 state. It changes imports, module paths, application callback boundaries, HF
 loader calls to MILES helpers, and model-validation exceptions to `ValueError`;
 it does not redesign training or publication algorithms.
+
+## Score centering
+
+The Core actor dispatches `loss_type=score_centering` through the shared native
+loss. Record generation-time candidates with `rollout_top_logprobs_num > 0`, use
+`advantage_estimator=grpo`, and select `score_centering_is=tis` for truncated
+importance weighting instead of `use_tis`. Native validation enables the FP32
+serving head, following upstream [#4031](https://github.com/radixark/miles/pull/4031).
+
+Complete sampling-support replay explicitly uses an empty-tail ratio of one,
+including when FP32 mass sums round below one (upstream
+[#4204](https://github.com/radixark/miles/issues/4204) and proposed
+[#4310](https://github.com/radixark/miles/pull/4310)). Partial candidate heads
+retain the original approximate tail estimator. Core refresh sampling remains
+subject to the application's unfiltered-sampling restrictions. The CPU tests
+cover candidate preservation through Core packing and the complete-support
+loss/gradient; a GPU training run is separate qualification.

@@ -403,7 +403,9 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             self._agree(
                 lambda current=step_versions: self.clock.validate_versions(current, self.args.olmo_core.max_policy_lag)
             )
-            normalization = contract.step_normalization(step_batches, self.args.global_batch_size)
+            normalization = contract.step_normalization(
+                step_batches, self.args.global_batch_size, getattr(self.args, "loss_constant_token_denominator", None)
+            )
             for batch in step_batches:
                 batch["aux_loss_div_factor"] = normalization.auxiliary_denominator
                 batch["aux_loss_response_div_factor"] = normalization.samples / normalization.world_size
@@ -579,7 +581,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                             "balancing_reduction": self.args.olmo_core.router_aux_loss_reduction,
                             "z_reduction": self.args.olmo_core.router_z_loss_reduction,
                         },
-                        "reduction": "token" if self.args.calculate_per_token_loss else "response",
+                        "reduction": self._loss_reduction(),
                         "scoring_pass": scoring_mode,
                         "local_policy_objective": sum(float(m["normalized_policy_objective"]) for m in metrics),
                         "local_auxiliary_objective": aux_metrics,
@@ -702,6 +704,11 @@ class OLMoCoreTrainRayActor(TrainRayActor):
     def _validate_step_batches(batches, local_batch):
         if not local_batch or len(batches) % local_batch:
             raise ValueError("Rollout collection must contain complete optimizer batches on every rank")
+
+    def _loss_reduction(self):
+        if not self.args.calculate_per_token_loss:
+            return "response"
+        return "token" if getattr(self.args, "loss_constant_token_denominator", None) is None else "token_constant"
 
     @staticmethod
     def _validate_loss(loss):

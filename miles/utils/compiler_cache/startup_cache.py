@@ -103,6 +103,7 @@ def prepare(args, *, application_root):
             "use_rollout_routing_replay",
             "use_rollout_logprobs",
             "calculate_per_token_loss",
+            "loss_constant_token_denominator",
             "update_weight_transfer_mode",
         }
     }

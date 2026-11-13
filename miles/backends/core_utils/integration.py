@@ -2,6 +2,7 @@
 
 import asyncio
 
+from miles.backends.core_utils.rollout import errors
 from miles.backends.hooks import BackendHooks
 from miles.utils.async_utils import run
 from miles.utils.function_registry import load_function
@@ -66,6 +67,12 @@ def shutdown_rollout(producer) -> None:
         run(producer.shutdown())
 
 
+def prompt_exhaustion_error(args):
+    if getattr(getattr(args, "olmo_core", None), "prompt_provider", None) in errors.FINITE_SYNC_PROVIDERS:
+        return errors.PromptPoolExhausted("Finite prompt inventory exhausted before a complete training batch")
+    return None
+
+
 def diagnostic_writer(args):
     return load_function("miles.backends.core_utils.rollout.diagnostic_writer.create_writer")(args)
 
@@ -77,6 +84,7 @@ async def finalize_checkpoint(actor, rollout_id: int) -> None:
 _HOOKS = BackendHooks(
     configure_rollout=configure_rollout,
     diagnostic_writer=diagnostic_writer,
+    prompt_exhaustion_error=prompt_exhaustion_error,
     shutdown_rollout=shutdown_rollout,
     finalize_checkpoint=finalize_checkpoint,
 )

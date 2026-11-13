@@ -1,7 +1,8 @@
 """Generation lifecycle errors shared by Core rollout workers."""
 
 # Application providers supported by the finite-drain and training-feedback protocol.
-FINITE_POOL_PROVIDERS = ("pools",)
+FINITE_POOL_PROVIDERS = ("pools", "priority")
+FINITE_SYNC_PROVIDERS = ("priority",)
 # Drop handlers notify feedback providers before retiring recovery ownership.
 EXPLICIT_DISCARD_FEEDBACK = True
 
@@ -15,4 +16,4 @@ class GenerationRequestTimeout(TimeoutError):
 
 
 class PromptPoolExhausted(RuntimeError):
-    """All finite prompt pools are drained; no complete training batch remains."""
+    """The finite prompt inventory is drained; no complete training batch remains."""

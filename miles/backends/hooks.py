@@ -16,6 +16,10 @@ def _configure_rollout(args, user_eval_path: str | None) -> None:
     pass
 
 
+def _prompt_exhaustion_error(args):
+    return None
+
+
 def _diagnostic_writer(args):
     return None
 
@@ -33,6 +37,8 @@ class BackendHooks:
     # Called after generic path resolution, before checkpoint-eval validation.
     configure_rollout: Callable[[Any, str | None], None] = _configure_rollout
     diagnostic_writer: Callable[[Any], Any] = _diagnostic_writer
+    # A finite synchronous collector drains active work before raising this error.
+    prompt_exhaustion_error: Callable[[Any], Exception | None] = _prompt_exhaustion_error
     # Runs synchronously before the executor disposes shared resources.
     shutdown_rollout: Callable[[Any], None] = _shutdown_rollout
     # Awaited after both training and rollout state have been saved.

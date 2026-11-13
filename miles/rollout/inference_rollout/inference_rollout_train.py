@@ -7,6 +7,7 @@ import sglang_router
 from packaging.version import parse
 from tqdm import tqdm
 
+from miles.backends.hooks import get_backend_hooks
 from miles.rollout.base_types import RolloutFnTrainOutput
 from miles.rollout.filter_hub.base_types import MetricGatherer
 from miles.rollout.filter_hub.common_filters import apply_preput_filters
@@ -109,17 +110,36 @@ async def generate_rollout_async(
     # default to group level submission for sync/one-step async rollout
     scheduler = make_submission_scheduler(args, default="group")
 
+    exhaustion_error = get_backend_hooks(getattr(args, "train_backend", None)).prompt_exhaustion_error(args)
+    exhausted = False
     pendings = set()
     data = []
     all_data = []
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
     while len(data) < target_data_size:
-        while scheduler.has_capacity(pending_groups=len(pendings), group_budget=target_data_size - len(data)):
+        while not exhausted and scheduler.has_capacity(
+            pending_groups=len(pendings), group_budget=target_data_size - len(data)
+        ):
             # get samples from the buffer and submit the generation requests.
-            samples = data_source(args.over_sampling_batch_size)
+            try:
+                samples = data_source(args.over_sampling_batch_size)
+            except StopIteration:
+                if exhaustion_error is None:
+                    raise
+                exhausted = True
+                break
             scheduler.on_submit(samples)
             pendings.update(submit_generate_tasks(state, samples, scheduler.sample_done_callback))
+
+        if exhausted and not pendings:
+            pbar.close()
+            logger.info(
+                "Finite prompt inventory drained; discarding %d groups from the incomplete final batch", len(data)
+            )
+            state.reset()
+            assert exhaustion_error is not None
+            raise exhaustion_error
 
         # wait for the generation to finish
         logger.debug(f"[rollout] Waiting on {len(pendings)} pending tasks, data={len(data)}/{target_data_size}")

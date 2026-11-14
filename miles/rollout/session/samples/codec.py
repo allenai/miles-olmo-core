@@ -39,6 +39,7 @@ SAMPLES_VALUE_SPEC: dict[str, ValueSpec] = {
     "rollout_log_probs": ValueSpec("tensor_list", np.dtype(np.float64)),
     "rollout_topk_token_ids": ValueSpec("tensor", np.dtype(np.int32), strict=True),
     "rollout_topk_log_probs": ValueSpec("tensor", np.dtype(np.float32), strict=True),
+    "rollout_score_mode": ValueSpec("json"),
     "rollout_sampling_mask": ValueSpec("sampling_mask"),
     "rollout_routed_experts": ValueSpec("tensor", np.dtype(np.int32), strict=True),
     "rollout_indexer_topk": ValueSpec("tensor", np.dtype(np.int32), strict=True),
@@ -124,7 +125,9 @@ def encode_samples(
                     value = value.to_dict()
                 elif field == "prefix_cache_info":
                     value = value.to_dict()
-                sample_meta[field] = value
+                # Keep legacy replies byte-compatible when no new mode is selected.
+                if field != "rollout_score_mode" or value != "topk":
+                    sample_meta[field] = value
                 continue
             if value is None:
                 # Preserve the existing wire format when rollout top-k logprobs collection is disabled.
@@ -184,7 +187,7 @@ def decode_samples_and_merge_input_sample(
         for field in fields:
             spec = SAMPLES_VALUE_SPEC_V2[field]
             if spec.codec == "json":
-                value = sample_meta[field]
+                value = sample_meta.get(field, "topk") if field == "rollout_score_mode" else sample_meta[field]
                 if field == "status":
                     value = Sample.Status(value)
                 elif field == "weight_versions":

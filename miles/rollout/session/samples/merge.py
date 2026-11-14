@@ -141,6 +141,8 @@ def _compute_sample_from_openai_record(
             sample,
             choice["meta_info"],
             args.rollout_top_logprobs_num,
+            score_mode=getattr(args, "rollout_score_mode", "topk"),
+            transport=getattr(args, "rollout_score_transport", "nested"),
             sampling_logprobs_mode=record.request.get("sampling_logprobs_mode", "selected"),
         )
     sample.rollout_routed_experts = (

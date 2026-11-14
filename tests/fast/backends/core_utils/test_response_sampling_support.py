@@ -31,16 +31,30 @@ def test_core_scores_match_independent_categorical_reference(monkeypatch, suppor
         "total_lengths": [3, 2],
         "response_lengths": [2, 1],
         "loss_masks": [torch.ones(2), torch.ones(1)],
-        "rollout_sampling_mask_ids": [torch.tensor([0, 2, 1, 3], dtype=torch.int32), torch.tensor([0, 2], dtype=torch.int32)],
+        "rollout_sampling_mask_ids": [
+            torch.tensor([0, 2, 1, 3], dtype=torch.int32),
+            torch.tensor([0, 2], dtype=torch.int32),
+        ],
         "rollout_sampling_mask_offsets": [torch.tensor([0, 2, 4]), torch.tensor([0, 2])],
     }
-    logits = [torch.tensor([[[2.0, 1.0, 0.0, -1.0], [-1.0, 0.0, 1.0, 2.0], [0.0, 0.0, 0.0, 0.0]]]), torch.tensor([[[1.0, 0.0, -2.0, -1.0], [0.0, 0.0, 0.0, 0.0]]])]
+    logits = [
+        torch.tensor([[[2.0, 1.0, 0.0, -1.0], [-1.0, 0.0, 1.0, 2.0], [0.0, 0.0, 0.0, 0.0]]]),
+        torch.tensor([[[1.0, 0.0, -2.0, -1.0], [0.0, 0.0, 0.0, 0.0]]]),
+    ]
     batches = data.sample_batches(rollout, 8)
     if packed:
         batches = [packing.combine(batches, [0, 1])]
         logits = [torch.cat(logits, dim=1)]
-    scores = [score for batch, values in zip(batches, logits, strict=True) for score in response_scoring.log_probs(args, values, batch)]
-    selected = [(torch.tensor([2.0, 1.0, 0.0, -1.0]), 0, [0, 2]), (torch.tensor([-1.0, 0.0, 1.0, 2.0]), 3, [1, 3]), (torch.tensor([1.0, 0.0, -2.0, -1.0]), 2, [0, 2])]
+    scores = [
+        score
+        for batch, values in zip(batches, logits, strict=True)
+        for score in response_scoring.log_probs(args, values, batch)
+    ]
+    selected = [
+        (torch.tensor([2.0, 1.0, 0.0, -1.0]), 0, [0, 2]),
+        (torch.tensor([-1.0, 0.0, 1.0, 2.0]), 3, [1, 3]),
+        (torch.tensor([1.0, 0.0, -2.0, -1.0]), 2, [0, 2]),
+    ]
     expected = []
     for row, token, support in selected:
         reference = row[support] if support_replay else row

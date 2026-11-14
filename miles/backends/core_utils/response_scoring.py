@@ -5,7 +5,11 @@ from miles.backends.training_utils.loss import objective
 
 
 def log_probs(args, logits, batch):
-    supports = sampling_mask.get_rollout_sampling_masks(batch) if getattr(args, "use_sampling_support_replay", False) else None
+    supports = (
+        sampling_mask.get_rollout_sampling_masks(batch)
+        if getattr(args, "use_sampling_support_replay", False)
+        else None
+    )
     return objective.get_log_probs_and_entropy(
         logits,
         args=args,

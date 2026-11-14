@@ -21,6 +21,7 @@ from miles.backends.core_utils import (
     packing,
     performance,
     replay_diagnostics,
+    response_scoring,
     router_load,
     router_objective,
     scheduler,
@@ -161,15 +162,8 @@ class OLMoCoreTrainRayActor(TrainRayActor):
 
     def _training_log_probs(self, logits, batch):
         with torch.no_grad():
-            result = miles_loss.get_log_probs_and_entropy(
-                logits.detach(),
-                args=self.args,
-                unconcat_tokens=batch["unconcat_tokens"],
-                total_lengths=batch["total_lengths"],
-                response_lengths=batch["response_lengths"],
-                max_seq_lens=batch["max_seq_lens"],
-            )
-        return [value.detach() for value in result["log_probs"]]
+            scores = response_scoring.log_probs(self.args, logits.detach(), batch)
+        return [value.detach() for value in scores]
 
     def _score_contract(self, rollout, rollout_id, source):
         """Validate the behavior-policy agreement gate and profile before any weight change."""
@@ -279,15 +273,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             for batch in batches:
                 with self._replay_context(module, batch) if use_replay else contextlib.nullcontext():
                     logits = self._forward(module, batch)
-                    result = miles_loss.get_log_probs_and_entropy(
-                        logits,
-                        args=self.args,
-                        unconcat_tokens=batch["unconcat_tokens"],
-                        total_lengths=batch["total_lengths"],
-                        response_lengths=batch["response_lengths"],
-                        max_seq_lens=batch["max_seq_lens"],
-                    )
-                    scores.extend(result["log_probs"])
+                    scores.extend(response_scoring.log_probs(self.args, logits, batch))
         return scores
 
     def train(self, rollout_id, rollout_data_ref, external_data=None, *, witness_info=None, attempt=0):

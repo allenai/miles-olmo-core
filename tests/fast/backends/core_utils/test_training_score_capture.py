@@ -120,3 +120,42 @@ def test_other_score_contracts_keep_existing_path(monkeypatch, case):
     assert fallback.call_count == (0 if case == "standalone" else 1)
     if case != "standalone":
         assert batch["training_log_probs"] is expected
+
+
+@pytest.mark.parametrize("recompute", [False, True])
+def test_diagnostic_scores_survive_in_place_tis_mutation(runtime, monkeypatch, recompute):
+    args = fixtures.make_args(
+        true_on_policy_mode=False,
+        skip_actor_forward_only=True,
+        use_tis=True,
+        custom_tis_function_path="test.mutating_tis",
+        recompute_loss_function=recompute,
+        entropy_coef=0.0,
+        observe_training_entropy=False,
+        use_kl_loss=False,
+        multi_lora=False,
+    )
+    inputs = fixtures.make_inputs(
+        seed=39, batch_size=3, prompt_lens=[2, 3, 4], response_lens=[3, 5, 2], vocab_size=16, args=args
+    )
+    args.global_batch_size = 3
+    batch = fixtures.make_batch(inputs, "policy_loss")
+    batch.pop("log_probs")
+    logits = inputs["policy_logits"].clone().requires_grad_()
+    expected = standalone(args, logits, batch)
+
+    def mutating_tis(*, pg_loss, train_log_probs, loss_masks, **kwargs):
+        for value in train_log_probs:
+            value.add_(1.0)
+        return pg_loss, loss_masks, {}
+
+    hook = Mock(side_effect=mutating_tis)
+    monkeypatch.setattr(losses, "load_function", lambda path: hook)
+    fallback = Mock(side_effect=AssertionError("policy must reuse its loss scores"))
+    loss, _, _ = training_objective.loss_with_scores(args, batch, 1, logits, capture=True, fallback_scores=fallback)
+    torch.testing.assert_close(batch["training_log_probs"], expected, rtol=0, atol=0)
+    loss.backward()
+    assert hook.call_count == (2 if recompute else 1)
+    torch.testing.assert_close(batch["training_log_probs"], expected, rtol=0, atol=0)
+    sums, maximum = contract.scoring_check(expected, batch["training_log_probs"], batch["loss_masks"])
+    assert contract.validate_scoring_check(sums, maximum, 1e-3)["mean_abs"] == 0

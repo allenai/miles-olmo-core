@@ -133,7 +133,8 @@ def policy_loss_function(
     if log_probs_out is not None:
         # Preserve response boundaries without retaining the gradient graph. Loss
         # checkpointing may call us again; replace the same output list each time.
-        log_probs_out[:] = [value.detach() for value in log_probs]
+        # Snapshot before custom TIS/debug hooks can mutate the live scores.
+        log_probs_out[:] = [value.detach().clone() for value in log_probs]
     if args.skip_actor_forward_only:
         trainer_scored_log_probs = [log_prob.detach() for log_prob in log_probs]
     else:

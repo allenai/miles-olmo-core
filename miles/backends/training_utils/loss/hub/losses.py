@@ -66,6 +66,8 @@ def policy_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    *,
+    log_probs_out: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute policy loss (PPO/GSPO) and metrics.
 
@@ -128,6 +130,10 @@ def policy_loss_function(
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
+    if log_probs_out is not None:
+        # Preserve response boundaries without retaining the gradient graph. Loss
+        # checkpointing may call us again; replace the same output list each time.
+        log_probs_out[:] = [value.detach() for value in log_probs]
     if args.skip_actor_forward_only:
         trainer_scored_log_probs = [log_prob.detach() for log_prob in log_probs]
     else:

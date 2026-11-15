@@ -1,11 +1,13 @@
 from argparse import Namespace
+from functools import partial
+
 import torch
 from torch.utils.checkpoint import checkpoint
 
 from miles.backends.training_utils.data.context_parallel import get_local_response_loss_masks, get_sum_of_sample_mean
 from miles.backends.training_utils.loss.hub.advantages import compute_advantages, normalize_advantages
 from miles.backends.training_utils.loss.hub.logit_processors import get_log_probs_and_entropy, get_values  # noqa: F401
-from miles.backends.training_utils.loss.hub.losses import get_loss_function
+from miles.backends.training_utils.loss.hub.losses import get_loss_function, policy_loss_function
 from miles.backends.training_utils.loss.hub.math_utils import compute_approx_kl
 from miles.backends.training_utils.loss.hub.opd import apply_opd_kl_to_advantages
 from miles.backends.training_utils.parallel import get_parallel_state
@@ -132,6 +134,8 @@ def loss_function(
     logits: torch.Tensor,
     apply_megatron_loss_scaling: bool = False,
     num_rollouts: int | None = None,
+    *,
+    log_probs_out: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, int | torch.Tensor, dict]:
     """Dispatch to the configured loss and rescale for Megatron integration.
 
@@ -148,6 +152,8 @@ def loss_function(
             keys required by the selected loss function.
         num_microbatches: Number of gradient accumulation steps.
         logits: Model outputs (policy or value head).
+        log_probs_out: Optional output list populated with detached response scores by
+            the built-in policy loss. Replaced, not appended, on loss recomputation.
         num_rollouts: This step's rollout count (total across DP), used as
             the loss normalizer; None falls back to the legacy batch/args value.
 
@@ -175,6 +181,10 @@ def loss_function(
     )
 
     func = get_loss_function(args, batch.get("loss_fn"))
+    if log_probs_out is not None:
+        if func is not policy_loss_function:
+            raise ValueError("log_probs_out requires the built-in policy loss")
+        func = partial(func, log_probs_out=log_probs_out)
 
     if args.recompute_loss_function:
         loss, log = checkpoint(

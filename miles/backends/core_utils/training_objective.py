@@ -9,9 +9,8 @@ def loss_with_scores(args, batch, count, logits, *, capture, fallback_scores):
     # Preserve their existing diagnostic forward until they expose that contract.
     reuse = (
         capture
-        and args.loss_type == "policy_loss"
-        and batch.get("loss_fn") is None
         and not getattr(args, "use_sampling_support_replay", False)
+        and objective.get_loss_function(args, batch.get("loss_fn")) is objective.policy_loss_function
     )
     scores = [] if reuse else None
     if capture and not reuse:

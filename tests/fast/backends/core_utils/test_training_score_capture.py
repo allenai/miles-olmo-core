@@ -108,6 +108,8 @@ def test_other_score_contracts_keep_existing_path(monkeypatch, case):
     args.use_sampling_support_replay = case == "support_replay"
     if case == "custom":
         args.loss_type = "custom_loss"
+        args.custom_loss_function_path = "test.custom_loss"
+        monkeypatch.setattr(losses, "load_function", lambda path: Mock())
     batch = {"loss_fn": "importance_sampling"} if case == "tinker" else {}
     expected = [torch.tensor([0.3])]
     fallback = Mock(return_value=expected)
@@ -159,3 +161,35 @@ def test_diagnostic_scores_survive_in_place_tis_mutation(runtime, monkeypatch, r
     torch.testing.assert_close(batch["training_log_probs"], expected, rtol=0, atol=0)
     sums, maximum = contract.scoring_check(expected, batch["training_log_probs"], batch["loss_masks"])
     assert contract.validate_scoring_check(sums, maximum, 1e-3)["mean_abs"] == 0
+
+
+@pytest.mark.parametrize("recompute", [False, True])
+def test_wrapped_policy_loss_uses_standalone_scores(runtime, monkeypatch, recompute):
+    args = fixtures.make_args(
+        true_on_policy_mode=False,
+        skip_actor_forward_only=True,
+        recompute_loss_function=recompute,
+        entropy_coef=0.0,
+        observe_training_entropy=False,
+        use_kl_loss=False,
+        multi_lora=False,
+    )
+    inputs = fixtures.make_inputs(
+        seed=39, batch_size=3, prompt_lens=[2, 3, 4], response_lens=[3, 5, 2], vocab_size=16, args=args
+    )
+    args.global_batch_size = 3
+    batch = fixtures.make_batch(inputs, "policy_loss")
+    logits = inputs["policy_logits"].clone().requires_grad_()
+    expected = standalone(args, logits, batch)
+    wrapped = Mock(wraps=losses.policy_loss_function)
+    monkeypatch.setattr(objective, "get_loss_function", lambda args, loss_fn: wrapped)
+    fallback = Mock(side_effect=lambda logits, batch: standalone(args, logits, batch))
+
+    loss, _, _ = training_objective.loss_with_scores(args, batch, 1, logits, capture=True, fallback_scores=fallback)
+    loss.backward()
+
+    fallback.assert_called_once_with(logits, batch)
+    assert wrapped.call_count == (2 if recompute else 1)
+    assert all("log_probs_out" not in call.kwargs for call in wrapped.call_args_list)
+    torch.testing.assert_close(batch["training_log_probs"], expected, rtol=0, atol=0)
+    assert logits.grad.count_nonzero() > 0

@@ -32,6 +32,8 @@ from miles.backends.core_utils.publication import (
     engine_delivery,
     policy_refresh,
     publication,
+    quantization,
+    tensors as publication_tensors,
     transport,
 )
 from miles.backends.core_utils.publication.state import PolicyClock
@@ -91,6 +93,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             )
         )
         self.train_parallel_config = {"dp_size": world}
+        self.publication_quantization_config = quantization.resolve(args)
         self.train_module, self.hf_config, self.model_config = models.build_train_module(args)
         self.model = self.train_module.model
         self.optimizer = self.train_module.optim
@@ -786,14 +789,19 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             self.hf_config,
             stream_moe=self.args.olmo_core.stream_moe_export,
             fused_experts=self.args.olmo_core.expert_publication == "fused",
+            quantization_config=getattr(self, "publication_quantization_config", None),
         ):
+            quantized = getattr(self, "publication_quantization_config", None) is not None
+            nbytes = publication_tensors.nbytes(tensor, quantized=quantized)
             tensor_count += 1
-            byte_count += tensor.nbytes
-            if bucket and size + tensor.nbytes > self.args.update_weight_buffer_size:
+            byte_count += nbytes
+            if publication_tensors.requires_flush(
+                size, tensor, quantized=quantized, limit=self.args.update_weight_buffer_size
+            ):
                 send(bucket)
                 bucket, size = [], 0
-            bucket.append((name, tensor.to(device="cuda", dtype=torch.bfloat16).contiguous()))
-            size += tensor.nbytes
+            bucket.append((name, publication_tensors.copy_tensor(tensor, quantized=quantized, device="cuda")))
+            size += nbytes
         if bucket:
             send(bucket)
         export_done = time.perf_counter()

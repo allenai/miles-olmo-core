@@ -17,6 +17,7 @@ import torch
 from torch import distributed as dist
 
 from miles.backends.core_utils import models
+from miles.backends.core_utils.publication import tensors as publication_tensors
 from miles.backends.core_utils.publication.engine_drain import WeightSnapshot
 from miles.backends.training_utils.weight_update.protocols.cuda_ipc import FlattenedTensorBucket
 from miles.utils import async_utils, distributed_utils
@@ -66,19 +67,23 @@ def capture(actor):
         actor.hf_config,
         stream_moe=actor.args.olmo_core.stream_moe_export,
         fused_experts=actor.args.olmo_core.expert_publication == "fused",
+        quantization_config=getattr(actor, "publication_quantization_config", None),
     ):
         if name in names_seen or tensor.numel() == 0:
             raise ValueError(f"invalid snapshot tensor {name}")
         names_seen.add(name)
-        nbytes = tensor.numel() * 2
-        if size and size + nbytes > actor.args.update_weight_buffer_size:
+        quantized = getattr(actor, "publication_quantization_config", None) is not None
+        nbytes = publication_tensors.nbytes(tensor, quantized=quantized)
+        if publication_tensors.requires_flush(
+            size, tensor, quantized=quantized, limit=actor.args.update_weight_buffer_size
+        ):
             actor._agree(flush)
             bucket, size = [], 0
         if dist.get_rank() == 0:
             # Exporters may reuse scratch storage on the next iteration. Own
             # each tensor immediately, but retain at most one GPU bucket rather
             # than a complete extra model. The packed CPU array is frozen by Ray.
-            bucket.append((name, tensor.detach().to(dtype=torch.bfloat16, copy=True).contiguous()))
+            bucket.append((name, publication_tensors.copy_tensor(tensor, quantized=quantized)))
         size += nbytes
         total += nbytes
     if size:

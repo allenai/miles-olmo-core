@@ -12,7 +12,7 @@ from olmo_core import config as core_config
 from olmo_core.nn import transformer
 from olmo_core.nn.transformer import config as transformer_config
 
-from miles.backends.core_utils import router_objective
+from miles.backends.core_utils import quantized_export, router_objective
 from miles.backends.core_utils.timing import startup_stage
 from miles.utils.hf_utils.config import load_hf_config
 
@@ -113,14 +113,19 @@ def build_train_module(args, source=None, *, reference=False):
     return module, hf, config
 
 
-def iter_export_state(module, hf, *, stream_moe=True, fused_experts=False):
+def iter_export_state(module, hf, *, stream_moe=True, fused_experts=False, quantization_config=None):
     """Yield HF weights through the selected trainer's native conversion path.
 
     ``fused_experts`` yields routed experts stacked per layer in the serving
     engine's layout, for publication only; HF exports keep per-expert slices.
     """
     kind = getattr(module, "_miles_model_backend", "moe" if hf.model_type == "olmo3moe" else "standard")
-    yield from _backend(kind).iter_export_state(module, hf, stream_moe=stream_moe, fused_experts=fused_experts)
+    if quantization_config is not None and (kind != "moe" or not stream_moe or fused_experts):
+        raise ValueError("Quantized export requires streaming per-expert Core MoE weights")
+    state = _backend(kind).iter_export_state(module, hf, stream_moe=stream_moe, fused_experts=fused_experts)
+    if quantization_config is not None:
+        state = quantized_export.iter_quantized_state(state, quantization_config)
+    yield from state
 
 
 def export_state(module, hf):

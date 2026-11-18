@@ -665,13 +665,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                     }
                 )
             logged = self._agree(
-                lambda losses=losses,
-                summary=summary,
-                lr_used=lr_used,
-                gradient_stats=gradient_stats,
-                difference=difference,
-                agreement=agreement,
-                profile=profile: training_metrics.log_step(
+                lambda losses=losses, summary=summary, lr_used=lr_used, gradient_stats=gradient_stats, difference=difference, agreement=agreement, profile=profile: training_metrics.log_step(
                     self.args,
                     losses=losses,
                     summary=summary,

@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ from transformers import AutoConfig
 from miles.backends.core_utils import quantized_export as export
 from miles.backends.core_utils.publication import quantization, tensors
 from tools.convert_core_hf_quantized import convert
+from tools import convert_core_hf_quantized
 
 PREFIX = "model.layers.1.mlp.experts.0."
 FP8 = {
@@ -244,6 +246,31 @@ def test_serialized_checkpoint_matches_publication_and_keeps_input(tmp_path):
     ).read_bytes()
     with pytest.raises(FileExistsError):
         convert(source, destination, fmt="fp8", device="cpu")
+
+
+def test_checkpoint_reader_reuse_is_bounded_and_preserves_tensors(tmp_path, monkeypatch):
+    weights = {name: torch.arange(8) for name in ("a", "b", "c")}
+    safetensors.torch.save_file({k: weights[k] for k in ("a", "b")}, tmp_path / "one")
+    safetensors.torch.save_file({"c": weights["c"]}, tmp_path / "two")
+    original = safetensors.safe_open
+    opened, active = [], 0
+
+    @contextmanager
+    def tracked(path, **kwargs):
+        nonlocal active
+        active += 1
+        assert active == 1
+        opened.append(path.name)
+        try:
+            with original(path, **kwargs) as reader:
+                yield reader
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(safetensors, "safe_open", tracked)
+    result = dict(convert_core_hf_quantized._state(tmp_path, {"a": "one", "b": "one", "c": "two"}, "cpu"))
+    assert opened == ["one", "two"] and active == 0
+    assert all(torch.equal(result[name], value) for name, value in weights.items())
 
 
 def test_failed_conversion_never_exposes_partial_checkpoint(tmp_path):

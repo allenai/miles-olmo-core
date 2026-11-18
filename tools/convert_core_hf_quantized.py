@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import tempfile
+from contextlib import ExitStack
 from pathlib import Path
 
 import safetensors
@@ -33,8 +34,17 @@ def _inventory(source):
 def _state(source, inventory, device):
     # Lexical order places each expert's down, gate, up consecutively, even when
     # its pair was stored in different input shards. Hold just one input tensor.
-    for name in sorted(inventory):
-        with safetensors.safe_open(source / inventory[name], framework="pt", device=device) as reader:
+    # A single-file MoE checkpoint can contain tens of thousands of tensors.
+    # Reuse its reader instead of reparsing the full header for every tensor.
+    # Keep at most one shard reader open when lexical ordering crosses shards.
+    with ExitStack() as stack:
+        current = None
+        for name in sorted(inventory):
+            path = source / inventory[name]
+            if path != current:
+                stack.close()
+                reader = stack.enter_context(safetensors.safe_open(path, framework="pt", device=device))
+                current = path
             yield name, reader.get_tensor(name)
 
 

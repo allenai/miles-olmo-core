@@ -240,7 +240,7 @@ def score_metrics(rollout, *, current_version, clip_low, clip_high):
     ):
         delta = scores.detach().float() - behavior.detach().float()
         replay_version = metadata["policy_refresh"]["replay_version"]
-        mixed += int(len(spans) > 1)
+        mixed += int(len({span["version"] for span in spans}) > 1)
         for span in spans:
             start, end = span["start"], span["end"]
             selected = delta[start:end][mask[start:end].bool()]

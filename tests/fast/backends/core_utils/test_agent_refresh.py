@@ -281,3 +281,18 @@ def test_native_session_assembly_preserves_moe_routes_and_tool_masks():
         dict(version=0, start=0, end=2),
         dict(version=1, start=4, end=6),
     ]
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_refresh_metrics_distinguish_multiple_turns_from_multiple_versions(mixed):
+    sample = trajectory()
+    if not mixed:
+        sample.weight_versions[1] = WeightVersionsPerCall([WeightVersionSpan("0", 6, 8)])
+    policy_refresh.record_trajectory(sample)
+    data = batch(sample)
+    scores = torch.tensor(sample.rollout_log_probs)
+    data.update(log_probs=[scores.clone()], rollout_log_probs=[scores])
+    metrics = policy_refresh.score_metrics(data, current_version=1, clip_low=0.5, clip_high=2.0)
+    assert metrics["mixed_responses"] == int(mixed)
+    assert metrics["response_count"] == 1
+    assert metrics["active_tokens"] == 4

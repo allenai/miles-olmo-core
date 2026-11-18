@@ -62,8 +62,10 @@ def test_native_block_fp8_repeated_refresh_storage_and_cuda_parity():
         value = sources["w2_weight"][0].to(dtype)
         gpu = fp8_export.quantize_blockwise(value)
         cpu = fp8_export.quantize_blockwise(value.cpu())
-        for actual, expected in zip(gpu, cpu, strict=True):
-            torch.testing.assert_close(actual.float().cpu(), expected.float(), rtol=0, atol=0)
+        torch.testing.assert_close(gpu[0].float().cpu(), cpu[0].float(), rtol=0, atol=0)
+        # Triton's division can differ by one FP32 ULP from CPU division.
+        # Keep packed bytes exact; permit only FP32 rounding in the scales.
+        torch.testing.assert_close(gpu[1].cpu(), cpu[1], rtol=torch.finfo(torch.float32).eps, atol=0)
     _load_layer(layer, sources, 1)
     method.process_weights_after_loading(layer)
     serving = dict(layer.named_parameters())

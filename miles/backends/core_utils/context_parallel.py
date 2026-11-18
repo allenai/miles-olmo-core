@@ -118,13 +118,23 @@ def replay_routes(model, routes, *, packed):
     if balancer is None:
         return routes
     names = list(routes)
+    # Core validates every replay row, including masked padding. Shift by
+    # distinct top-k IDs so zero padding becomes [0, 1, ...] after unshifting.
+    offsets = [
+        (
+            torch.arange(routes[name].shape[-1], device=routes[name].device, dtype=routes[name].dtype)
+            if routes[name].ndim == 3
+            else 0
+        )
+        for name in names
+    ]
     values = balancer.batch_shard(
-        inputs=[routes[name] for name in names],
+        inputs=[routes[name] - offset for name, offset in zip(names, offsets, strict=True)],
         seq_dims=[1] * len(names),
         pad_values=[0] * len(names),
         length_multiple=16 if packed else balancer.cp_world_size,
     )
-    return dict(zip(names, values, strict=True))
+    return {name: value + offset for name, value, offset in zip(names, values, offsets, strict=True)}
 
 
 def replay_counts(model, batch):

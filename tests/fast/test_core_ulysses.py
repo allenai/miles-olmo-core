@@ -16,20 +16,16 @@ def test_replay_shards_match_core_document_padding_and_tail_counts():
     ring = pytest.importorskip("olmo_core.nn.attention.ring")
     tokens = torch.arange(19).unsqueeze(0)
     batch = {"tokens": tokens, "total_lengths": [7, 12], "doc_lens": torch.tensor([[7, 12]])}
-    original = torch.arange(19 * 2).reshape(1, 19, 2)
+    original = (torch.arange(19).view(1, 19, 1) + torch.arange(2)) % 4
+    padded_routes = torch.cat((original, torch.arange(2).expand(1, 13, 2)), dim=1)
     shards = []
     for rank in range(2):
         balancer = ring.UlyssesLoadBalancer(cp_rank=rank, cp_world_size=2)
         model = SimpleNamespace(_cp_load_balancer=balancer)
         result = context_parallel.replay_routes(model, {"router": original}, packed=True)["router"]
-        expected = balancer.batch_shard_by_document(
-            inputs=[original],
-            seq_dims=[1],
-            cu_doc_lens=torch.tensor([0, 7, 19]),
-            pad_values=[0],
-            length_multiple=16,
-        )[0][0]
-        torch.testing.assert_close(result, expected)
+        torch.testing.assert_close(result, padded_routes.chunk(2, dim=1)[rank])
+        assert bool((result[..., 0] != result[..., 1]).all())
+        assert bool(((result >= 0) & (result < 4)).all())
         shards.append(context_parallel.replay_counts(model, batch))
     assert sum(tokens for tokens, _ in shards) == 32
     assert sum(captured for _, captured in shards) == 17

@@ -1,4 +1,6 @@
+import ast
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +14,30 @@ from tools.convert_core_hf_quantized import convert
 PREFIX = "model.layers.1.mlp.experts.0."
 FP8 = {"quant_method": "fp8", "activation_scheme": "dynamic", "ignored_layers": ["lm_head"]}
 NVFP4 = {"quant_method": "modelopt", "quant_algo": "NVFP4", "exclude_modules": ["lm_head"]}
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_fp8_matches_megatron_per_tensor_recipe(dtype):
+    # Execute the real checkout's function without importing Megatron's CUDA
+    # dependencies. Only its per-tensor branch is exercised here; signature or
+    # dependency changes upstream should make this compatibility test fail.
+    source = (
+        Path(__file__).resolve().parents[4]
+        / "miles/backends/megatron_utils/megatron_to_hf/processors/quantizer_fp8.py"
+    )
+    tree = ast.parse(source.read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_quantize_param")
+    namespace = {"torch": torch}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
+    generator = torch.Generator().manual_seed(31)
+    weight = torch.randn((16, 32), generator=generator).to(dtype)
+    name = PREFIX + "down_proj.weight"
+    expected = dict(namespace["_quantize_param"](None, name, weight, None))
+    actual = dict(export.iter_quantized_state([(name, weight)], FP8))
+    assert actual.keys() == expected.keys()
+    for key in actual:
+        assert actual[key].dtype == expected[key].dtype
+        assert torch.equal(actual[key].view(torch.uint8), expected[key].view(torch.uint8))
 
 
 def state(value=1):

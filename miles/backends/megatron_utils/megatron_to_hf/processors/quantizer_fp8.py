@@ -1,8 +1,9 @@
 import os
 import re
 
+import torch
+
 from miles.kernels.quant.fp8_blockwise import fp8_blockwise_cast
-from miles.utils.fp8_export import quantize_per_tensor
 
 from ...sglang import (
     per_block_cast_to_fp8,
@@ -110,6 +111,8 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
 
 def _quantize_param(args, name, weight, weight_block_size):
     assert name.endswith(".weight"), f"Expected weight parameter, got {name}"
+    FP8_MIN = torch.finfo(torch.float8_e4m3fn).min
+    FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
     if weight_block_size is not None:
         if _get_scale_format(args, name, weight_block_size) == "ue8m0":
             qweight, scale = quant_weight_ue8m0(weight, weight_block_size=weight_block_size)
@@ -126,7 +129,9 @@ def _quantize_param(args, name, weight, weight_block_size):
         scale_name = name.replace(".weight", ".weight_scale_inv")
     else:
         # per tensor quant
-        qweight, scale = quantize_per_tensor(weight)
+        scale = weight.abs().max().clamp(min=1e-12).to(torch.float32) / FP8_MAX
+        qweight = (weight / scale).clamp(min=FP8_MIN, max=FP8_MAX).to(torch.float8_e4m3fn)
+        scale = scale.view(1)
         scale_name = name.replace(".weight", ".weight_scale")
     return [(name, qweight), (scale_name, scale)]
 

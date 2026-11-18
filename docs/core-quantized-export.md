@@ -1,8 +1,10 @@
 # Core quantized weight export
 
 This opt-in path converts Core's ordinary per-expert HF export on the sender.
-It reuses MILES' NVFP4 quantizer and shares the per-tensor FP8 quantizer with
-the Megatron exporter. Core itself does not currently expose a quantized HF
+It reuses MILES' existing NVFP4 quantizer unchanged. A small Core-local FP8
+helper follows Megatron's per-tensor recipe without changing Megatron files.
+Parity tests compare against the checkout's Megatron implementation; Core clamps
+scales in FP32 to additionally handle zero FP16 weights safely. Core itself does not currently expose a quantized HF
 export option. Training weights and native resumable checkpoints stay unchanged.
 
 ## Prepare the initial rollout checkpoint

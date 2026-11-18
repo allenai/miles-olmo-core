@@ -8,8 +8,8 @@ import re
 
 import torch
 
+from miles.backends.core_utils.fp8_export import quantize_per_tensor
 from miles.utils import nvfp4
-from miles.utils.fp8_export import quantize_per_tensor
 
 _EXPERT = re.compile(r"model\.layers\.\d+\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight$")
 

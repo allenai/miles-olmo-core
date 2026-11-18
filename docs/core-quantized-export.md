@@ -62,9 +62,9 @@ and actual byte counts. Ordinary HF evaluation exports remain unquantized.
 - CPU tests cover FP8 checkpoint/update byte parity, immutable publication
   copies, mixed dtypes, gate/up grouping and invalid configuration. The CPU
   NVFP4 grouping test uses a stub quantizer; it does not validate CUDA numerics.
-- Serialized SGLang loading and repeated GPU refresh still require end-to-end
-  qualification. Earlier online receiver-quantization tests do not qualify this
-  path. Do not switch active runs based on CPU tests alone.
+- Block FP8 has the bounded one-GPU qualification below. NVFP4 sender export,
+  production hybrid models and distributed transport remain unqualified by
+  this test. Earlier online receiver-quantization tests do not qualify those paths.
 
 ## Block FP8 refresh qualification
 
@@ -84,5 +84,15 @@ with initial/cold-load generation. The fixture uses one full-attention layer;
 it does not qualify production-scale hybrid KDA behavior, NCCL, or TP>1.
 Set `CORE_FP8_FIXTURE_BUILDER` to olmo-sglang's
 `tools/create_tiny_parity_checkpoint.py`, `CORE_FP8_TEST_OUTPUT` to an empty
-output directory, and run that file explicitly with pytest. GPU results remain
-pending until an actual execution receipt is recorded.
+output directory, and run that file explicitly with pytest.
+
+On 2026-11-18, revision `5b7ff4ac77f434e500fa846f8ed9eda1a75f8fac`
+passed all three cases on one B300 in 269 seconds:
+[Beaker receipt](https://beaker.org/ex/01M7R5ZFRMGJ4A5EN18MZ12T11), exit 0.
+The pinned runtime used a SHA256-verified source overlay and the independent
+names-only Olmo loader fix; native SGLang FP8 code was unchanged. The same job
+also passed all 44 focused CPU cases. CPU/CUDA packed FP8 values match exactly;
+FP32 scales allow one machine epsilon for division rounding. Native parameter
+identity, storage and cold-layer tensors remain exact checks; generation scores
+use absolute tolerance `1e-5`. FP8 KV used the runtime's default unit scales.
+This is a refresh correctness receipt, not a training, accuracy or speed result.

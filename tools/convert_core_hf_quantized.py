@@ -86,7 +86,13 @@ def convert(source, destination, *, fmt, device="cuda", shard_bytes=256 * 1024**
         name.removesuffix(".weight") for name in inventory if name.endswith(".weight") and ".mlp.experts." not in name
     )
     recipe = (
-        {"quant_method": "fp8", "activation_scheme": "dynamic", "fmt": "e4m3", "ignored_layers": ignored}
+        {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "weight_block_size": [128, 128],
+            "ignored_layers": ignored,
+        }
         if fmt == "fp8"
         else {"quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16, "exclude_modules": ignored}
     )

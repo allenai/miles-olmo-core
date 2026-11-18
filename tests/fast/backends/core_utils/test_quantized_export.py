@@ -1,6 +1,4 @@
-import ast
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -12,37 +10,18 @@ from miles.backends.core_utils.publication import quantization, tensors
 from tools.convert_core_hf_quantized import convert
 
 PREFIX = "model.layers.1.mlp.experts.0."
-FP8 = {"quant_method": "fp8", "activation_scheme": "dynamic", "ignored_layers": ["lm_head"]}
+FP8 = {
+    "quant_method": "fp8",
+    "activation_scheme": "dynamic",
+    "ignored_layers": ["lm_head"],
+    "weight_block_size": [128, 128],
+}
 NVFP4 = {"quant_method": "modelopt", "quant_algo": "NVFP4", "exclude_modules": ["lm_head"]}
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_fp8_matches_megatron_per_tensor_recipe(dtype):
-    # Execute the real checkout's function without importing Megatron's CUDA
-    # dependencies. Only its per-tensor branch is exercised here; signature or
-    # dependency changes upstream should make this compatibility test fail.
-    source = (
-        Path(__file__).resolve().parents[4]
-        / "miles/backends/megatron_utils/megatron_to_hf/processors/quantizer_fp8.py"
-    )
-    tree = ast.parse(source.read_text())
-    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_quantize_param")
-    namespace = {"torch": torch}
-    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
-    generator = torch.Generator().manual_seed(31)
-    weight = torch.randn((16, 32), generator=generator).to(dtype)
-    name = PREFIX + "down_proj.weight"
-    expected = dict(namespace["_quantize_param"](None, name, weight, None))
-    actual = dict(export.iter_quantized_state([(name, weight)], FP8))
-    assert actual.keys() == expected.keys()
-    for key in actual:
-        assert actual[key].dtype == expected[key].dtype
-        assert torch.equal(actual[key].view(torch.uint8), expected[key].view(torch.uint8))
 
 
 def state(value=1):
     return [
-        (PREFIX + role + ".weight", torch.full((16, 32), value, dtype=torch.bfloat16))
+        (PREFIX + role + ".weight", torch.full((128, 256), value, dtype=torch.bfloat16))
         for role in ("up_proj", "gate_proj", "down_proj")
     ]
 
@@ -56,17 +35,19 @@ def test_fp8_repeated_changed_restored_and_high_precision_head():
         assert result["lm_head.weight"] is head
         for name, original in inputs[:-1]:
             weight = result[name]
-            scale = result[name.replace(".weight", ".weight_scale")]
+            scale = result[name.replace(".weight", ".weight_scale_inv")]
             assert weight.dtype == torch.float8_e4m3fn
             assert scale.dtype == torch.float32
-            torch.testing.assert_close(weight.float() * scale, original.float())
+            torch.testing.assert_close(
+                weight.float() * scale.repeat_interleave(128, 0).repeat_interleave(128, 1), original.float()
+            )
             assert torch.equal(original, torch.full_like(original, value))
         receipts.append({name: value.view(torch.uint8).clone() for name, value in result.items()})
     for name in receipts[0]:
         assert torch.equal(receipts[0][name], receipts[1][name])
         assert torch.equal(receipts[0][name], receipts[3][name])
     assert not torch.equal(
-        receipts[0][PREFIX + "gate_proj.weight_scale"], receipts[2][PREFIX + "gate_proj.weight_scale"]
+        receipts[0][PREFIX + "gate_proj.weight_scale_inv"], receipts[2][PREFIX + "gate_proj.weight_scale_inv"]
     )
 
 
@@ -96,7 +77,7 @@ def test_nvfp4_pairs_before_bucketing_and_preserves_scale_types(monkeypatch):
 
 @pytest.mark.parametrize("names", [("up_proj",), ("up_proj", "down_proj"), ("up_proj", "up_proj")])
 def test_incomplete_interleaved_duplicate_pairs_fail(names):
-    weights = [(PREFIX + name + ".weight", torch.ones(16, 32)) for name in names]
+    weights = [(PREFIX + name + ".weight", torch.ones(128, 256)) for name in names]
     with pytest.raises(ValueError, match="pair|Duplicate"):
         # Missing/interleaved pairs fail before reaching any CUDA quantizer.
         list(export.iter_quantized_state(weights, NVFP4))
@@ -106,7 +87,7 @@ def test_incomplete_interleaved_duplicate_pairs_fail(names):
     "config",
     [
         {"quant_method": "fp8", "activation_scheme": "static"},
-        {**FP8, "weight_block_size": [128, 128]},
+        {**FP8, "weight_block_size": None},
         {"quant_method": "mxfp8"},
     ],
 )
@@ -133,6 +114,7 @@ def test_resolve_uses_effective_updated_checkpoint_and_rejects_online(monkeypatc
     monkeypatch.setattr(quantization.PretrainedConfig, "get_config_dict", descriptor)
     args = SimpleNamespace(
         hf_checkpoint="trainer",
+        sglang_moe_runner_backend="triton",
         olmo_core=SimpleNamespace(stream_moe_export=True, expert_publication="per_expert"),
     )
     assert quantization.resolve(args, deployment=deployment) == FP8
@@ -142,14 +124,12 @@ def test_resolve_uses_effective_updated_checkpoint_and_rejects_online(monkeypatc
         quantization.resolve(args, deployment=deployment)
 
 
-def resolve_case(monkeypatch, configs, *, selection=None, options=None):
+def resolve_case(monkeypatch, configs, *, selection=None, options=None, backend="triton"):
     groups = [
         SimpleNamespace(worker_type="regular", overrides={"model_path": str(i), "kv_cache_dtype": "fp8"})
         for i in range(len(configs))
     ]
-    deployment = SimpleNamespace(
-        models=[SimpleNamespace(update_weights=True, model_path="base", server_groups=groups)]
-    )
+    deployment = SimpleNamespace(models=[SimpleNamespace(update_weights=True, model_path="base", server_groups=groups)])
     monkeypatch.setattr(
         quantization.PretrainedConfig,
         "get_config_dict",
@@ -157,7 +137,12 @@ def resolve_case(monkeypatch, configs, *, selection=None, options=None):
     )
     core = dict(stream_moe_export=True, expert_publication="per_expert", weight_sync_mode="flattened")
     core.update(options or {})
-    args = SimpleNamespace(hf_checkpoint="base", sglang_quantization=selection, olmo_core=SimpleNamespace(**core))
+    args = SimpleNamespace(
+        sglang_moe_runner_backend=backend,
+        hf_checkpoint="base",
+        sglang_quantization=selection,
+        olmo_core=SimpleNamespace(**core),
+    )
     return quantization.resolve(args, deployment=deployment)
 
 
@@ -193,8 +178,8 @@ def test_no_updated_engines_needs_no_export_config(monkeypatch):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_zero_weights_have_finite_positive_scale(dtype):
-    result = dict(export.iter_quantized_state([(PREFIX + "down_proj.weight", torch.zeros(16, 32, dtype=dtype))], FP8))
-    assert result[PREFIX + "down_proj.weight_scale"].item() > 0
+    result = dict(export.iter_quantized_state([(PREFIX + "down_proj.weight", torch.zeros(128, 256, dtype=dtype))], FP8))
+    assert (result[PREFIX + "down_proj.weight_scale_inv"] > 0).all()
     assert torch.isfinite(result[PREFIX + "down_proj.weight"].float()).all()
 
 
@@ -232,7 +217,7 @@ def test_serialized_checkpoint_matches_publication_and_keeps_input(tmp_path):
     weights = dict(state(2))
     weights["lm_head.weight"] = torch.randn(8, 16)
     safetensors.torch.save_file(weights, source / "model.safetensors")
-    convert(source, destination, fmt="fp8", device="cpu", shard_bytes=520)
+    convert(source, destination, fmt="fp8", device="cpu", shard_bytes=40000)
     config = json.loads((destination / "config.json").read_text())
     index = json.loads((destination / "model.safetensors.index.json").read_text())
     restored = {}
@@ -252,8 +237,45 @@ def test_failed_conversion_never_exposes_partial_checkpoint(tmp_path):
     source, destination = tmp_path / "source", tmp_path / "bad"
     source.mkdir()
     (source / "config.json").write_text(json.dumps({"model_type": "olmo3moe"}))
-    safetensors.torch.save_file({PREFIX + "up_proj.weight": torch.ones(16, 32)}, source / "model.safetensors")
+    safetensors.torch.save_file({PREFIX + "up_proj.weight": torch.ones(128, 256)}, source / "model.safetensors")
     with pytest.raises(ValueError, match="Incomplete"):
         convert(source, destination, fmt="nvfp4", device="cpu")
     assert not destination.exists()
     assert not list(tmp_path.glob(".quantized-export-*"))
+
+
+@pytest.mark.parametrize("shape", [(127, 128), (128, 129)])
+def test_block_fp8_rejects_unaligned_expert_shapes(shape):
+    with pytest.raises(ValueError, match="divisible by 128"):
+        list(export.iter_quantized_state([(PREFIX + "down_proj.weight", torch.ones(shape))], FP8))
+
+
+def test_block_fp8_uses_independent_scales():
+    weight = torch.ones(256, 256)
+    weight[:128, 128:] = 2
+    weight[128:, :128] = 4
+    weight[128:, 128:] = 8
+    result = dict(export.iter_quantized_state([(PREFIX + "down_proj.weight", weight)], FP8))
+    scale = result[PREFIX + "down_proj.weight_scale_inv"]
+    torch.testing.assert_close(scale, torch.tensor([[1, 2], [4, 8]]) / 448)
+    reconstructed = result[PREFIX + "down_proj.weight"].float() * scale.repeat_interleave(128, 0).repeat_interleave(
+        128, 1
+    )
+    torch.testing.assert_close(reconstructed, weight)
+
+
+@pytest.mark.parametrize("block", [None, [64, 128], [128, 64]])
+def test_runtime_rejects_non_block128_fp8(monkeypatch, block):
+    with pytest.raises(ValueError, match="128x128"):
+        resolve_case(monkeypatch, [{**FP8, "weight_block_size": block}])
+
+
+def test_runtime_rejects_packed_scale_recipe(monkeypatch):
+    with pytest.raises(ValueError, match="FP32 scales"):
+        resolve_case(monkeypatch, [{**FP8, "scale_fmt": "ue8m0"}])
+
+
+@pytest.mark.parametrize("backend", [None, "auto", "deep_gemm", "flashinfer_trtllm"])
+def test_runtime_rejects_unqualified_fp8_repacking(monkeypatch, backend):
+    with pytest.raises(ValueError, match="explicit moe_runner_backend=triton"):
+        resolve_case(monkeypatch, [FP8], backend=backend)

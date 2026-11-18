@@ -27,15 +27,19 @@ def resolve(args, *, deployment=None):
             if config is None:
                 if selection is not None:
                     raise ValueError(
-                        "Weight quantization requires a matching serialized rollout checkpoint; "
-                        "convert it first with tools/convert_core_hf_quantized.py. "
-                        "KV-cache-only quantization should use kv_cache_dtype instead."
+                        "Weight quantization requires a matching serialized rollout checkpoint; convert it first with tools/convert_core_hf_quantized.py. KV-cache-only quantization should use kv_cache_dtype instead."
                     )
                 configs.append(None)
                 continue
             if descriptor.get("model_type") != "olmo3moe" or not isinstance(config, dict):
                 raise ValueError("Core quantized export requires an Olmo MoE serialized quantized rollout checkpoint")
             fmt = export_format(config)
+            if (
+                fmt == "fp8"
+                and group.overrides.get("moe_runner_backend", getattr(args, "sglang_moe_runner_backend", None))
+                != "triton"
+            ):
+                raise ValueError("Core block FP8 refresh requires explicit moe_runner_backend=triton")
             expected = "fp8" if fmt == "fp8" else "modelopt_fp4"
             if selection not in (None, expected):
                 raise ValueError(f"Rollout quantization override {selection!r} conflicts with {expected}")

@@ -8,7 +8,7 @@ import re
 
 import torch
 
-from miles.backends.core_utils.fp8_export import quantize_per_tensor
+from miles.backends.core_utils.fp8_export import quantize_blockwise
 from miles.utils import nvfp4
 
 _EXPERT = re.compile(r"model\.layers\.\d+\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight$")
@@ -16,10 +16,12 @@ _EXPERT = re.compile(r"model\.layers\.\d+\.mlp\.experts\.\d+\.(gate_proj|up_proj
 
 def export_format(config):
     if config.get("quant_method") == "fp8":
-        if config.get("activation_scheme") != "dynamic" or config.get("weight_block_size") is not None:
-            raise ValueError("Core FP8 export requires dynamic activations and per-tensor weight scaling")
+        if config.get("activation_scheme") != "dynamic" or config.get("weight_block_size") != [128, 128]:
+            raise ValueError("Core FP8 export requires dynamic activations and 128x128 block weight scaling")
         if config.get("fmt", "e4m3") != "e4m3":
             raise ValueError("Core FP8 export requires e4m3")
+        if config.get("scale_fmt", "float32") not in ("float32", "fp32"):
+            raise ValueError("Core block FP8 requires FP32 scales, not UE8M0")
         return "fp8"
     if config.get("quant_algo") == "NVFP4" and config.get("quant_method") == "modelopt":
         if config.get("group_size", 16) != 16 or config.get("config_groups"):
@@ -99,7 +101,9 @@ def iter_quantized_state(state, config):
         if fmt == "nvfp4" and weight.shape[1] % nvfp4.NVFP4_GROUP_SIZE:
             raise ValueError(f"NVFP4 requires K divisible by 16: {name}")
         if fmt == "fp8":
-            yield from _outputs(name, quantize_per_tensor(weight))
+            packed, scales = quantize_blockwise(weight)
+            yield name, packed
+            yield name.removesuffix(".weight") + ".weight_scale_inv", scales
         elif match[1] == "down_proj":
             yield from _outputs(name, nvfp4.nvfp4_quantize_1d(weight))
         elif pending is None:

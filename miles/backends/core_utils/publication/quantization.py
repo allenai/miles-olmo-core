@@ -8,15 +8,8 @@ from miles.backends.core_utils.quantized_export import export_format
 
 
 def resolve(args, *, deployment=None):
-    if not getattr(args.olmo_core, "quantized_export", False):
-        return None
-    if not args.olmo_core.stream_moe_export or args.olmo_core.expert_publication != "per_expert":
-        raise ValueError("core.quantized_export requires streaming per_expert publication")
-    if getattr(args.olmo_core, "weight_sync_mode", "flattened") != "flattened":
-        raise ValueError("core.quantized_export requires flattened byte transport")
     if deployment is None:
-        # SGLang's config resolver imports its CUDA runtime. Keep pure exporter
-        # and disabled-mode use available without that optional dependency.
+        # Defer the optional SGLang runtime dependency for pure exporter tests.
         from miles.backends.sglang_utils.sglang_config import resolve_sglang_config
 
         deployment = resolve_sglang_config(args)
@@ -30,14 +23,30 @@ def resolve(args, *, deployment=None):
             path = group.overrides.get("model_path", model.model_path or args.hf_checkpoint)
             descriptor, _ = PretrainedConfig.get_config_dict(path)
             config = descriptor.get("quantization_config")
+            selection = group.overrides.get("quantization", getattr(args, "sglang_quantization", None))
+            if config is None:
+                if selection is not None:
+                    raise ValueError(
+                        "Weight quantization requires a matching serialized rollout checkpoint; "
+                        "convert it first with tools/convert_core_hf_quantized.py. "
+                        "KV-cache-only quantization should use kv_cache_dtype instead."
+                    )
+                configs.append(None)
+                continue
             if descriptor.get("model_type") != "olmo3moe" or not isinstance(config, dict):
                 raise ValueError("Core quantized export requires an Olmo MoE serialized quantized rollout checkpoint")
             fmt = export_format(config)
-            selection = group.overrides.get("quantization", getattr(args, "sglang_quantization", None))
             expected = "fp8" if fmt == "fp8" else "modelopt_fp4"
             if selection not in (None, expected):
                 raise ValueError(f"Rollout quantization override {selection!r} conflicts with {expected}")
             configs.append(config)
-    if not configs or any(config != configs[0] for config in configs[1:]):
+    if not configs:
+        return None
+    if any(config != configs[0] for config in configs[1:]):
         raise ValueError("All updated rollout engines must use the same serialized quantization config")
+    if configs[0] is not None:
+        if not args.olmo_core.stream_moe_export or args.olmo_core.expert_publication != "per_expert":
+            raise ValueError("Quantized export requires streaming per_expert publication")
+        if getattr(args.olmo_core, "weight_sync_mode", "flattened") != "flattened":
+            raise ValueError("Quantized export requires flattened byte transport")
     return deepcopy(configs[0])

@@ -1,6 +1,6 @@
 # Core quantized weight export
 
-This opt-in path converts Core's ordinary per-expert HF export on the sender.
+This path automatically converts Core's ordinary per-expert HF export on the sender.
 It reuses MILES' existing NVFP4 quantizer unchanged. A small Core-local FP8
 helper follows Megatron's per-tensor recipe without changing Megatron files.
 Parity tests compare against the checkout's Megatron implementation; Core clamps
@@ -34,18 +34,21 @@ and explicitly set `update_weights: true` (different model paths otherwise
 default to frozen). Do not enable online quantization or application installers.
 Allow SGLang to infer quantization from the serialized checkpoint configuration.
 
-Open Instruct's Core configuration exposes:
+Export precision is inferred from the updated rollout checkpoints; no export flag
+is required. Quantized checkpoints require these publication settings:
 
 ```toml
 [core]
-quantized_export = true
 stream_moe_export = true
 expert_publication = "per_expert"
 weight_sync_mode = "flattened"
 ```
 
 The actor resolves the actual updated engines' checkpoint configs once at
-startup and rejects missing, heterogeneous or conflicting recipes. Both direct
+startup. BF16 checkpoints retain BF16 publication, including when KV-cache
+quantization is enabled. Weight-quantization overrides without a serialized
+quantized checkpoint, heterogeneous recipes, and conflicting overrides are
+rejected. Prepare a converted checkpoint before selecting FP8/NVFP4 weights. Both direct
 publication and engine-drain snapshots preserve packed weights, scales, dtypes,
 and actual byte counts. Ordinary HF evaluation exports remain unquantized.
 

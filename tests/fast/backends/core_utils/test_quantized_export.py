@@ -133,7 +133,7 @@ def test_resolve_uses_effective_updated_checkpoint_and_rejects_online(monkeypatc
     monkeypatch.setattr(quantization.PretrainedConfig, "get_config_dict", descriptor)
     args = SimpleNamespace(
         hf_checkpoint="trainer",
-        olmo_core=SimpleNamespace(quantized_export=True, stream_moe_export=True, expert_publication="per_expert"),
+        olmo_core=SimpleNamespace(stream_moe_export=True, expert_publication="per_expert"),
     )
     assert quantization.resolve(args, deployment=deployment) == FP8
     assert paths == ["serialized"]
@@ -142,8 +142,53 @@ def test_resolve_uses_effective_updated_checkpoint_and_rejects_online(monkeypatc
         quantization.resolve(args, deployment=deployment)
 
 
-def test_default_does_not_resolve_or_change_existing_runs():
-    assert quantization.resolve(SimpleNamespace(olmo_core=SimpleNamespace())) is None
+def resolve_case(monkeypatch, configs, *, selection=None, options=None):
+    groups = [
+        SimpleNamespace(worker_type="regular", overrides={"model_path": str(i), "kv_cache_dtype": "fp8"})
+        for i in range(len(configs))
+    ]
+    deployment = SimpleNamespace(
+        models=[SimpleNamespace(update_weights=True, model_path="base", server_groups=groups)]
+    )
+    monkeypatch.setattr(
+        quantization.PretrainedConfig,
+        "get_config_dict",
+        lambda path: ({"model_type": "olmo3moe", "quantization_config": configs[int(path)]}, {}),
+    )
+    core = dict(stream_moe_export=True, expert_publication="per_expert", weight_sync_mode="flattened")
+    core.update(options or {})
+    args = SimpleNamespace(hf_checkpoint="base", sglang_quantization=selection, olmo_core=SimpleNamespace(**core))
+    return quantization.resolve(args, deployment=deployment)
+
+
+@pytest.mark.parametrize("config", [FP8, NVFP4, None])
+def test_infers_export_from_checkpoint_and_ignores_kv_dtype(monkeypatch, config):
+    assert resolve_case(monkeypatch, [config]) == config
+
+
+@pytest.mark.parametrize("selection", ["fp8", "nvfp4_online", "modelopt_fp4"])
+def test_weight_quantization_without_serialized_checkpoint_rejected(monkeypatch, selection):
+    with pytest.raises(ValueError, match="convert it first"):
+        resolve_case(monkeypatch, [None], selection=selection)
+
+
+@pytest.mark.parametrize("configs", [[None, FP8], [NVFP4, FP8]])
+def test_mixed_receiver_recipes_rejected(monkeypatch, configs):
+    with pytest.raises(ValueError, match="same serialized"):
+        resolve_case(monkeypatch, configs)
+
+
+@pytest.mark.parametrize(
+    "options", [{"expert_publication": "fused"}, {"stream_moe_export": False}, {"weight_sync_mode": "per_tensor"}]
+)
+def test_quantized_layout_restrictions_do_not_apply_to_bf16(monkeypatch, options):
+    assert resolve_case(monkeypatch, [None], options=options) is None
+    with pytest.raises(ValueError, match="Quantized export requires"):
+        resolve_case(monkeypatch, [FP8], options=options)
+
+
+def test_no_updated_engines_needs_no_export_config(monkeypatch):
+    assert resolve_case(monkeypatch, []) is None
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])

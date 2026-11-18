@@ -22,6 +22,8 @@ def validate_options(args):
         raise ValueError("Core Ulysses does not support expert-balanced packing or forced exits")
     if args.loss_type != "policy_loss" or args.advantage_estimator != "grpo":
         raise ValueError("Core Ulysses currently supports the GRPO policy loss")
+    if getattr(args, "custom_loss_function_path", None) or getattr(args, "normalize_advantages", False):
+        raise ValueError("Core Ulysses does not yet qualify custom loss overrides or advantage whitening")
     if options.router_aux_loss_weight or options.router_z_loss_weight:
         raise ValueError("Core Ulysses qualification requires zero router auxiliary losses")
     # Core emits contiguous token shards. MILES' existing allgather_cp path

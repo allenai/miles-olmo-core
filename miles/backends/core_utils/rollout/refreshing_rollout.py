@@ -30,6 +30,7 @@ from miles.rollout.generate_utils.generate_endpoint_utils import (
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
 from miles.utils import logger_utils
 from miles.utils.http_utils import post
+from miles.utils.types import Sample
 
 logger = logger_utils.setup_logger(__name__)
 
@@ -44,7 +45,11 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
 
     def __init__(self, input):
         super().__init__(input)
-        self.state.generate_function = self._generate_response
+        self._agentic = self.args.custom_generate_function_path == (
+            "miles.rollout.generate_hub.agentic_tool_call.generate"
+        )
+        self._agent_generate = self.state.generate_function if self._agentic else None
+        self.state.generate_function = self._generate_agent if self._agentic else self._generate_response
         self._generation_admission = GenerationAdmission(
             self.args.sglang_server_concurrency * self.args.rollout_num_gpus // self.args.rollout_num_gpus_per_engine
         )
@@ -88,7 +93,11 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
 
     async def _generate_group(self, prompt_group):
         if any(s.generate_function_path or s.response_length or s.multimodal_inputs for s in prompt_group):
-            raise ValueError("Policy refresh supports fresh, single-turn text requests without custom generators")
+            raise ValueError("Policy refresh requires fresh text prompts without per-sample generator overrides")
+        if getattr(self, "_agentic", False):
+            if any(not isinstance(s.prompt, list) for s in prompt_group):
+                raise ValueError("Agent refresh requires unrendered message lists")
+            return await super()._generate_group(prompt_group)
         observed = getattr(self.args.olmo_core, "pipeline_observation_interval", 0) > 0
         records = sibling_timing.start_group(prompt_group) if observed else None
         outcome = "completed"
@@ -117,6 +126,19 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
                     # with diagnostic-admission cancellation in retry accounting.
                     if failure is None:
                         raise
+
+    async def _generate_agent(self, input):
+        # Native admission wraps the entire episode, including tools and sample
+        # collection. Ordinary publication never closes this gate. Eval/export
+        # closes it and lets active episodes finish before reusing the engines.
+        output = await self._agent_generate(input)
+        samples = output.samples if isinstance(output.samples, list) else [output.samples]
+        if len(samples) != 1:
+            raise ValueError("Core agent refresh requires one linear trajectory per episode; branching is unsupported")
+        sample = samples[0]
+        if sample.status != Sample.Status.ABORTED:
+            policy_refresh.record_trajectory(sample)
+        return GenerateFnOutput(samples=sample)
 
     async def _generate_response(self, input):
         sibling_timing.admitted(input.sample)
@@ -303,7 +325,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         # Queued training tasks retain their own generator/state. Evaluation
         # gets independent admission while the training gate remains closed.
         state = copy.copy(self.state)
-        state.generate_function = single_turn_generate
+        state.generate_function = self._generate_agent if getattr(self, "_agentic", False) else single_turn_generate
         state.generate_fn_semaphore = GenerationAdmission(self._generation_admission.capacity)
         try:
             results = await run_eval_datasets(state, self._eval_prompt_dataset_cache)

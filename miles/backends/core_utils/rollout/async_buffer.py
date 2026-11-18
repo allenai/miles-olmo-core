@@ -176,14 +176,20 @@ class RefreshPolicyDataBuffer(HomogeneousPolicyDataBuffer):
     async def put(self, item):  # ty: ignore[invalid-method-override]
         samples = list(iter_samples(item.group))
         if len(item.group) != self._samples or len(samples) != self._samples:
-            raise ValueError("Policy refresh requires complete single-turn prompt groups")
+            raise ValueError("Policy refresh requires one complete trajectory per prompt sample")
         if len({sample.group_index for sample in samples}) != 1:
             raise ValueError("Policy refresh cannot combine unrelated prompt groups")
+        # Aborted episodes may have no model calls or provenance. Let the native
+        # buffer apply its abort/drop/retry policy before validating trainable data.
+        if any(s.status == Sample.Status.ABORTED for s in samples):
+            return await self._delegate.put(item)
         policy_refresh.validate_batch(
             {
                 "metadata": [s.train_metadata for s in samples],
                 "response_lengths": [s.response_length for s in samples],
                 "weight_versions": [s.weight_versions for s in samples],
+                "loss_masks": [s.loss_mask for s in samples],
+                "total_lengths": [len(s.tokens) for s in samples],
             }
         )
         return await self._delegate.put(item)

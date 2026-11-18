@@ -426,6 +426,18 @@ class Qwen3TITOTokenizer(TITOTokenizer):
 # contracts layered on that token boundary.
 
 
+class Olmo35TITOTokenizer(Qwen3TITOTokenizer):
+    """Olmo 3.5 retains thinking in its native template and uses XML tools.
+
+    Tool turns end at im_end without its rendered newline, as in Qwen3.
+    Keep the checkpoint's Olmo template: Qwen templates change system text,
+    tool observations, thinking whitespace and assistant termination.
+    """
+
+    tool_call_parser = "qwen3_coder"
+    FIXED_TEMPLATE = FixedTemplate(allowed_append_roles=frozenset({"tool", "user"}))
+
+
 class Qwen35TITOTokenizer(Qwen3TITOTokenizer):
     """Qwen3.5 template and Qwen3 token boundary."""
 
@@ -982,6 +994,7 @@ class InklingTITOTokenizer(TITOTokenizer):
 
 class TITOTokenizerType(StrEnum):
     DEFAULT = "default"
+    OLMO35 = "olmo35"
     QWEN3 = "qwen3"
     QWEN35 = "qwen35"
     QWEN36 = "qwen36"
@@ -1005,6 +1018,8 @@ class TITOTokenizerType(StrEnum):
         match t:
             case cls.DEFAULT:
                 return TITOTokenizer
+            case cls.OLMO35:
+                return Olmo35TITOTokenizer
             case cls.QWEN3:
                 return Qwen3TITOTokenizer
             case cls.QWEN35:

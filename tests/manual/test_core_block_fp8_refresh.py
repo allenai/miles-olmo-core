@@ -97,6 +97,7 @@ def _fixture(root):
         result = original(profile, tokenizer, max_position_embeddings)
         result.update(
             model_type="olmo3moe",
+            auto_map={"AutoConfig": "configuration_olmo3moe.Olmo3MoeConfig"},
             hidden_size=256,
             attention_hidden_size=256,
             head_dim=128,
@@ -113,6 +114,9 @@ def _fixture(root):
     builder._config = config  # Test fixture dimensions only; no serving/runtime patch.
     source = root / "source"
     builder.build_checkpoint(source, profile="hybrid-moe", max_position_embeddings=512)
+    (source / "configuration_olmo3moe.py").write_text(
+        'from transformers import PretrainedConfig\nclass Olmo3MoeConfig(PretrainedConfig):\n    model_type = "olmo3moe"\n'
+    )
     weights = safetensors.torch.load_file(source / "model.safetensors")
     packed = root / "serialized"
     convert(source, packed, fmt="fp8", device="cuda", shard_bytes=131072)

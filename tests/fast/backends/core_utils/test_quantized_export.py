@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import safetensors.torch
 import torch
+from transformers import AutoConfig
 
 from miles.backends.core_utils import quantized_export as export
 from miles.backends.core_utils.publication import quantization, tensors
@@ -213,7 +214,12 @@ def test_mixed_dtype_bucket_alignment_and_byte_limit():
 def test_serialized_checkpoint_matches_publication_and_keeps_input(tmp_path):
     source, destination = tmp_path / "source", tmp_path / "fp8"
     source.mkdir()
-    (source / "config.json").write_text(json.dumps({"model_type": "olmo3moe"}))
+    (source / "config.json").write_text(
+        json.dumps({"model_type": "olmo3moe", "auto_map": {"AutoConfig": "configuration_olmo3moe.Olmo3MoeConfig"}})
+    )
+    (source / "configuration_olmo3moe.py").write_text(
+        'from transformers import PretrainedConfig\nclass Olmo3MoeConfig(PretrainedConfig):\n    model_type = "olmo3moe"\n'
+    )
     weights = dict(state(2))
     weights["lm_head.weight"] = torch.randn(8, 16)
     safetensors.torch.save_file(weights, source / "model.safetensors")
@@ -224,11 +230,18 @@ def test_serialized_checkpoint_matches_publication_and_keeps_input(tmp_path):
     for filename in set(index["weight_map"].values()):
         restored.update(safetensors.torch.load_file(destination / filename))
     expected = dict(export.iter_quantized_state(sorted(weights.items()), config["quantization_config"]))
+    assert (
+        AutoConfig.from_pretrained(destination, trust_remote_code=True).quantization_config
+        == config["quantization_config"]
+    )
     assert restored.keys() == expected.keys()
     assert index["metadata"]["total_size"] == sum(t.nbytes for t in expected.values())
     for name in expected:
         assert torch.equal(restored[name].view(torch.uint8), expected[name].view(torch.uint8))
     assert "quantization_config" not in json.loads((source / "config.json").read_text())
+    assert (destination / "configuration_olmo3moe.py").read_bytes() == (
+        source / "configuration_olmo3moe.py"
+    ).read_bytes()
     with pytest.raises(FileExistsError):
         convert(source, destination, fmt="fp8", device="cpu")
 

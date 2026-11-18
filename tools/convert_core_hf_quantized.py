@@ -106,6 +106,7 @@ def convert(source, destination, *, fmt, device="cuda", shard_bytes=256 * 1024**
         for path in source.iterdir():
             if path.is_file() and (
                 path.name.startswith("tokenizer")
+                or path.suffix == ".py"
                 or path.name
                 in (
                     "generation_config.json",

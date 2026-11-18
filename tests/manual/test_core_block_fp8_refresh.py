@@ -217,6 +217,11 @@ def test_olmo_serialized_refresh_with_kv(kv_dtype):
                 for (ids, scores), (expected_ids, expected_scores) in zip(actual, initial, strict=True):
                     assert ids == expected_ids
                     torch.testing.assert_close(torch.tensor(scores), torch.tensor(expected_scores), rtol=0, atol=1e-5)
+            if changed:
+                assert any(
+                    not torch.allclose(torch.tensor(scores), torch.tensor(old_scores), rtol=0, atol=1e-5)
+                    for (_, scores), (_, old_scores) in zip(actual, initial, strict=True)
+                ), "Changed expert weights must change observed scores"
             receipts.append({"changed": changed, "outputs": actual})
     finally:
         engine.shutdown()

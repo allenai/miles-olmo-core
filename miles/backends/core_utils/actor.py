@@ -191,7 +191,9 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         # Agree on local shape/finite-value failures before entering tensor collectives.
         sums, maximum = self._agree(
             lambda: contract.scoring_check(
-                rollout["log_probs"], training_scores, context_parallel.local_masks(rollout)
+                rollout["log_probs"],
+                training_scores,
+                context_parallel.local_masks(rollout, getattr(self.args, "context_parallel_size", 1)),
             )
         )
         dist.all_reduce(sums)
@@ -235,7 +237,9 @@ class OLMoCoreTrainRayActor(TrainRayActor):
 
     def _batch_steps(self, rollout):
         samples = self._agree(lambda: data.sample_batches(rollout, self.args.olmo_core.max_sequence_length))
-        local_batch = self.args.global_batch_size // context_parallel.data_parallel_size()
+        local_batch = self.args.global_batch_size // context_parallel.data_parallel_size(
+            getattr(self.args, "context_parallel_size", 1)
+        )
         self._agree(lambda: self._validate_step_batches(samples, local_batch))
         contract.validate_batch_schedule(len(samples), local_batch, samples[0]["tokens"].device)
         steps = [samples[i : i + local_batch] for i in range(0, len(samples), local_batch)]
@@ -250,7 +254,10 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             result.append(
                 self._agree(
                     lambda step=step, plan=plan, count=int(count): [
-                        packing.combine(step, indices) for indices in packing.equalize(plan, count)
+                        context_parallel.prepare_pack(
+                            packing.combine(step, indices), getattr(self.args, "context_parallel_size", 1)
+                        )
+                        for indices in packing.equalize(plan, count)
                     ]
                 )
             )
@@ -284,7 +291,9 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             steps = self._batch_steps(rollout)
             prepared_at = time.perf_counter()
             batches = [batch for step in steps for batch in step]
-            local_batch = self.args.global_batch_size // context_parallel.data_parallel_size()
+            local_batch = self.args.global_batch_size // context_parallel.data_parallel_size(
+                getattr(self.args, "context_parallel_size", 1)
+            )
             if self.args.use_rollout_routing_replay:
                 self._agree(lambda: self._validate_replay_batches(batches))
             if self.args.olmo_core.publication_mode == "refresh":

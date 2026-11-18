@@ -68,11 +68,21 @@ def degree():
     return parallel.get_parallel_state().cp.size
 
 
-def data_parallel_size():
-    return parallel.get_parallel_state().effective_dp.size
+def data_parallel_size(cp_size=1):
+    return dist.get_world_size() // cp_size
 
 
-def local_masks(batch):
+def prepare_pack(batch, cp_size=1):
+    if cp_size == 1 or "doc_lens" not in batch:
+        return batch
+    # Core's CP balancer requires host document metadata. Construct it from
+    # lengths already owned by the pack, without synchronizing CUDA each forward.
+    return batch | {"doc_lens": torch.tensor([batch["total_lengths"]], dtype=torch.int32)}
+
+
+def local_masks(batch, cp_size=1):
+    if cp_size == 1:
+        return batch["loss_masks"]
     return response_cp.get_local_response_loss_masks(
         batch["total_lengths"], batch["response_lengths"], batch["loss_masks"]
     )

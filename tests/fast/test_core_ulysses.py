@@ -75,3 +75,20 @@ def test_cp1_diagnostics_preserve_identity(monkeypatch):
     )
     batch = {"tokens": torch.arange(4)}
     assert context_parallel.diagnostic_view(batch) is batch
+
+
+def test_cp1_batch_and_scoring_helpers_preserve_pre_forward_validation(monkeypatch):
+    monkeypatch.setattr(parallel, "_parallel_state", None)
+    monkeypatch.setattr(context_parallel.dist, "get_world_size", lambda: 4)
+    assert context_parallel.data_parallel_size() == 4
+    assert context_parallel.data_parallel_size(2) == 2
+    batch = {"loss_masks": [torch.ones(3)]}
+    assert context_parallel.local_masks(batch) is batch["loss_masks"]
+
+
+def test_cp_pack_builds_host_metadata_without_reading_device_values():
+    batch = {"doc_lens": torch.empty((1, 2), dtype=torch.int32, device="meta"), "total_lengths": [7, 12]}
+    assert context_parallel.prepare_pack(batch) is batch
+    prepared = context_parallel.prepare_pack(batch, 2)
+    assert prepared["doc_lens"].device.type == "cpu"
+    torch.testing.assert_close(prepared["doc_lens"], torch.tensor([[7, 12]], dtype=torch.int32))

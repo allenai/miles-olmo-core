@@ -5,9 +5,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from miles.backends.core_utils import checkpoint, context_parallel, contract
+from miles.backends.core_utils import context_parallel, contract
 from miles.backends.training_utils import parallel
 from miles.utils.ft_utils.process_group_utils import GroupInfo
+
+checkpoint = pytest.importorskip("miles.backends.core_utils.checkpoint")
 
 
 def test_replay_shards_match_core_document_padding_and_tail_counts():

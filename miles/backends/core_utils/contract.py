@@ -26,7 +26,7 @@ class StepNormalization:
         return loss * self.world_size / self.token_denominator
 
 
-def step_normalization(batches, global_batch_size):
+def step_normalization(batches, global_batch_size, *, cp_size=1):
     """Match MILES' clamped per-sample token denominator and Core rank averaging."""
     masks = [mask for batch in batches for mask in batch["loss_masks"]]
     counts = torch.tensor(
@@ -40,7 +40,9 @@ def step_normalization(batches, global_batch_size):
         dtype=torch.int64,
     )
     dist.all_reduce(counts)
-    samples, active, denominator, model_tokens = counts.tolist()
+    if any(int(value) % cp_size for value in counts):
+        raise ValueError("CP-shared batch counts are inconsistent")
+    samples, active, denominator, model_tokens = (counts // cp_size).tolist()
     if samples != global_batch_size or active == 0 or model_tokens < active:
         raise ValueError(f"Invalid optimizer batch counts: {counts.tolist()}, expected {global_batch_size} samples")
     return StepNormalization(samples, active, denominator, model_tokens, dist.get_world_size())
@@ -163,9 +165,7 @@ def validate_scoring_check(sums, maximum, tolerance):
     }
     if mean_abs > tolerance:
         raise ValueError(
-            f"Standalone scoring differs from the training forward: mean_abs {mean_abs:.6g} "
-            f"exceeds tolerance {tolerance:.6g} "
-            f"(max_abs {float(maximum):.6g}; active_tokens {tokens})"
+            f"Standalone scoring differs from the training forward: mean_abs {mean_abs:.6g} exceeds tolerance {tolerance:.6g} (max_abs {float(maximum):.6g}; active_tokens {tokens})"
         )
     return report
 

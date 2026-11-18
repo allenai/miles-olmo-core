@@ -57,6 +57,7 @@ def save(actor, rollout_id):
                 "schema_version": 2,
                 "world_size": dist.get_world_size(),
                 "expert_parallel_size": actor.args.olmo_core.expert_parallel_size,
+                "context_parallel_size": getattr(actor.args, "context_parallel_size", 1),
                 "clock": actor.clock.as_dict(),
                 "model_config": actor.model_config.as_config_dict(),
                 "hf_config": actor.hf_config.to_dict(),
@@ -143,7 +144,7 @@ def resume_manifest(root):
     return path, manifest
 
 
-def validate_topology(manifest, world_size, expert_parallel_size):
+def validate_topology(manifest, world_size, expert_parallel_size, context_parallel_size=1):
     """Reject ambiguous legacy topology and all unimplemented resharding."""
     schema = manifest.get("schema_version")
     saved_world = manifest.get("world_size")
@@ -154,28 +155,33 @@ def validate_topology(manifest, world_size, expert_parallel_size):
     if schema == 1:
         if saved_world != 1:
             raise ValueError(
-                "Legacy schema-1 multi-rank checkpoints do not record expert_parallel_size. "
-                "Verify the original launch configuration and explicitly migrate the manifest "
-                "to schema 2 with its saved expert_parallel_size; automatic inference is disabled."
+                "Legacy schema-1 multi-rank checkpoints do not record expert_parallel_size. Verify the original launch configuration and explicitly migrate the manifest to schema 2 with its saved expert_parallel_size; automatic inference is disabled."
             )
         saved_ep = 1
     else:
         saved_ep = manifest.get("expert_parallel_size")
         if type(saved_ep) is not int or saved_ep < 1 or saved_world % saved_ep:
             raise ValueError("Invalid or missing saved expert_parallel_size in schema-2 checkpoint")
+    saved_cp = manifest.get("context_parallel_size", 1)
+    if type(saved_cp) is not int or saved_cp < 1 or saved_world % saved_cp:
+        raise ValueError("Invalid saved context_parallel_size")
+    if saved_cp != context_parallel_size:
+        raise ValueError("Core RL resume requires the saved context_parallel_size")
     if (saved_world, saved_ep) != (world_size, expert_parallel_size):
         raise ValueError(
-            "Core RL resume requires the saved trainer topology: "
-            f"saved world_size={saved_world}, expert_parallel_size={saved_ep}; "
-            f"requested world_size={world_size}, expert_parallel_size={expert_parallel_size}. "
-            "Changing trainer topology during resume is not implemented."
+            f"Core RL resume requires the saved trainer topology: saved world_size={saved_world}, expert_parallel_size={saved_ep}; requested world_size={world_size}, expert_parallel_size={expert_parallel_size}. Changing trainer topology during resume is not implemented."
         )
 
 
 def _restore_preflight(actor):
     # Read and validate rank-local state before any native checkpoint collective.
     path, manifest = resume_manifest(actor.args.load)
-    validate_topology(manifest, dist.get_world_size(), actor.args.olmo_core.expert_parallel_size)
+    validate_topology(
+        manifest,
+        dist.get_world_size(),
+        actor.args.olmo_core.expert_parallel_size,
+        getattr(actor.args, "context_parallel_size", 1),
+    )
     if comparable_model_config(manifest["model_config"]) != comparable_model_config(
         actor.model_config.as_config_dict()
     ):
@@ -201,8 +207,7 @@ def restore(actor):
     actor._observed_response_tokens = state.get("consumed_response_tokens")
     if actor._observed_response_tokens is None:
         logger.warning(
-            "Checkpoint has no cumulative response-token count; omitting run_consumed_response_tokens "
-            "because the pre-resume total is unknown"
+            "Checkpoint has no cumulative response-token count; omitting run_consumed_response_tokens because the pre-resume total is unknown"
         )
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])

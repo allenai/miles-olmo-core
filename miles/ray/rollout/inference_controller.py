@@ -39,9 +39,12 @@ logger = logging.getLogger(__name__)
 
 TICK_INTERVAL_SECONDS = 5.0
 CELL_TICK_TIMEOUT_SECONDS = 120.0
-# Large checkpoints can take minutes to snapshot to host memory, particularly
-# when several engines share a node. Keep serving-cell probes on the short bound.
-CELL_INITIALIZATION_TICK_TIMEOUT_SECONDS = 600.0
+# Small startup with 23 rollout engines exceeded the 120-second snapshot/reset
+# deadline. Larger model snapshots copy more data to host memory; engines sharing
+# a node likely contend for transfer bandwidth. Allow five minutes for startup
+# while retaining the shorter serving-probe bound. This is a budget, not a measured
+# completion time, and the controller lock remains held until these ticks settle.
+CELL_INITIALIZATION_TICK_TIMEOUT_SECONDS = 300.0
 CELLS_READY_POLL_INTERVAL_SECONDS = 2.0
 CELLS_READY_TIMEOUT_SECONDS = 3600.0
 

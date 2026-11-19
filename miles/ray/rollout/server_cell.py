@@ -1,3 +1,4 @@
+import asyncio
 import dataclasses
 import logging
 import time
@@ -68,6 +69,7 @@ class ServerCell:
     _router_health_next: float = dataclasses.field(default=0.0, init=False)
     _env_reporter: EngineEnvReporter = dataclasses.field(init=False)
     _startup_weights_snapshotted: bool = dataclasses.field(default=False, init=False)
+    _startup_snapshot_task: asyncio.Task[Any] | None = dataclasses.field(default=None, init=False)
     _state: CellState = dataclasses.field(default_factory=StateUninitialized)
 
     def __post_init__(self) -> None:
@@ -224,8 +226,25 @@ class ServerCell:
         if not await probe_server_healthy(server_url=addr_info.server_url, api_key=self.meta.sglang_api_key):
             return
 
-        if self.args.check_weight_update_equal and self.meta.update_weights and not self._startup_weights_snapshotted:
-            await self.check_weights(action="snapshot", allow_quant_error=False, selector="all", skip_list=None)
+        serve_without_weight_update: bool = not self.meta.update_weights or self.args.debug_rollout_only
+        if (
+            self.args.check_weight_update_equal
+            and not serve_without_weight_update
+            and not self._startup_weights_snapshotted
+        ):
+            if self._startup_snapshot_task is None or self._startup_snapshot_task.cancelled():
+                self._startup_snapshot_task = asyncio.create_task(
+                    self.check_weights(action="snapshot", allow_quant_error=False, selector="all", skip_list=None)
+                )
+            # A tick timeout must not start another full host copy while this RPC
+            # is still running. Rejoin its reply on the next tick instead.
+            try:
+                await asyncio.shield(self._startup_snapshot_task)
+            except Exception:
+                # A completed failed RPC is retryable before any reset. Caller
+                # cancellation leaves the in-flight task intact instead.
+                self._startup_snapshot_task = None
+                raise
             # Reset can finish on the engine even if its HTTP waiter is cancelled.
             # Preserve the original HF reference across a retried initialization;
             # taking another snapshot would capture the randomized live weights.
@@ -236,7 +255,6 @@ class ServerCell:
             await api_client.release_memory_occupation()
             await api_client.resume_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 
-        serve_without_weight_update: bool = not self.meta.update_weights or self.args.debug_rollout_only
         if not serve_without_weight_update and self.args.check_weight_update_equal:
             await self.check_weights(
                 action="reset_tensors",
@@ -285,6 +303,9 @@ class ServerCell:
 
     async def dispose(self) -> None:
         self._health_checker.stop()
+        if self._startup_snapshot_task is not None:
+            self._startup_snapshot_task.cancel()
+            await asyncio.gather(self._startup_snapshot_task, return_exceptions=True)
 
         if self._rust_membership is not None:
             # Also settle pending registration after cancellation/failure. A

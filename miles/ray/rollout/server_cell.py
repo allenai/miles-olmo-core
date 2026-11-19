@@ -67,6 +67,7 @@ class ServerCell:
     _router_quarantining: bool = dataclasses.field(default=False, init=False)
     _router_health_next: float = dataclasses.field(default=0.0, init=False)
     _env_reporter: EngineEnvReporter = dataclasses.field(init=False)
+    _startup_weights_snapshotted: bool = dataclasses.field(default=False, init=False)
     _state: CellState = dataclasses.field(default_factory=StateUninitialized)
 
     def __post_init__(self) -> None:
@@ -223,8 +224,12 @@ class ServerCell:
         if not await probe_server_healthy(server_url=addr_info.server_url, api_key=self.meta.sglang_api_key):
             return
 
-        if self.args.check_weight_update_equal and self.meta.update_weights:
+        if self.args.check_weight_update_equal and self.meta.update_weights and not self._startup_weights_snapshotted:
             await self.check_weights(action="snapshot", allow_quant_error=False, selector="all", skip_list=None)
+            # Reset can finish on the engine even if its HTTP waiter is cancelled.
+            # Preserve the original HF reference across a retried initialization;
+            # taking another snapshot would capture the randomized live weights.
+            self._startup_weights_snapshotted = True
 
         if self.meta.needs_offload:
             api_client = SGLangApiClient(server_url=addr_info.server_url)

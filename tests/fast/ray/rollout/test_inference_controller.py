@@ -183,6 +183,7 @@ class _TickingCell:
     def __init__(self, cell_id: str = "engine-0"):
         self.meta = SimpleNamespace(cell_id=cell_id)
         self.tick_count = 0
+        self.is_initializing = False
 
     async def tick(self) -> None:
         self.tick_count += 1

@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 
 TICK_INTERVAL_SECONDS = 5.0
 CELL_TICK_TIMEOUT_SECONDS = 120.0
+# Large checkpoints can take minutes to snapshot to host memory, particularly
+# when several engines share a node. Keep serving-cell probes on the short bound.
+CELL_INITIALIZATION_TICK_TIMEOUT_SECONDS = 600.0
 CELLS_READY_POLL_INTERVAL_SECONDS = 2.0
 CELLS_READY_TIMEOUT_SECONDS = 3600.0
 
@@ -384,7 +387,9 @@ class InferenceController:
             *[
                 infra_timeouts.wait_for(
                     cell.tick(),
-                    timeout=CELL_TICK_TIMEOUT_SECONDS,
+                    timeout=(
+                        CELL_INITIALIZATION_TICK_TIMEOUT_SECONDS if cell.is_initializing else CELL_TICK_TIMEOUT_SECONDS
+                    ),
                     operation=f"engine initialization {cell.meta.cell_id}",
                 )
                 for cell in cells

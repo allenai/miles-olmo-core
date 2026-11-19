@@ -61,3 +61,36 @@ async def test_expired_background_preparation_cannot_mark_cell_ready(cell_env, m
     await controller._tick_cells()
     assert cell._initialization_task is None
     assert cell.is_initializing
+
+
+async def test_missing_snapshot_reply_fails_both_readiness_waits_without_another_copy(cell_env, monkeypatch):
+    cell = state_tests._make_cell(args_overrides={"check_weight_update_equal": True})
+    await cell.init()
+    server = RolloutServer.__new__(RolloutServer)
+    server.server_cells = {"replacement": cell}
+    server.model_name = "default"
+    controller = tick_tests._make_controller({"default": server})
+    controller.args = cell.args
+    server.context_lock = controller.context_lock
+    started = asyncio.Event()
+    actions = []
+
+    async def never_reply(action, **kwargs):
+        actions.append(action)
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(cell, "check_weights", never_reply)
+    monkeypatch.setattr("miles.ray.rollout.server_cell.SNAPSHOT_REPLY_TIMEOUT_SECONDS", 0.05)
+    await controller._tick_cells()
+    await asyncio.wait_for(started.wait(), 1)
+    with pytest.raises(RuntimeError, match="no snapshot reply"):
+        await asyncio.wait_for(asyncio.shield(cell._initialization_task), 1)
+    for _ in range(3):
+        await controller._tick_cells()
+    with pytest.raises(RuntimeError, match=cell.meta.cell_id):
+        await server.wait_init_expected_num_cells()
+    async with controller.context_lock:
+        with pytest.raises(RuntimeError, match=cell.meta.workers_hash):
+            await controller._ensure_cells_ready()
+    assert actions == ["snapshot"]

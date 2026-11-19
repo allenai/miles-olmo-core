@@ -169,6 +169,8 @@ class _RecordingRemoteMethod:
 
 
 class _FakeUpdatableCell:
+    startup_failure = None
+
     def __init__(self, workers_hash: str):
         self.meta = SimpleNamespace(workers_hash=workers_hash)
         self.marked_ready = 0
@@ -1578,6 +1580,7 @@ class TestCellsReadyIsScopedToTheTargetedModel:
         a.api_clients = ["a-client"]
         a.server_cells = {
             "a-0": SimpleNamespace(
+                startup_failure=None,
                 is_pending_weights_or_serving=True,
                 is_uninitialized=False,
                 meta=SimpleNamespace(workers_hash="hash-a"),
@@ -1586,6 +1589,7 @@ class TestCellsReadyIsScopedToTheTargetedModel:
         b = _RecordingServer(model_name="b", update_weights=True)
         b.server_cells = {
             "b-0": SimpleNamespace(
+                startup_failure=None,
                 is_pending_weights_or_serving=False,
                 is_uninitialized=False,
                 meta=SimpleNamespace(workers_hash="hash-b"),

@@ -38,6 +38,11 @@ from miles.utils.workers.worker_provider.base import BaseWorkerProvider
 logger = logging.getLogger(__name__)
 
 SHUTDOWN_TIMEOUT = 30
+# H253 Small (23 rollout engines) hit the old 120s initialization deadline
+# during snapshot/reset. Cancellation ended observation, so we do not know
+# when those replies would have arrived. This per-engine 600s budget spans
+# two 300s preparation windows at the same infrastructure timeout multiplier.
+SNAPSHOT_REPLY_TIMEOUT_SECONDS = 600.0
 INITIALIZING_TIMEOUT_SECONDS = 1800.0
 ABORT_REQUEST_TIMEOUT_SECONDS = 30.0
 
@@ -70,6 +75,7 @@ class ServerCell:
     _env_reporter: EngineEnvReporter = dataclasses.field(init=False)
     _startup_weights_snapshotted: bool = dataclasses.field(default=False, init=False)
     _initialization_task: asyncio.Task[bool] | None = dataclasses.field(default=None, init=False)
+    startup_failure: str | None = dataclasses.field(default=None, init=False)
     _startup_snapshot_task: asyncio.Task[Any] | None = dataclasses.field(default=None, init=False)
     _state: CellState = dataclasses.field(default_factory=StateUninitialized)
 
@@ -226,6 +232,8 @@ class ServerCell:
     async def poll_initialization(self, timeout: float) -> None:
         # The controller calls this on its current cell objects under its lock.
         # A retired cell's task can never register a worker or commit readiness.
+        if self.startup_failure is not None and self._initialization_task is None:
+            return
         task = self._initialization_task
         if task is None:
             self._initialization_task = asyncio.create_task(
@@ -238,7 +246,21 @@ class ServerCell:
             if task.result():
                 await self._finish_initialization()
 
+    async def _snapshot_startup_weights(self) -> None:
+        started = time.monotonic()
+        try:
+            async with asyncio.timeout(infra_timeouts.seconds(SNAPSHOT_REPLY_TIMEOUT_SECONDS)):
+                await self.check_weights(action="snapshot", allow_quant_error=False, selector="all", skip_list=None)
+        except TimeoutError as exc:
+            self.startup_failure = (
+                f"Cell {self.meta.cell_id} generation {self.meta.workers_hash} received no snapshot reply "
+                f"after {time.monotonic() - started:.1f}s; restart with a fresh engine"
+            )
+            raise RuntimeError(self.startup_failure) from exc
+
     async def _prepare_initialization(self) -> bool:
+        if self.startup_failure is not None:
+            raise RuntimeError(self.startup_failure)
         addr_info = self._state.addr_info
         if not await probe_server_healthy(server_url=addr_info.server_url, api_key=self.meta.sglang_api_key):
             return False
@@ -250,9 +272,7 @@ class ServerCell:
             and not self._startup_weights_snapshotted
         ):
             if self._startup_snapshot_task is None or self._startup_snapshot_task.cancelled():
-                self._startup_snapshot_task = asyncio.create_task(
-                    self.check_weights(action="snapshot", allow_quant_error=False, selector="all", skip_list=None)
-                )
+                self._startup_snapshot_task = asyncio.create_task(self._snapshot_startup_weights())
             # A tick timeout must not start another full host copy while this RPC
             # is still running. Rejoin its reply on the next tick instead.
             try:

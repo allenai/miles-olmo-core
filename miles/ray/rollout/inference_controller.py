@@ -292,6 +292,9 @@ class InferenceController:
         next_warning = started + 30
         while True:
             cells = [cell for srv in self._get_servers_of_model_id(model_id) for cell in srv.server_cells.values()]
+            for cell in cells:
+                if cell.startup_failure:
+                    raise RuntimeError(cell.startup_failure)
             if self.args.colocate:
                 await asyncio.gather(*[cell.init() for cell in cells if cell.is_uninitialized])
             pending = [cell for cell in cells if not cell.is_pending_weights_or_serving]

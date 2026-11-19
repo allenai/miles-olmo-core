@@ -69,6 +69,7 @@ class ServerCell:
     _router_health_next: float = dataclasses.field(default=0.0, init=False)
     _env_reporter: EngineEnvReporter = dataclasses.field(init=False)
     _startup_weights_snapshotted: bool = dataclasses.field(default=False, init=False)
+    _initialization_task: asyncio.Task[bool] | None = dataclasses.field(default=None, init=False)
     _startup_snapshot_task: asyncio.Task[Any] | None = dataclasses.field(default=None, init=False)
     _state: CellState = dataclasses.field(default_factory=StateUninitialized)
 
@@ -173,7 +174,8 @@ class ServerCell:
 
     async def tick(self) -> None:
         if isinstance(self._state, StateInitializing):
-            await self._tick_when_initializing()
+            if await self._prepare_initialization():
+                await self._finish_initialization()
         if rust_router_membership.controller_manages_router(self.args):
             await self._check_router_membership_health()
         await self._report_env_if_due()
@@ -221,10 +223,25 @@ class ServerCell:
             cell_id=self.meta.cell_id, server_url=self.server_url, api_client=self.api_client
         )
 
-    async def _tick_when_initializing(self) -> None:
+    async def poll_initialization(self, timeout: float) -> None:
+        # The controller calls this on its current cell objects under its lock.
+        # A retired cell's task can never register a worker or commit readiness.
+        task = self._initialization_task
+        if task is None:
+            self._initialization_task = asyncio.create_task(
+                infra_timeouts.wait_for(
+                    self._prepare_initialization(), timeout=timeout, operation=f"initialize {self.meta.cell_id}"
+                )
+            )
+        elif task.done():
+            self._initialization_task = None
+            if task.result():
+                await self._finish_initialization()
+
+    async def _prepare_initialization(self) -> bool:
         addr_info = self._state.addr_info
         if not await probe_server_healthy(server_url=addr_info.server_url, api_key=self.meta.sglang_api_key):
-            return
+            return False
 
         serve_without_weight_update: bool = not self.meta.update_weights or self.args.debug_rollout_only
         if (
@@ -263,6 +280,11 @@ class ServerCell:
                 skip_list=self.args.check_weight_update_skip_list,
             )
 
+        return True
+
+    async def _finish_initialization(self) -> None:
+        addr_info = self.addr_info
+        serve_without_weight_update = not self.meta.update_weights or self.args.debug_rollout_only
         if serve_without_weight_update:
             await self._register_with_router(addr_info=addr_info)
 
@@ -303,6 +325,9 @@ class ServerCell:
 
     async def dispose(self) -> None:
         self._health_checker.stop()
+        if self._initialization_task is not None:
+            self._initialization_task.cancel()
+            await asyncio.gather(self._initialization_task, return_exceptions=True)
         if self._startup_snapshot_task is not None:
             self._startup_snapshot_task.cancel()
             await asyncio.gather(self._startup_snapshot_task, return_exceptions=True)

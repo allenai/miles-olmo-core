@@ -43,7 +43,7 @@ CELL_TICK_TIMEOUT_SECONDS = 120.0
 # deadline. Larger model snapshots copy more data to host memory; engines sharing
 # a node likely contend for transfer bandwidth. Allow five minutes for startup
 # while retaining the shorter serving-probe bound. This is a budget, not a measured
-# completion time, and the controller lock remains held until these ticks settle.
+# completion time. The controller polls this work without waiting for the copy.
 CELL_INITIALIZATION_TICK_TIMEOUT_SECONDS = 300.0
 CELLS_READY_POLL_INTERVAL_SECONDS = 2.0
 CELLS_READY_TIMEOUT_SECONDS = 3600.0
@@ -389,10 +389,12 @@ class InferenceController:
         results = await asyncio.gather(
             *[
                 infra_timeouts.wait_for(
-                    cell.tick(),
-                    timeout=(
-                        CELL_INITIALIZATION_TICK_TIMEOUT_SECONDS if cell.is_initializing else CELL_TICK_TIMEOUT_SECONDS
+                    (
+                        cell.poll_initialization(CELL_INITIALIZATION_TICK_TIMEOUT_SECONDS)
+                        if cell.is_initializing
+                        else cell.tick()
                     ),
+                    timeout=CELL_TICK_TIMEOUT_SECONDS,
                     operation=f"engine initialization {cell.meta.cell_id}",
                 )
                 for cell in cells

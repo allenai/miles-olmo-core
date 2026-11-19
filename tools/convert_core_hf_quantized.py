@@ -104,7 +104,9 @@ def convert(source, destination, *, fmt, device="cuda", shard_bytes=256 * 1024**
             "ignored_layers": ignored,
         }
         if fmt == "fp8"
-        else {"quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16, "exclude_modules": ignored}
+        # ModelOpt's flat config.json schema uses "ignore"; "exclude_modules"
+        # belongs to the legacy nested hf_quant_config.json schema.
+        else {"quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16, "ignore": ignored}
     )
     config["quantization_config"] = recipe
     destination.parent.mkdir(parents=True, exist_ok=True)

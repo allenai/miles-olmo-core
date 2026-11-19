@@ -284,6 +284,23 @@ def test_failed_conversion_never_exposes_partial_checkpoint(tmp_path):
     assert not list(tmp_path.glob(".quantized-export-*"))
 
 
+def test_nvfp4_flat_metadata_excludes_unquantized_head_and_attention(tmp_path):
+    source, destination = tmp_path / "source", tmp_path / "nvfp4"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "olmo3moe"}))
+    # Exercise passthrough storage and its receiver metadata without CUDA quantization.
+    weights = {name: torch.randn(8, 16) for name in ("lm_head.weight", "model.layers.1.self_attn.q_proj.weight")}
+    safetensors.torch.save_file(weights, source / "model.safetensors")
+    convert(source, destination, fmt="nvfp4", device="cpu")
+    recipe = json.loads((destination / "config.json").read_text())["quantization_config"]
+    assert set(recipe["ignore"]) == {name.removesuffix(".weight") for name in weights}
+    assert "exclude_modules" not in recipe  # Not consumed by ModelOpt's flat-schema parser.
+    index = json.loads((destination / "model.safetensors.index.json").read_text())
+    for name, expected in weights.items():
+        actual = safetensors.torch.load_file(destination / index["weight_map"][name])[name]
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("shape", [(127, 128), (128, 129)])
 def test_block_fp8_rejects_unaligned_expert_shapes(shape):
     with pytest.raises(ValueError, match="divisible by 128"):

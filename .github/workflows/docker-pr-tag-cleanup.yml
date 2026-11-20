@@ -9,7 +9,9 @@ permissions:
 
 jobs:
   delete-pr-tag:
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: >-
+      github.repository == 'radixark/miles' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - shell: bash

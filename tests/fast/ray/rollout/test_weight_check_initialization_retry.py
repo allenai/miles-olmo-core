@@ -30,10 +30,12 @@ async def test_cancelled_reset_cannot_replace_the_original_checkpoint_reference(
     monkeypatch.setattr(ServerCell, "check_weights", check_weights)
     await cell.init()
     tick = asyncio.create_task(cell.tick())
-    await reset_started.wait()
-    tick.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await tick
+    try:
+        await asyncio.wait_for(reset_started.wait(), timeout=5)
+    finally:
+        tick.cancel()
+        await asyncio.gather(tick, return_exceptions=True)
+    assert tick.cancelled()
     assert cell.is_initializing
     assert weights == {"live": 99, "reference": 17}
 

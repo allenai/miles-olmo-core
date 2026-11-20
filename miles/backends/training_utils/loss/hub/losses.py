@@ -197,6 +197,7 @@ def policy_loss_function(
     )
     local_loss_masks = torch.cat(local_loss_mask_list, dim=0).to(device=ppo_kl.device)
     active_tokens = local_loss_masks.bool()
+    tail_active_tokens = active_tokens
     ppo_kl = torch.where(
         active_tokens,
         torch.nan_to_num(ppo_kl, nan=0.0, posinf=0.0, neginf=0.0),
@@ -263,6 +264,18 @@ def policy_loss_function(
         }
 
         pg_loss, modified_response_masks, tis_metrics = tis_func(**tis_kwargs)
+        # Tokens the hook rejected leave the logprob-gap mean; keep them out of its tail too.
+        tail_active_tokens = (
+            torch.cat(
+                get_local_response_loss_masks(
+                    total_lengths, response_lengths, modified_response_masks, args.qkv_format, max_seq_lens
+                ),
+                dim=0,
+            )
+            .to(device=active_tokens.device)
+            .bool()
+            & active_tokens
+        )
 
         # [decouple IS and rejection] modified masks correct the numerator only;
         # denominators stay the precomputed rollout_mask_sums.
@@ -355,6 +368,18 @@ def policy_loss_function(
             abs_diff.new_zeros(()),
         )
         train_rollout_logprob_abs_diff = sum_of_sample_mean(abs_diff)
+        # Tail of the same masked differences. Fractions use the mean's
+        # sample/token weighting; the maximum is reduced with MAX (see
+        # MAX_REDUCED_LOSS_KEYS) over the tokens the mean counts, so a token a
+        # TIS hook rejected cannot set it. Excluded tokens are zero and never win.
+        tail_abs_diff = torch.where(tail_active_tokens, abs_diff, abs_diff.new_zeros(()))
+        train_rollout_logprob_tail = {
+            "train_rollout_logprob_abs_diff_max": (
+                tail_abs_diff.amax() if tail_abs_diff.numel() else tail_abs_diff.new_zeros(())
+            ),
+            "train_rollout_logprob_abs_diff_frac_gt_0p5": sum_of_sample_mean((abs_diff > 0.5).to(abs_diff.dtype)),
+            "train_rollout_logprob_abs_diff_frac_gt_1p0": sum_of_sample_mean((abs_diff > 1.0).to(abs_diff.dtype)),
+        }
 
         # KL(rollout || train) at sampled tokens via Schulman k3 with per-token clamp [-10, 10]
         rollout_train_kl = compute_approx_kl(rollout_log_probs, train_scored_log_probs, kl_loss_type="low_var_kl")
@@ -376,6 +401,7 @@ def policy_loss_function(
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
+        reported_loss.update({key: value.clone().detach() for key, value in train_rollout_logprob_tail.items()})
     if train_rollout_kl is not None:
         reported_loss["train_rollout_kl"] = train_rollout_kl.clone().detach()
 

@@ -24,9 +24,9 @@ def test_unused_handler_preserves_drop_and_retry_contract(monkeypatch, feedback,
     args = SimpleNamespace(async_unused_samples_handler=handling)
     producer = async_rollout.ManagedFullyAsyncRolloutFn(SimpleNamespace(args=args, data_source=source))
     group = [SimpleNamespace(group_index=3)]
-    producer._handle_unused(group)
+    producer._handle_unused(group, group=group, reason="stale")
     if handling == "retry":
-        source.add_samples.assert_called_once_with(group)
+        source.add_samples.assert_called_once_with(group, group=group, reason="stale")
         source.acknowledge_groups.assert_not_called()
         if feedback:
             source.discard_groups.assert_not_called()

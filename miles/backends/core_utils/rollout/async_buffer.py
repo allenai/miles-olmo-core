@@ -8,7 +8,7 @@ from miles.backends.core_utils.data import policy_versions
 from miles.backends.core_utils.publication import policy_refresh
 from miles.backends.core_utils.rollout.queue_metrics import QueueMetrics
 from miles.rollout.filter_hub.base_types import call_dynamic_filter, iter_samples
-from miles.rollout.filter_hub.common_filters import apply_missing_reward_filter
+from miles.rollout.filter_hub.common_filters import FilterReason, apply_missing_reward_filter
 from miles.rollout.fully_async_data_buffer import DefaultDataBuffer
 from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
@@ -49,6 +49,8 @@ class MeasuredDataBuffer(DefaultDataBuffer):
                 )
             if not output.keep:
                 self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
+                # The producer retires the group on False; never_give_up may still requeue its prompt.
+                self._unused_handler_fn(item.prompt_group, group=item.group, reason=output.reason)
                 return False
         await super().put(item)
         return True
@@ -113,7 +115,8 @@ class HomogeneousPolicyDataBuffer:
         self._rejected += 1
         self._incomplete += incomplete
         self._mixed += mixed
-        self._unused(item.prompt_group)
+        # Handled like an aborted group: retry regenerates the prompt as-is, drop retires it.
+        self._unused(item.prompt_group, group=item.group, reason=FilterReason.aborted)
 
     async def get(self, current_version=None, **context):
         return await self._delegate.get(current_version=current_version, **context)

@@ -49,6 +49,9 @@ def serving(monkeypatch):
         sample_index = payload["input_ids"][-1]
         calls.append((sample_index, payload["rid"]))
         if sample_index == 0 and sum(index == 0 for index, _ in calls) <= state.hangs:
+            if getattr(state, "drain_while_hung", False):
+                # A lifecycle drain closes admission while this attempt is in flight.
+                state.fn._publication_paused = True
             await asyncio.Event().wait()
         return {"meta_info": {"finish_reason": {"type": "stop"}}}
 
@@ -72,10 +75,12 @@ def serving(monkeypatch):
     return SimpleNamespace(calls=calls, state=state)
 
 
-def run_group(args):
+def run_group(args, serving=None):
     async def scenario():
         fn = refreshing_rollout.RefreshingRolloutFn.__new__(refreshing_rollout.RefreshingRolloutFn)
         fn.args = args
+        if serving is not None:
+            serving.state.fn = fn
         fn._worker = None
         fn._scheduler = SimpleNamespace(sample_done_callback=lambda: None)
         fn._sample_timeout_retries = refreshing_rollout.sample_timeout_retries(args)
@@ -134,6 +139,15 @@ def test_exhausted_retries_fall_back_to_group_failure(tmp_path, serving):
     with pytest.raises(GenerationRequestTimeout, match="refresh_request_timeout"):
         run_group(make_args(tmp_path, refresh_sample_timeout_retries=2))
     assert sum(index == 0 for index, _ in serving.calls) == 3
+
+
+def test_timeout_after_lifecycle_drain_started_is_not_retried(tmp_path, serving):
+    serving.state.hangs = 1
+    serving.state.drain_while_hung = True
+    with pytest.raises(GenerationRequestTimeout, match="refresh_request_timeout"):
+        run_group(make_args(tmp_path, refresh_sample_timeout_retries=2), serving)
+    # Only the first request id for the sample was submitted; recovery owns the group.
+    assert sum(index == 0 for index, _ in serving.calls) == 1
 
 
 @pytest.mark.parametrize("value", [-1, 1.0, True, "1", None])

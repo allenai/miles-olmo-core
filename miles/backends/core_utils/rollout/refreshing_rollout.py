@@ -35,7 +35,12 @@ logger = logger_utils.setup_logger(__name__)
 
 
 def sample_timeout_retries(args):
-    """Per-sample retries after core.refresh_request_timeout; 0 keeps whole-group requeue."""
+    """Per-sample retries after core.refresh_request_timeout; 0 keeps whole-group requeue.
+
+    Read from ``args.olmo_core`` (Open Instruct's ``CoreConfig``), refresh mode only.
+    No Open Instruct revision exposes ``refresh_sample_timeout_retries`` yet, so
+    until one does the default of 0 applies and behaviour is unchanged.
+    """
     value = getattr(getattr(args, "olmo_core", None), "refresh_sample_timeout_retries", 0)
     if type(value) is not int or value < 0:
         raise ValueError(f"core.refresh_sample_timeout_retries must be a non-negative integer, got {value!r}")
@@ -143,14 +148,16 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
 
         A timeout leaves the sample pristine: nothing is written to it before a
         response arrives. The retry keeps the admission slot and gets a fresh
-        request id and deadline. Exhausted retries fall back to whole-group requeue.
+        request id and deadline. Exhausted retries fall back to whole-group requeue,
+        and so does a timeout after a lifecycle drain or shutdown closed admission:
+        a fresh request would spend the drain budget.
         """
         retries = getattr(self, "_sample_timeout_retries", 0)
         for attempt in range(retries + 1):
             try:
                 return await self._generate_response_impl(input)
             except GenerationRequestTimeout as error:
-                if attempt == retries:
+                if attempt == retries or self._admission_closed():
                     raise
                 sibling_timing.timeout_retried(input.sample)
                 logger.warning(
@@ -161,6 +168,9 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
                     retries,
                     error,
                 )
+
+    def _admission_closed(self):
+        return getattr(self, "_publication_paused", False) or getattr(self, "_stopping", False)
 
     async def _generate_response_impl(self, input):
         sample = input.sample

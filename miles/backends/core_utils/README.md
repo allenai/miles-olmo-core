@@ -67,7 +67,7 @@ Complete sampling-support replay explicitly uses an empty-tail ratio of one,
 including when FP32 mass sums round below one (upstream
 [#4204](https://github.com/radixark/miles/issues/4204) and proposed
 [#4310](https://github.com/radixark/miles/pull/4310)). Partial candidate heads
-retain the original approximate tail estimator. Core refresh sampling remains
-subject to the application's unfiltered-sampling restrictions. The CPU tests
+retain the original approximate tail estimator. Core policy training requires
+unfiltered rollout sampling until [#52](https://github.com/allenai/miles-olmo-core/issues/52) is resolved. The CPU tests
 cover candidate preservation through Core packing and the complete-support
 loss/gradient; a GPU training run is separate qualification.

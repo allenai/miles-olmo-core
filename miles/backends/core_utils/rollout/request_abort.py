@@ -1,6 +1,7 @@
 """Abort serving requests the producer has stopped waiting for."""
 
 import asyncio
+import contextlib
 import time
 from collections.abc import Awaitable, Callable
 
@@ -15,15 +16,21 @@ _URL_CACHE_SECONDS = 60.0
 # Pool waits are bounded by the posts ahead of them, not by a deadline.
 _ABORT_TIMEOUT = httpx.Timeout(10.0, pool=None)
 _ABORT_LIMITS = httpx.Limits(max_connections=32, max_keepalive_connections=32)
+# Discovery shares the rollout client, which has no timeout; one stalled router
+# call must not hold the only drain task and strand every later abort.
+_DISCOVERY_TIMEOUT_SECONDS = 10.0
+# Teardown waits this long for queued aborts, then cancels the rest.
+_CLOSE_TIMEOUT_SECONDS = 30.0
 
 
 class RequestAborter:
     """Send SGLang a per-request abort for generations the producer abandoned.
 
-    A request deadline or a failed sibling cancels the producer's await, but the
-    cancellation does not reach the engine: a distributed HTTP worker keeps the
-    connection open, so SGLang decodes the response to the end for nobody. The
-    router does not route aborts by request id and the producer does not know
+    A request deadline or a failed sibling cancels the producer's await. ``post``
+    then cancels a distributed HTTP worker's call, which closes its connection to
+    the router, but the router's own connection to the engine may stay open, so
+    SGLang can decode the response to the end for nobody. This abort covers that.
+    The router does not route aborts by request id and the producer does not know
     which engine received the request, so every engine gets the abort. SGLang
     ignores an abort for a request id it does not hold.
 
@@ -37,11 +44,15 @@ class RequestAborter:
         self._urls_fetched = float("-inf")
         self._pending: list[str] = []
         self._task: asyncio.Task | None = None
+        self._closed = False
         self.requested = 0
         self.failed_posts = 0
 
     def abort(self, request_id: str) -> None:
         self.requested += 1
+        if self._closed:
+            # Teardown has started; closing the request's connection still aborts it.
+            return
         self._pending.append(request_id)
         if self._task is None or self._task.done():
             self._task = asyncio.get_running_loop().create_task(self._drain())
@@ -50,6 +61,22 @@ class RequestAborter:
         """Wait for queued aborts to be sent; used by tests and orderly teardown."""
         while self._task is not None and not self._task.done():
             await asyncio.shield(self._task)
+
+    async def close(self, timeout: float = _CLOSE_TIMEOUT_SECONDS) -> None:
+        """Stop taking aborts; send queued ones within ``timeout``, then cancel the rest."""
+        self._closed = True
+        task = self._task
+        if task is None or task.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout)
+        except TimeoutError:
+            logger.warning(
+                "Abort sender did not finish within %gs; cancelling %d queued abort(s)", timeout, len(self._pending)
+            )
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     async def _drain(self) -> None:
         async with httpx.AsyncClient(timeout=_ABORT_TIMEOUT, limits=_ABORT_LIMITS) as client:
@@ -75,10 +102,10 @@ class RequestAborter:
     async def _worker_urls(self) -> list[str]:
         if time.monotonic() - self._urls_fetched >= _URL_CACHE_SECONDS or not self._urls:
             try:
-                self._urls = list(await self._get_urls())
+                self._urls = list(await asyncio.wait_for(self._get_urls(), _DISCOVERY_TIMEOUT_SECONDS))
                 self._urls_fetched = time.monotonic()
             except Exception as error:
-                logger.warning("Engine discovery for request aborts failed: %s", error)
+                logger.warning("Engine discovery for request aborts failed: %r", error)
         return self._urls
 
     @staticmethod

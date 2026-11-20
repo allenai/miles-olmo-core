@@ -350,6 +350,10 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             if self._worker is not None:
                 self._worker.cancel()
                 await asyncio.gather(self._worker, return_exceptions=True)
+            # Cancelling the producer queues aborts; send them before engine teardown.
+            aborter = getattr(self, "_request_aborter", None)
+            if aborter is not None:
+                await aborter.close()
             self._shutdown_complete = True
             outcome = "shutdown_aborted" if abort else "shutdown_complete" if quiesced else "shutdown_incomplete"
             await pipeline_observer.write_lifecycle(self, outcome)

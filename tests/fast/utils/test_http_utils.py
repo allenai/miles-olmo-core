@@ -806,3 +806,39 @@ class TestInitHttpClientConcurrency:
     def test_no_client_without_gpus_or_snapshot_eval(self, monkeypatch):
         _, client = self._init(monkeypatch, self._args(eval_uses_snapshots=False))
         assert client is None
+
+
+class TestDistributedPostCancellation:
+    def test_cancelled_waiter_cancels_a_call_still_queued_in_ray(self, monkeypatch):
+        """A deadline on the producer must stop the actor call, or it dispatches after the abort."""
+        submitted: list[dict] = []
+        cancelled: list[object] = []
+
+        class _Actor:
+            class do_post:
+                @staticmethod
+                def remote(url, payload, *args, **kwargs):
+                    async def queued_then_submit():
+                        # Ray delivers the call after the producer has given up on it.
+                        await asyncio.sleep(0.2)
+                        submitted.append(payload)
+                        return {}
+
+                    return asyncio.ensure_future(queued_then_submit())
+
+        def fake_cancel(ref):
+            cancelled.append(ref)
+            ref.cancel()
+
+        monkeypatch.setattr(http_utils, "_distributed_post_enabled", True)
+        monkeypatch.setattr(http_utils, "_post_actors", [_Actor()])
+        monkeypatch.setattr(ray, "cancel", fake_cancel)
+
+        async def scenario():
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(http_utils.post("http://engine/generate", {"rid": "r1"}), 0.05)
+            await asyncio.sleep(0.3)
+
+        asyncio.run(scenario())
+        assert len(cancelled) == 1
+        assert submitted == []

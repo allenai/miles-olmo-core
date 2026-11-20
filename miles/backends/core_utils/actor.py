@@ -915,7 +915,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             logger.warning("BACKGROUND EVALUATION GAP: incomplete snapshot retained at %s", target)
 
     def export_hf(self, rollout_id, path):
-        state = models.export_state(self.train_module, self.hf_config)
+        state = models.export_state(self.train_module, self.hf_config, retain=dist.get_rank() == 0)
 
         def write_snapshot():
             if dist.get_rank() != 0:

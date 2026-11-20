@@ -123,8 +123,13 @@ def iter_export_state(module, hf, *, stream_moe=True, fused_experts=False):
     yield from _backend(kind).iter_export_state(module, hf, stream_moe=stream_moe, fused_experts=fused_experts)
 
 
-def export_state(module, hf):
-    return {name: value.detach().cpu() for name, value in iter_export_state(module, hf)}
+def export_state(module, hf, *, retain=True):
+    """Consume every collective export on all ranks; retain CPU weights only where needed."""
+    state = {}
+    for name, value in iter_export_state(module, hf):
+        if retain:
+            state[name] = value.detach().cpu()
+    return state
 
 
 def _module_backend(module):

@@ -39,12 +39,6 @@ logger = logging.getLogger(__name__)
 
 TICK_INTERVAL_SECONDS = 5.0
 CELL_TICK_TIMEOUT_SECONDS = 120.0
-# Small startup with 23 rollout engines exceeded the 120-second snapshot/reset
-# deadline. Larger model snapshots copy more data to host memory; engines sharing
-# a node likely contend for transfer bandwidth. Allow five minutes for startup
-# while retaining the shorter serving-probe bound. This is a budget, not a measured
-# completion time. The controller polls this work without waiting for the copy.
-CELL_INITIALIZATION_TICK_TIMEOUT_SECONDS = 300.0
 CELLS_READY_POLL_INTERVAL_SECONDS = 2.0
 CELLS_READY_TIMEOUT_SECONDS = 3600.0
 
@@ -292,9 +286,6 @@ class InferenceController:
         next_warning = started + 30
         while True:
             cells = [cell for srv in self._get_servers_of_model_id(model_id) for cell in srv.server_cells.values()]
-            for cell in cells:
-                if cell.startup_failure:
-                    raise RuntimeError(cell.startup_failure)
             if self.args.colocate:
                 await asyncio.gather(*[cell.init() for cell in cells if cell.is_uninitialized])
             pending = [cell for cell in cells if not cell.is_pending_weights_or_serving]
@@ -392,11 +383,7 @@ class InferenceController:
         results = await asyncio.gather(
             *[
                 infra_timeouts.wait_for(
-                    (
-                        cell.poll_initialization(CELL_INITIALIZATION_TICK_TIMEOUT_SECONDS)
-                        if cell.is_initializing
-                        else cell.tick()
-                    ),
+                    cell.tick(),
                     timeout=CELL_TICK_TIMEOUT_SECONDS,
                     operation=f"engine initialization {cell.meta.cell_id}",
                 )

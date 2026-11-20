@@ -185,9 +185,6 @@ class RolloutServer:
     @lock_exempt
     async def wait_init_expected_num_cells(self, timeout: float = 3600, *, check_worker_failures: bool = False):
         async def _check(remaining_seconds: float) -> None:
-            for cell in self.server_cells.values():
-                if cell.startup_failure:
-                    raise RuntimeError(cell.startup_failure)
             count = self._count_startable_cells()
             if count < self.init_expected_num_cells:
                 if check_worker_failures:

@@ -11,8 +11,6 @@ from miles.utils.context_lock import ContextLock
 
 
 class _FakeCell:
-    startup_failure = None
-
     def __init__(self, *, state: str = "uninitialized", init_gate: asyncio.Event | None = None):
         self.state = state
         self.init_count = 0

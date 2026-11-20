@@ -29,7 +29,10 @@ def test_nonwriter_consumes_all_exports_without_cpu_copies(monkeypatch):
 
 @pytest.mark.parametrize("options", [{}, {"retain": True}])
 def test_writer_preserves_export_names_values_and_dtypes(monkeypatch, options):
-    expected = {"weight": torch.arange(12, dtype=torch.bfloat16).reshape(3, 4).T, "bias": torch.arange(3, dtype=torch.float32)}
+    expected = {
+        "weight": torch.arange(12, dtype=torch.bfloat16).reshape(3, 4).T,
+        "bias": torch.arange(3, dtype=torch.float32),
+    }
     monkeypatch.setattr(models, "iter_export_state", lambda *args: iter(expected.items()))
     actual = models.export_state(object(), object(), **options)
     assert actual.keys() == expected.keys()

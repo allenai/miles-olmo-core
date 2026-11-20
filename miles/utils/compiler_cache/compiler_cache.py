@@ -65,6 +65,7 @@ NON_COMPILE_CORE = {
     "engine_drain_timeout",
     "engine_update_timeout",
     "refresh_request_timeout",
+    "max_group_retries",
     "scoring_check_interval",
     "scoring_check_tolerance",
     "records_root",

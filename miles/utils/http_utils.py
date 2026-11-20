@@ -466,7 +466,7 @@ async def post(
         # the rollout's bounded whole-group recovery owns retries, not this layer.
         actor = _next_actor()
         if actor is not None:
-            result = await actor.do_post.remote(
+            ref = actor.do_post.remote(
                 url,
                 payload,
                 max_retries,
@@ -476,6 +476,14 @@ async def post(
                 decode_routed_experts=decode_routed_experts,
                 compact_token_logprobs=compact_token_logprobs,
             )
+            try:
+                result = await ref
+            except asyncio.CancelledError:
+                # Cancelling the local await does not stop the actor call. Cancel it
+                # too: a call still queued never dispatches, and a running one closes
+                # its connection, which aborts the request in SGLang.
+                _cancel_remote_post(ref)
+                raise
             if isinstance(result, HTTPPostFailure):
                 raise result.exception()
             return result
@@ -496,6 +504,15 @@ async def post(
     if compact_token_logprobs:
         response = compact_token_logprobs_response(response)
     return response
+
+
+def _cancel_remote_post(ref) -> None:
+    import ray
+
+    try:
+        ray.cancel(ref)
+    except Exception as error:  # the caller is already unwinding a cancellation
+        logger.warning("Could not cancel abandoned distributed HTTP call: %s", error)
 
 
 # TODO unify w/ `post` to add retries and remote-execution

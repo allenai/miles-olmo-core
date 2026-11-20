@@ -227,3 +227,69 @@ def test_unreachable_engines_and_discovery_failure_never_raise(engines):
     assert len(calls) == 2
     assert sorted(body["rid"] for body in engines[0].aborts) == ["b", "c"]
     assert aborter.requested == 3 and aborter.failed_posts == 2
+
+
+def test_stalled_discovery_does_not_strand_later_aborts(monkeypatch, engines):
+    monkeypatch.setattr(request_abort, "_DISCOVERY_TIMEOUT_SECONDS", 0.05)
+    calls = []
+
+    async def urls():
+        calls.append(1)
+        if len(calls) == 1:
+            await asyncio.Event().wait()  # router accepts the call and never answers
+        return [engines[0].url]
+
+    async def scenario():
+        aborter = request_abort.RequestAborter(urls)
+        aborter.abort("a")
+        await asyncio.wait_for(aborter.wait_idle(), 5)
+        aborter.abort("b")
+        await asyncio.wait_for(aborter.wait_idle(), 5)
+
+    asyncio.run(scenario())
+    assert len(calls) == 2
+    assert [body["rid"] for body in engines[0].aborts] == ["b"]
+
+
+def test_close_bounds_pending_aborts_and_refuses_new_ones():
+    async def scenario():
+        hung = asyncio.Event()
+
+        async def urls():
+            hung.set()
+            await asyncio.Event().wait()
+
+        aborter = request_abort.RequestAborter(urls)
+        aborter.abort("a")
+        await hung.wait()
+        await asyncio.wait_for(aborter.close(timeout=0.05), 5)
+        assert aborter._task.done()
+        aborter.abort("late")
+        assert aborter._pending == [] and aborter._task.done()
+
+    # Close, not the discovery deadline, ends the stuck send.
+    assert request_abort._DISCOVERY_TIMEOUT_SECONDS > 1
+    asyncio.run(scenario())
+
+
+def test_shutdown_sends_queued_aborts_before_returning(monkeypatch, tmp_path, engines):
+    args = make_args(tmp_path, timeout=30)
+    fn = make_producer(args, engines)
+    fn._shutdown_complete = False
+    fn._worker = None
+    fn._generation_admission = GenerationAdmission(1)
+
+    async def lifecycle(*a, **kw):
+        pass
+
+    monkeypatch.setattr(refreshing_rollout.pipeline_observer, "write_lifecycle", lifecycle)
+
+    async def scenario():
+        fn._producer_resumed = asyncio.Event()
+        fn._stop_requested = asyncio.Event()
+        fn._request_aborter.abort("cancelled-by-shutdown")
+        await fn.shutdown(abort=True)
+        assert fn._request_aborter._task.done()
+
+    asyncio.run(scenario())
+    assert aborted(engines) == ["cancelled-by-shutdown"]

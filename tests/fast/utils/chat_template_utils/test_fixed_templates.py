@@ -24,6 +24,7 @@ from miles.utils.chat_template_utils.tito_tokenizer import (
 )
 
 _EXPECTED_FIXED_TEMPLATES = {
+    TITOTokenizerType.OLMO35: (None, {}),
     TITOTokenizerType.QWEN3: ("qwen3_fixed.jinja", {"clear_thinking": False}),
     TITOTokenizerType.QWEN35: ("qwen3.5_fixed.jinja", {"preserve_thinking": True}),
     TITOTokenizerType.QWEN36: ("qwen3.6_fixed.jinja", {"preserve_thinking": True}),

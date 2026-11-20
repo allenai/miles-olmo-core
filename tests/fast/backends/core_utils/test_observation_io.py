@@ -127,6 +127,7 @@ def producer(tmp_path, monkeypatch):
     def parent_init(fn, input):
         fn.args = SimpleNamespace(
             save=str(tmp_path),
+            custom_generate_function_path=None,
             olmo_core=SimpleNamespace(pipeline_observation_interval=1),
             sglang_server_concurrency=8,
             rollout_num_gpus=1,

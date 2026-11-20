@@ -70,8 +70,14 @@ def version_number(value):
     return result
 
 
-def validate_spans(spans, length, *, replay_version):
-    """Validate exact half-open response-token coverage; omit empty spans."""
+def _has_active_tokens(mask):
+    # Training masks may be CUDA tensors. Never iterate over their scalar
+    # elements in Python: that would synchronize the device once per token.
+    return bool(mask.any()) if isinstance(mask, torch.Tensor) else any(mask)
+
+
+def validate_spans(spans, length, *, replay_version, loss_mask=None):
+    """Validate sampled-token coverage; allow masked observation gaps for agents."""
     if (
         isinstance(length, bool)
         or not isinstance(length, Integral)
@@ -81,25 +87,66 @@ def validate_spans(spans, length, *, replay_version):
     ):
         raise ValueError("Policy refresh requires version spans for every response token")
     replay_version = version_number(replay_version)
+    if loss_mask is not None:
+        if isinstance(loss_mask, torch.Tensor):
+            valid = (
+                loss_mask.ndim == 1
+                and loss_mask.numel() == length
+                and bool(((loss_mask == 0) | (loss_mask == 1)).all())
+            )
+        else:
+            valid = len(loss_mask) == length and all(value in (0, 1) for value in loss_mask)
+        if not valid:
+            raise ValueError("Agent refresh requires one binary loss mask value per response token")
     result, cursor, previous = [], 0, -1
     for span in spans:
         if not isinstance(span, dict) or set(span) != {"version", "start", "end"}:
             raise ValueError("Policy spans require version, start, and end")
         start, end = span["start"], span["end"]
         version = version_number(span["version"])
-        if type(start) is not int or type(end) is not int or start != cursor or not start <= end <= length:
+        if type(start) is not int or type(end) is not int or not cursor <= start <= end <= length:
             raise ValueError("Policy spans must cover response tokens without gaps or overlaps")
+        if start != cursor and (loss_mask is None or _has_active_tokens(loss_mask[cursor:start])):
+            raise ValueError("Policy spans must cover every trainable response token")
         if version < previous or version > replay_version:
             raise ValueError("Policy span versions must increase and cannot exceed the replay version")
         previous, cursor = version, end
         if start != end:
-            if result and result[-1]["version"] == version:
+            if result and result[-1]["version"] == version and result[-1]["end"] == start:
                 result[-1]["end"] = end
             else:
                 result.append(dict(version=version, start=start, end=end))
-    if cursor != length or not result or result[-1]["version"] != replay_version:
+    uncovered_tail = cursor != length and (loss_mask is None or _has_active_tokens(loss_mask[cursor:]))
+    if uncovered_tail or not result or result[-1]["version"] != replay_version:
         raise ValueError("Policy spans must end at the completed response and its final replay version")
     return result
+
+
+def record_trajectory(sample):
+    """Attach refresh provenance to a linear TITO trajectory without rewriting it.
+
+    Native call spans use absolute token positions. Tool observations and turn
+    delimiters occupy masked gaps; only sampled tokens need behavior versions.
+    """
+    length = sample.response_length
+    offset = len(sample.tokens) - length
+    mask = sample.loss_mask
+    if mask is None or len(mask) != length or not any(mask):
+        raise ValueError("Agent refresh requires a nonempty trajectory loss mask")
+    native = policy_versions.spans(sample.weight_versions)
+    spans = [dict(version=s["version"], start=s["abs_start"] - offset, end=s["abs_end"] - offset) for s in native]
+    replay_version = max((s["version"] for s in spans), default=0)
+    spans = validate_spans(spans, length, replay_version=replay_version, loss_mask=mask)
+    scores = sample.rollout_log_probs
+    if (
+        scores is None
+        or len(scores) != length
+        or any(active and not math.isfinite(score) for active, score in zip(mask, scores, strict=True))
+    ):
+        raise ValueError("Agent refresh requires original behavior logprobs for every trainable token")
+    record = dict(kind="agent", spans=spans, replay_version=replay_version)
+    sample.train_metadata = {**(sample.train_metadata or {}), "policy_refresh": record}
+    return record
 
 
 def record_response(sample, meta):
@@ -142,15 +189,31 @@ def validate_batch(batch):
         record = item.get("policy_refresh") if isinstance(item, dict) else None
         if not isinstance(record, dict):
             raise ValueError("Policy refresh training sample has no provenance")
-        spans = validate_spans(record.get("spans"), length, replay_version=record.get("replay_version"))
-        if policy_versions.versions(sample_versions) != [s["version"] for s in spans]:
-            raise ValueError("Policy refresh span versions disagree with the staleness ledger")
-        if not all(isinstance(value, (int, str)) for value in sample_versions):
+        mask = None
+        if record.get("kind") == "agent":
+            masks = batch.get("loss_masks")
+            if masks is None or len(masks) != len(lengths):
+                raise ValueError("Agent refresh training batch lost loss masks")
+            mask = masks[index]
+        spans = validate_spans(
+            record.get("spans"), length, replay_version=record.get("replay_version"), loss_mask=mask
+        )
+        if all(isinstance(value, (int, str)) for value in sample_versions):
+            if policy_versions.versions(sample_versions) != [s["version"] for s in spans]:
+                raise ValueError("Policy refresh span versions disagree with the staleness ledger")
+        else:
             native = policy_versions.spans(sample_versions)
-            offset = batch["total_lengths"][index] - length if "total_lengths" in batch else native[0]["abs_start"]
+            if not native:
+                raise ValueError("Policy refresh sample has an empty staleness ledger")
+            offset = (
+                int(batch["total_lengths"][index]) - int(length)
+                if "total_lengths" in batch
+                else native[0]["abs_start"] - spans[0]["start"]
+            )
             relative = [
                 dict(version=s["version"], start=s["abs_start"] - offset, end=s["abs_end"] - offset) for s in native
             ]
+            relative = validate_spans(relative, length, replay_version=record.get("replay_version"), loss_mask=mask)
             if relative != spans:
                 raise ValueError("Policy refresh token spans disagree with the staleness ledger")
         result.append(spans)
@@ -177,7 +240,7 @@ def score_metrics(rollout, *, current_version, clip_low, clip_high):
     ):
         delta = scores.detach().float() - behavior.detach().float()
         replay_version = metadata["policy_refresh"]["replay_version"]
-        mixed += int(len(spans) > 1)
+        mixed += int(len({span["version"] for span in spans}) > 1)
         for span in spans:
             start, end = span["start"], span["end"]
             selected = delta[start:end][mask[start:end].bool()]

@@ -49,6 +49,30 @@ result to [0, 10]; the existing low-var diagnostic uses [-20, 20] inputs and
 Publication logs record `pause_mode` and `retained_state`. Preserve failures:
 publication exceptions must not resume inference or advance the published clock.
 
+## Linear agent episodes
+
+Core refresh can retain the native `agentic_tool_call.generate` runner with
+TITO v2 and `tito_model=olmo35`. The Olmo family keeps the checkpoint's native
+template, uses Qwen-compatible thinking/XML parsers and restores the newline
+after an `im_end` tool handoff without rewriting sampled tokens.
+
+The managed producer unwraps exactly one trajectory per episode and records
+native absolute call spans as response-relative refresh provenance. Tool
+observations and turn delimiters may leave gaps only where the loss mask is zero.
+The native TITO assembler supplies original logprobs and append-only expert
+route patches; Core does not synthesize behavior probabilities for observations.
+Aborted episodes retain the native buffer's drop/retry handling.
+
+Ordinary publications do not cancel episode tasks. Shared-engine lifecycle
+boundaries close admission for new episodes and wait for existing agents,
+including external tool execution and collection, to finish. Terminal abort
+cancels the owned tasks. Checkpoint recovery regenerates pending prompts rather
+than restoring live sandboxes. Branching/multiple leaves and arbitrary custom
+generators remain unsupported. Application validation selects this path and
+retains the GRPO/TIS objective restrictions. CPU tests cover native assembly,
+route alignment, mixed-policy buffering and agent lifecycle; GPU qualification
+of the multi-turn combination remains separate from the single-turn runs below.
+
 Qualification completed on the B300 hybrid model with 32K responses: a tiny
 live-update probe, a short one-node learning run, and a 50-update three-node run
 at 3,840 admitted samples. The three-node run had zero stale discards, allocator

@@ -357,12 +357,35 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                 if self.ref_module is not None:
                     rollout["ref_log_probs"] = self._score(self.ref_module, batches, use_replay=False)
                 with self._actor_forward_skipped(not standalone):
-                    self._train_steps(rollout, rollout_id, local_batch, decision, checked, difference, agreement, profile, steps, normalizations)
+                    self._train_steps(
+                        rollout,
+                        rollout_id,
+                        local_batch,
+                        decision,
+                        checked,
+                        difference,
+                        agreement,
+                        profile,
+                        steps,
+                        normalizations,
+                    )
             self.clock.next_rollout_id = rollout_id + 1
         self._heartbeat.bump()
         return TrainStepOutput(outcome=cast(TrainStepOutcome, TrainStepOutcome.NORMAL))
 
-    def _train_steps(self, rollout, rollout_id, local_batch, decision, checked, difference, agreement, profile, steps, normalizations):
+    def _train_steps(
+        self,
+        rollout,
+        rollout_id,
+        local_batch,
+        decision,
+        checked,
+        difference,
+        agreement,
+        profile,
+        steps,
+        normalizations,
+    ):
         # Without the standalone pass, old log-probabilities come from the training
         # forward itself. That is exact only at unchanged weights, which the caller
         # guarantees by admitting exactly one optimizer step per collection.
@@ -371,7 +394,9 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         miles_loss.compute_advantages_and_returns(self.args, rollout)
         self._agree(lambda: contract.validate_training_data(rollout))
         advantages = training_metrics.advantage_metrics(rollout)
-        for step_batches, normalization in zip(packing.bind_training_fields(steps, rollout), normalizations, strict=True):
+        for step_batches, normalization in zip(
+            packing.bind_training_fields(steps, rollout), normalizations, strict=True
+        ):
             if normalization.active_tokens == 0:
                 continue
             expert_metrics = None
@@ -380,8 +405,12 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             dispatch_started = time.perf_counter()
             if self.args.olmo_core.expert_balanced_packing or (profile_due and self.args.use_rollout_routing_replay):
                 local_loads = self._agree(lambda batches=step_batches: expert_schedule.local_loads(self.args, batches))
-                expert_metrics = expert_schedule.realized_measurements(local_loads, self.args.olmo_core.expert_parallel_size)
-                expert_metrics["layer_ids"] = expert_schedule.model_layout(self.args.hf_checkpoint, self.args.olmo_core.expert_balance_layer_stride)[3]
+                expert_metrics = expert_schedule.realized_measurements(
+                    local_loads, self.args.olmo_core.expert_parallel_size
+                )
+                expert_metrics["layer_ids"] = expert_schedule.model_layout(
+                    self.args.hf_checkpoint, self.args.olmo_core.expert_balance_layer_stride
+                )[3]
                 logger.info(
                     "Core expert balance: %s",
                     contract.record(

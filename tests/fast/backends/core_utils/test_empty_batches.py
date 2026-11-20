@@ -32,14 +32,18 @@ def _rollout(mask):
 
 def _worker(rank, rendezvous):
     torch.set_num_threads(1)
-    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=60))
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=60)
+    )
     try:
         worker = object.__new__(actor.OLMoCoreTrainRayActor)
         worker.args = SimpleNamespace(
             global_batch_size=2,
             use_rollout_routing_replay=False,
             save=None,
-            olmo_core=SimpleNamespace(max_sequence_length=8, sequence_packing=False, publication_mode="barrier", max_policy_lag=0),
+            olmo_core=SimpleNamespace(
+                max_sequence_length=8, sequence_packing=False, publication_mode="barrier", max_policy_lag=0
+            ),
         )
         worker.clock = PolicyClock(completed_steps=3, published_step=3, next_rollout_id=7)
         worker._agree = lambda function: function()
@@ -57,7 +61,10 @@ def _worker(rank, rendezvous):
         momentum = worker.optimizer.state[parameter]["exp_avg"].clone()
         optimizer_step = worker.optimizer.state[parameter]["step"].clone()
         rollout = _rollout([0, 0])
-        with mock.patch.object(actor.miles_data, "get_rollout_data", return_value=(rollout, contextlib.nullcontext())), mock.patch.object(metrics.tracking, "log") as log:
+        with (
+            mock.patch.object(actor.miles_data, "get_rollout_data", return_value=(rollout, contextlib.nullcontext())),
+            mock.patch.object(metrics.tracking, "log") as log,
+        ):
             worker.train(7, object())
             assert worker.clock == PolicyClock(completed_steps=3, published_step=3, next_rollout_id=8)
             assert torch.equal(parameter, before)
@@ -78,7 +85,10 @@ def _worker(rank, rendezvous):
         worker._train_steps = mock.Mock()
         worker.ref_module = None
         rollout = _rollout([0, 0] if rank == 0 else [1, 0])
-        with mock.patch.object(actor.miles_data, "get_rollout_data", return_value=(rollout, contextlib.nullcontext())), mock.patch.object(metrics.tracking, "log"):
+        with (
+            mock.patch.object(actor.miles_data, "get_rollout_data", return_value=(rollout, contextlib.nullcontext())),
+            mock.patch.object(metrics.tracking, "log"),
+        ):
             worker.train(8, object())
         worker._train_steps.assert_called_once()
         [normalization] = worker._train_steps.call_args.args[-1]
@@ -155,9 +165,22 @@ def test_empty_step_inside_active_collection_does_not_update(monkeypatch):
     excluded = contract.StepNormalization(2, 0, 2, 4, 1)
     active = contract.StepNormalization(2, 1, 2, 4, 1)
     step = [{"total_lengths": [2]}]
-    worker._train_steps({"tokens": [None]}, 0, 2, SimpleNamespace(standalone=True), False, None, None, None, [step], [excluded])
+    worker._train_steps(
+        {"tokens": [None]}, 0, 2, SimpleNamespace(standalone=True), False, None, None, None, [step], [excluded]
+    )
     with pytest.raises(ActiveStepReached):
-        worker._train_steps({"tokens": [None, None]}, 0, 2, SimpleNamespace(standalone=True), False, None, None, None, [step, step], [excluded, active])
+        worker._train_steps(
+            {"tokens": [None, None]},
+            0,
+            2,
+            SimpleNamespace(standalone=True),
+            False,
+            None,
+            None,
+            None,
+            [step, step],
+            [excluded, active],
+        )
     worker.train_module.zero_grads.assert_not_called()
     worker.train_module.optim_step.assert_not_called()
     worker.lr_scheduler.step.assert_not_called()

@@ -55,6 +55,34 @@ state. It changes imports, module paths, application callback boundaries, HF
 loader calls to MILES helpers, and model-validation exceptions to `ValueError`;
 it does not redesign training or publication algorithms.
 
+## When an answer hits the length limit
+
+Suppose the model generates two answers to one prompt. One finishes and earns a
+reward of 1. The other reaches the length limit halfway through. Open Instruct
+offers two ways to treat the unfinished answer when training with GRPO.
+
+| Choice | Effect on training if the group is retained |
+|---|---|
+| Give the unfinished answer zero reward (`core.reward_zero_truncated=true`) | Both answers enter the group comparison. Their mean reward is 0.5, so the finished answer scores above the mean and the unfinished one below it. The generated tokens remain eligible for the policy loss. |
+| Mask the unfinished answer (`exclude_truncated`, with `core.reward_zero_truncated=false`) | The unfinished answer contributes no tokens to the policy loss and its reward is left out of the group comparison. In this example the finished answer is alone, so its reward equals the group mean. |
+
+**Core decides whether to take an optimizer step from the response masks across
+all training ranks.** If every response token in that update is masked, Core
+consumes the batch, records an `optimizer_skipped` event, and skips the entire
+update. Optimizer momentum, the learning-rate schedule, and the policy version
+stay where they were. Zero reward alone never triggers this skip. A rank with
+only masked tokens still participates if another rank has included tokens.
+
+**Combining masking with auxiliary losses.** Router load balancing and router
+z-loss use model tokens, including prompt tokens. Forced-exit guidance can
+train on a stopping probe with nonzero advantage and parent weight. In an
+update that contains some included response tokens, these objectives can still
+use data from a masked response. In a fully masked update, Core skips them
+along with the policy loss, even if they could produce a gradient on their own.
+If you need router or guidance updates on all-truncated batches, keep the
+responses eligible for training and select the zero-reward policy. Group filters
+still apply before training and can discard an all-zero-reward group.
+
 ## Score centering
 
 The Core actor dispatches `loss_type=score_centering` through the shared native

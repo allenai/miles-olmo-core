@@ -10,6 +10,7 @@ import httpx
 
 from miles.backends.core_utils import infra_timeouts
 from miles.backends.core_utils.publication import policy_refresh
+from miles.backends.core_utils.rollout import fault_injection
 from miles.backends.core_utils.rollout import (
     partial_groups,
     pipeline_observer,
@@ -229,6 +230,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
                 "admission pressure; increase the request timeout for deliberately long responses. "
                 "core.engine_drain_timeout only controls eval/export/shutdown draining."
             ) from error
+        fault_injection.maybe_fail(url, payload["rid"])
         sibling_timing.response_received(sample, payload["rid"], output.get("meta_info", {}))
         if output.get("meta_info", {}).get("finish_reason", {}).get("type") not in ("stop", "length"):
             raise RuntimeError("Policy refresh request did not finish; refusing a partial training sample")

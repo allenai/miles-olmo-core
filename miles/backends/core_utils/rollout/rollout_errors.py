@@ -87,6 +87,14 @@ def failure_description(error: BaseException) -> str:
     return description
 
 
+def _fault_injection_metrics():
+    from miles.backends.core_utils.rollout import fault_injection
+
+    if fault_injection.rate() <= 0:
+        return {}
+    return {"errors/test_injected_transport_failures": fault_injection.injected}
+
+
 def from_args(args) -> "RolloutErrors":
     """Use core.max_group_retries when the Core config provides it (older configs omit it)."""
     core = getattr(args, "olmo_core", None)
@@ -163,6 +171,7 @@ class RolloutErrors:
             "errors/high_failure_seconds": 0.0 if self._bad_since is None else now - self._bad_since,
             **{f"errors/{category}_groups": self.failures[category] for category in CATEGORIES},
             **(self.partial.metrics() if self.partial is not None else {}),
+            **_fault_injection_metrics(),
         }
 
     def check(self):

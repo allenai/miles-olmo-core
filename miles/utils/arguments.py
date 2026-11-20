@@ -3354,6 +3354,17 @@ def miles_validate_args(args):
     args.use_sampling_support_replay = args.rollout_top_p < 1.0 or args.rollout_top_k > 0
     args.rollout_sampling_logprobs_mode = "support" if args.use_sampling_support_replay else "selected"
     if args.use_sampling_support_replay:
+        if (
+            args.train_backend == "olmo_core"
+            and args.entry == "train"
+            and not args.debug_rollout_only
+            and args.loss_type in ("policy_loss", "score_centering")
+        ):
+            raise ValueError(
+                "Core policy training requires --rollout-top-p 1 and --rollout-top-k -1. "
+                "With restricted sampling, Core scoring and the policy loss can disagree on token probabilities. "
+                "See https://github.com/allenai/miles-olmo-core/issues/52"
+            )
         if args.rollout_top_k == -1:
             raise ValueError(
                 "--rollout-top-p below 1 requires a positive --rollout-top-k; "

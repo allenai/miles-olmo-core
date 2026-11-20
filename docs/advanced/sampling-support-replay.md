@@ -26,6 +26,10 @@ probability space while retaining gradients through the current actor logits.
 
 ## Enable replay
 
+Core policy training currently requires `--rollout-top-p 1 --rollout-top-k -1`
+because its standalone scorer can disagree with the loss under restricted
+sampling. [Core scoring issue #52](https://github.com/allenai/miles-olmo-core/issues/52)
+
 ```bash
 ROLLOUT_ARGS+=(
   --rollout-temperature 1.0

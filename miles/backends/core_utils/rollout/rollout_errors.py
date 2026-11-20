@@ -101,6 +101,8 @@ class RolloutErrors:
         self.successes = 0
         self.failures = collections.Counter()
         self._group_retries = {}
+        # Partial-group counters, set by the refresh producer when enabled.
+        self.partial = None
 
     def check_group_retry(self, group_index: int, error: BaseException) -> int:
         """Count isolated failures only while other generation is making progress."""
@@ -150,6 +152,7 @@ class RolloutErrors:
             "errors/failure_fraction_5m": fraction,
             "errors/high_failure_seconds": 0.0 if self._bad_since is None else now - self._bad_since,
             **{f"errors/{category}_groups": self.failures[category] for category in CATEGORIES},
+            **(self.partial.metrics() if self.partial is not None else {}),
         }
 
     def check(self):

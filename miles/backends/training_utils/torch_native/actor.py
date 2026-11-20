@@ -60,6 +60,7 @@ TRAIN_KEYS = FORWARD_ONLY_KEYS + [
     "rollout_topk_token_ids",
     "rollout_topk_lengths",
     "rollout_topk_log_probs",
+    "rollout_score_mode",
 ]
 SAMPLING_MASK_KEYS = ["rollout_sampling_mask_ids", "rollout_sampling_mask_offsets"]
 

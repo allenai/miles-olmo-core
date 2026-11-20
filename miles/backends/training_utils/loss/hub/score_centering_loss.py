@@ -35,7 +35,9 @@ def _candidate_ids(batch: RolloutBatch, sample: int, indices: torch.Tensor) -> t
     return ids
 
 
-def _candidate_log_probs(args: Namespace, batch: RolloutBatch, logits: torch.Tensor) -> dict[str, list[torch.Tensor]]:
+def _candidate_log_probs(
+    args: Namespace, batch: RolloutBatch, logits: torch.Tensor, *, with_candidates: bool = True
+) -> dict[str, list[torch.Tensor]]:
     parallel = get_parallel_state()
     result = {"selected": []}
     if args.use_kl_loss:
@@ -56,8 +58,10 @@ def _candidate_log_probs(args: Namespace, batch: RolloutBatch, logits: torch.Ten
     )
     for i, (chunk, tokens, indices) in enumerate(chunks):
         indices = torch.as_tensor(list(indices), dtype=torch.long)
-        ids = _candidate_ids(batch, i, indices).to(logits.device)
-        ids = torch.cat((tokens.unsqueeze(-1), ids), dim=-1)
+        ids = tokens.unsqueeze(-1)
+        if with_candidates:
+            candidates = _candidate_ids(batch, i, indices).to(logits.device)
+            ids = torch.cat((ids, candidates), dim=-1)
         selected, entropy = selected_log_probs_and_entropy(
             chunk,
             ids,
@@ -160,6 +164,10 @@ def score_centering_loss_function(
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if getattr(args, "rollout_score_mode", "topk") != "topk" or any(
+        mode != "topk" for mode in (batch.get("rollout_score_mode") or [])
+    ):
+        raise ValueError("The SCT score_centering loss cannot consume SCMC probes")
     probabilities = _candidate_log_probs(args, batch, logits)
     selected = torch.cat(probabilities["selected"])
     active = torch.cat(

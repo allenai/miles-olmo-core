@@ -259,6 +259,8 @@ async def generate(
             sample,
             output["meta_info"],
             args.rollout_top_logprobs_num,
+            score_mode=getattr(args, "rollout_score_mode", "topk"),
+            transport=getattr(args, "rollout_score_transport", "nested"),
             sampling_logprobs_mode=payload.get("sampling_logprobs_mode", "selected"),
         )
 

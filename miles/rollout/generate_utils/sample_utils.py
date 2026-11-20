@@ -165,6 +165,7 @@ def _merge_sample_pair(a: Sample, b: Sample, tokenizer) -> Sample:
             rollout_log_probs=a.rollout_log_probs + [0.0] * obs_len + b.rollout_log_probs,
             rollout_topk_token_ids=merge_rollout_topk_logprobs_field(a, b, "rollout_topk_token_ids", obs_len),
             rollout_topk_log_probs=merge_rollout_topk_logprobs_field(a, b, "rollout_topk_log_probs", obs_len),
+            rollout_score_mode=_merge_equal_value("rollout_score_mode"),
             rollout_sampling_mask=sampling_mask,
             teacher_log_probs=_merge_optional_per_token("teacher_log_probs"),
             opd_reverse_kl=_merge_optional_per_token("opd_reverse_kl"),

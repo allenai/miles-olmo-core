@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 
+from miles.rollout.generate_utils.score_transport import configure_score_transport, decode_score_arrays
 from miles.utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_sampling
 from miles.utils.sampling_mask import RolloutSamplingMask
 from miles.utils.types import Sample
@@ -26,6 +27,7 @@ def configure_rollout_topk_logprobs_request(args: Namespace, request: dict[str, 
         if sampling.get(key) is None:
             sampling[key] = default
     validate_rollout_topk_logprobs_sampling(sampling, temperature=args.rollout_temperature, candidate_count=k)
+    configure_score_transport(args, request, openai=openai)
     if args.rollout_sampling_logprobs_mode == "support":
         # SGLang's support mode returns the actual post-filter behavior distribution.
         request.pop("top_logprobs", None)
@@ -40,7 +42,13 @@ def configure_rollout_topk_logprobs_request(args: Namespace, request: dict[str, 
 
 
 def append_rollout_topk_logprobs(
-    sample: Sample, meta: Mapping[str, Any], k: int, *, sampling_logprobs_mode: str = "selected"
+    sample: Sample,
+    meta: Mapping[str, Any],
+    k: int,
+    *,
+    sampling_logprobs_mode: str = "selected",
+    score_mode: str = "topk",
+    transport: str = "nested",
 ) -> None:
     """Append compact [response, k] arrays after appending generated tokens.
 
@@ -52,6 +60,30 @@ def append_rollout_topk_logprobs(
     if not k:
         return
     n = len(meta.get("output_token_logprobs") or [])
+    if score_mode not in ("topk", "mc") or transport not in ("nested", "flat", "array"):
+        raise ValueError("Unknown rollout score mode or transport")
+    if sample.rollout_topk_token_ids is not None and sample.rollout_score_mode != score_mode:
+        raise ValueError("Cannot append different score modes to one sample")
+    expected_mode = f"mc{k}" if score_mode == "mc" else "topk"
+    if meta.get("output_score_mode", "topk") != expected_mode:
+        raise ValueError(f"Expected output_score_mode={expected_mode}")
+    if transport != "nested":
+        if transport == "array" and "output_score_mode" not in meta:
+            raise ValueError("Array transport requires output_score_mode acknowledgement from patched SGLang")
+        if sampling_logprobs_mode != "selected":
+            raise ValueError("Packed scores do not support filtered sampling")
+        ids, logps = decode_score_arrays(meta, rows=n, width=k, mode=score_mode)
+    else:
+        if score_mode != "topk":
+            raise ValueError("SCMC requires array transport")
+        ids, logps = _decode_nested_scores(meta, n, k, sampling_logprobs_mode)
+    sample.rollout_score_mode = score_mode
+    for name, values in (("rollout_topk_token_ids", ids), ("rollout_topk_log_probs", logps)):
+        previous = getattr(sample, name)
+        setattr(sample, name, values if previous is None else np.concatenate((previous, values)))
+
+
+def _decode_nested_scores(meta, n, k, sampling_logprobs_mode):
     support_mode = sampling_logprobs_mode == "support"
     field = "output_token_sampling_logprobs" if support_mode else "output_top_logprobs"
     rows = meta.get(field)
@@ -69,9 +101,7 @@ def append_rollout_topk_logprobs(
             probabilities = [entry[0] for entry in entries[:k]]
         ids[i, : len(token_ids)] = token_ids
         logps[i, : len(token_ids)] = probabilities
-    for name, values in (("rollout_topk_token_ids", ids), ("rollout_topk_log_probs", logps)):
-        previous = getattr(sample, name)
-        setattr(sample, name, values if previous is None else np.concatenate((previous, values)))
+    return ids, logps
 
 
 def _support_membership(ids: np.ndarray, support: RolloutSamplingMask) -> tuple[np.ndarray, np.ndarray]:
@@ -117,12 +147,18 @@ def validate_rollout_topk_logprobs_sample(sample: Sample, k: int) -> None:
     if ids.shape[1] != k:
         raise ValueError("Rollout top-k logprobs candidates must have --rollout-top-logprobs-num columns")
     valid = ids >= 0
-    sorted_ids = np.sort(ids, axis=-1)
-    if ((sorted_ids[:, 1:] >= 0) & (sorted_ids[:, 1:] == sorted_ids[:, :-1])).any():
-        raise ValueError("Duplicate rollout top-k logprobs candidate token IDs")
+    if sample.rollout_score_mode == "topk":
+        sorted_ids = np.sort(ids, axis=-1)
+        if ((sorted_ids[:, 1:] >= 0) & (sorted_ids[:, 1:] == sorted_ids[:, :-1])).any():
+            raise ValueError("Duplicate rollout top-k logprobs candidate token IDs")
     active = np.asarray(sample.loss_mask if sample.loss_mask is not None else [1] * sample.response_length, dtype=bool)
     if (active & ~valid.any(-1)).any():
         raise ValueError("Every trained token needs rollout top-k logprobs candidates")
+    if sample.rollout_score_mode == "mc":
+        if k not in (32, 64, 128) or (active[:, None] & ~valid).any():
+            raise ValueError("Every trained token needs 32, 64 or 128 SCMC probes")
+        if sample.rollout_sampling_mask is not None:
+            raise ValueError("SCMC probes require unfiltered sampling")
     if sample.rollout_sampling_mask is not None:
         in_support, lengths = _support_membership(ids, sample.rollout_sampling_mask)
         if ((valid != in_support) & active[:, None]).any() or ((valid.sum(-1) != lengths) & active).any():

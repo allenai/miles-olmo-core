@@ -88,6 +88,7 @@ class Sample:
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
     rollout_topk_token_ids: numpy.ndarray | None = None  # [response_length, k], int32; -1 pads unused slots
     rollout_topk_log_probs: numpy.ndarray | None = None  # [response_length, k], float32; -inf pads unused slots
+    rollout_score_mode: str = "topk"  # "mc" arrays contain independent draws, including duplicates
     rollout_sampling_mask: RolloutSamplingMask | None = None
     rollout_routed_experts: numpy.ndarray | None = (
         None  # Routed experts from rollout engine. shape: (num_tokens-1, num_layers, moe_router_topk), dtype=int32
@@ -253,6 +254,8 @@ class Sample:
             assert (
                 len(self.rollout_log_probs) == self.response_length
             ), f"rollout_log_probs length ({len(self.rollout_log_probs)}) != response_length ({self.response_length})"
+        if self.rollout_score_mode not in ("topk", "mc"):
+            raise ValueError("Unknown rollout_score_mode")
         if self.rollout_topk_token_ids is not None or self.rollout_topk_log_probs is not None:
             ids, logps = self.rollout_topk_token_ids, self.rollout_topk_log_probs
             assert (
@@ -351,6 +354,7 @@ class Sample:
         self.rollout_log_probs = None
         self.rollout_topk_token_ids = None
         self.rollout_topk_log_probs = None
+        self.rollout_score_mode = "topk"
         self.rollout_sampling_mask = None
         self.rollout_routed_experts = None
         self.rollout_indexer_topk = None

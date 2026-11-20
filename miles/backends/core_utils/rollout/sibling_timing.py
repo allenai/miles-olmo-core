@@ -55,6 +55,12 @@ def admitted(sample):
         record["admitted_unix"] = time.time()
 
 
+def timeout_retried(sample):
+    record = sample_record(sample)
+    if record is not None:
+        record["timeout_retries"] = record.get("timeout_retries", 0) + 1
+
+
 def response_received(sample, request_id, meta):
     record = sample_record(sample)
     if record is None:

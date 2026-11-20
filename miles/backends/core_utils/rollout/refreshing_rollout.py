@@ -34,6 +34,14 @@ from miles.utils.http_utils import post
 logger = logger_utils.setup_logger(__name__)
 
 
+def sample_timeout_retries(args):
+    """Per-sample retries after core.refresh_request_timeout; 0 keeps whole-group requeue."""
+    value = getattr(getattr(args, "olmo_core", None), "refresh_sample_timeout_retries", 0)
+    if type(value) is not int or value < 0:
+        raise ValueError(f"core.refresh_sample_timeout_retries must be a non-negative integer, got {value!r}")
+    return value
+
+
 class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
     """Engine publication preserves requests; lifecycle boundaries park generation.
 
@@ -56,6 +64,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         # reads the original tokenizer while another path may be using it.
         self._prompt_preparer = prompt_preparation.PromptPreparer(lambda: copy.deepcopy(self.state.tokenizer))
         self._prepared_prompt_ids = {}
+        self._sample_timeout_retries = sample_timeout_retries(self.args)
 
     async def dispose(self):
         try:
@@ -122,12 +131,36 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         sibling_timing.admitted(input.sample)
         outcome = "completed"
         try:
-            return await self._generate_response_impl(input)
+            return await self._generate_with_timeout_retries(input)
         except BaseException as error:
             outcome = type(error).__name__
             raise
         finally:
             sibling_timing.finished(input.sample, outcome)
+
+    async def _generate_with_timeout_retries(self, input):
+        """Regenerate only a timed-out sample, in place, while its siblings keep running.
+
+        A timeout leaves the sample pristine: nothing is written to it before a
+        response arrives. The retry keeps the admission slot and gets a fresh
+        request id and deadline. Exhausted retries fall back to whole-group requeue.
+        """
+        retries = getattr(self, "_sample_timeout_retries", 0)
+        for attempt in range(retries + 1):
+            try:
+                return await self._generate_response_impl(input)
+            except GenerationRequestTimeout as error:
+                if attempt == retries:
+                    raise
+                sibling_timing.timeout_retried(input.sample)
+                logger.warning(
+                    "Policy refresh sample timed out; regenerating it alone: group=%s sample=%s retry=%d/%d detail=%s",
+                    input.sample.group_index,
+                    input.sample.index,
+                    attempt + 1,
+                    retries,
+                    error,
+                )
 
     async def _generate_response_impl(self, input):
         sample = input.sample

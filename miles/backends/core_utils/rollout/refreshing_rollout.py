@@ -11,6 +11,7 @@ import httpx
 from miles.backends.core_utils import infra_timeouts
 from miles.backends.core_utils.publication import policy_refresh
 from miles.backends.core_utils.rollout import (
+    partial_groups,
     pipeline_observer,
     prompt_preparation,
     refresh_routing,
@@ -30,6 +31,7 @@ from miles.rollout.generate_utils.generate_endpoint_utils import (
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
 from miles.utils import logger_utils
 from miles.utils.http_utils import post
+from miles.utils.types import Sample
 
 logger = logger_utils.setup_logger(__name__)
 
@@ -56,6 +58,12 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         # reads the original tokenizer while another path may be using it.
         self._prompt_preparer = prompt_preparation.PromptPreparer(lambda: copy.deepcopy(self.state.tokenizer))
         self._prepared_prompt_ids = {}
+        # Opt-in partial groups: failed members by id(sample) until their group resolves.
+        self._min_group_size = partial_groups.min_group_size(self.args)
+        self._failed_members = {}
+        self._partial_stats = None
+        if self._min_group_size is not None:
+            self._partial_stats = self._errors.partial = partial_groups.PartialGroupStats()
 
     async def dispose(self):
         try:
@@ -101,7 +109,12 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
                 if records is not None:
                     for record in records:
                         record["prompt_preparation_seconds"] = time.monotonic() - started
-            return await super()._generate_group(prompt_group)
+            entry = await super()._generate_group(prompt_group)
+            if getattr(self, "_partial_stats", None) is not None:
+                entry.group = partial_groups.resolve(
+                    entry.group, self._failed_members, min_size=self._min_group_size, stats=self._partial_stats
+                )
+            return entry
         except BaseException as error:
             failure = error
             outcome = type(error).__name__
@@ -109,6 +122,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         finally:
             for sample in prompt_group:
                 self._prepared_prompt_ids.pop(id(sample), None)
+                getattr(self, "_failed_members", {}).pop(id(sample), None)
             if records is not None:
                 try:
                     await sibling_timing.write_group(self, records, outcome)
@@ -125,7 +139,13 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             return await self._generate_response_impl(input)
         except BaseException as error:
             outcome = type(error).__name__
-            raise
+            if getattr(self, "_partial_stats", None) is None or not partial_groups.droppable(error):
+                raise
+            # Siblings continue; _generate_group swaps this member for a masked
+            # dummy, or requeues the group when too few members succeed.
+            input.sample.status = Sample.Status.ABORTED
+            self._failed_members[id(input.sample)] = error
+            return GenerateFnOutput(samples=input.sample)
         finally:
             sibling_timing.finished(input.sample, outcome)
 
@@ -147,7 +167,8 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             timing["request_id"] = payload["rid"]
         # With the pinned Rust or MILES router the complete response metadata survives.
         # Do not retry a request in place. On recognized transport loss, the
-        # producer discards the whole group and requeues its pristine prompts.
+        # producer discards the whole group and requeues its pristine prompts,
+        # unless core.refresh_min_group_size lets the group keep the others.
         url = f"http://{input.args.sglang_router_ip}:{input.args.sglang_router_port}/generate"
         timeout = self.args.olmo_core.refresh_request_timeout
         started = time.monotonic()

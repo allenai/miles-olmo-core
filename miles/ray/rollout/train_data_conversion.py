@@ -272,6 +272,16 @@ def _reward_group_segments(args: Any, samples: list[Sample], prompt_group_sizes:
     return [list(range(len(samples)))]
 
 
+# Sample.metadata flag for a placeholder row (zero loss mask) that must neither
+# shift its group's reward baseline nor receive an advantage.
+EXCLUDE_FROM_REWARD_BASELINE = "exclude_from_reward_baseline"
+
+
+def excluded_from_reward_baseline(sample: Sample) -> bool:
+    metadata = sample.metadata
+    return isinstance(metadata, dict) and bool(metadata.get(EXCLUDE_FROM_REWARD_BASELINE))
+
+
 def _normalize_rewards_by_rollout(
     args: Any,
     samples: list[Sample],
@@ -287,6 +297,9 @@ def _normalize_rewards_by_rollout(
         segments_by_rollout_key: dict[int | tuple[str, int], list[int]] = {}
         for segment_index in prompt_segments:
             sample = samples[segment_index]
+            if excluded_from_reward_baseline(sample):
+                normalized_rewards[segment_index] = 0.0
+                continue
             if sample.rollout_id is not None:
                 rollout_key = sample.rollout_id
             elif sample.index is not None:
@@ -296,6 +309,8 @@ def _normalize_rewards_by_rollout(
             segments_by_rollout_key.setdefault(rollout_key, []).append(segment_index)
 
         rollout_segment_groups = list(segments_by_rollout_key.items())
+        if not rollout_segment_groups:
+            continue
         shared_rewards: list[float] = []
         for rollout_key, rollout_segments in rollout_segment_groups:
             sibling_rewards = [raw_rewards[segment_index] for segment_index in rollout_segments]

@@ -293,3 +293,44 @@ def test_shutdown_sends_queued_aborts_before_returning(monkeypatch, tmp_path, en
 
     asyncio.run(scenario())
     assert aborted(engines) == ["cancelled-by-shutdown"]
+
+
+def test_abort_is_resent_in_case_it_overtook_the_generation(monkeypatch, engines):
+    # An abort that reaches SGLang before the rid registers is dropped; repeats are harmless.
+    monkeypatch.setattr(request_abort, "_RESEND_DELAYS_SECONDS", (0.05, 0.1))
+
+    async def urls():
+        return [engine.url for engine in engines]
+
+    async def scenario():
+        aborter = request_abort.RequestAborter(urls)
+        aborter.abort("a")
+        await aborter.wait_idle()
+        assert aborted(engines) == ["a"]
+        await asyncio.wait_for(asyncio.gather(*aborter._resends), 5)
+        await aborter.wait_idle()
+        assert not aborter._resends
+        return aborter
+
+    aborter = asyncio.run(scenario())
+    assert aborted(engines) == ["a", "a", "a"]
+    assert aborter.requested == 1 and aborter.resent == 2
+
+
+def test_close_cancels_pending_resends(monkeypatch, engines):
+    monkeypatch.setattr(request_abort, "_RESEND_DELAYS_SECONDS", (60.0,))
+
+    async def urls():
+        return [engine.url for engine in engines]
+
+    async def scenario():
+        aborter = request_abort.RequestAborter(urls)
+        aborter.abort("a")
+        (resend,) = aborter._resends
+        await asyncio.wait_for(aborter.close(), 5)
+        assert resend.cancelled() and not aborter._resends
+        return aborter
+
+    aborter = asyncio.run(scenario())
+    assert aborted(engines) == ["a"]
+    assert aborter.resent == 0

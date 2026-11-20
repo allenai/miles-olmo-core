@@ -21,6 +21,10 @@ _ABORT_LIMITS = httpx.Limits(max_connections=32, max_keepalive_connections=32)
 _DISCOVERY_TIMEOUT_SECONDS = 10.0
 # Teardown waits this long for queued aborts, then cancels the rest.
 _CLOSE_TIMEOUT_SECONDS = 30.0
+# Seconds after the first abort to send it again. SGLang drops an abort for a rid
+# it has not registered, so an abort that overtakes the forwarded /generate is
+# lost. Resending narrows that window; only an engine-side marker would close it.
+_RESEND_DELAYS_SECONDS = (2.0, 10.0)
 
 
 class RequestAborter:
@@ -32,7 +36,8 @@ class RequestAborter:
     SGLang can decode the response to the end for nobody. This abort covers that.
     The router does not route aborts by request id and the producer does not know
     which engine received the request, so every engine gets the abort. SGLang
-    ignores an abort for a request id it does not hold.
+    ignores an abort for a request id it does not hold, so the abort is resent
+    after short delays in case it overtook the generation request.
 
     ``abort`` is synchronous and never raises, so cancellation and timeout paths
     can call it before re-raising. Posts run in one background task per batch.
@@ -44,18 +49,37 @@ class RequestAborter:
         self._urls_fetched = float("-inf")
         self._pending: list[str] = []
         self._task: asyncio.Task | None = None
+        self._resends: set[asyncio.Task] = set()
         self._closed = False
         self.requested = 0
         self.failed_posts = 0
+        self.resent = 0
 
     def abort(self, request_id: str) -> None:
         self.requested += 1
         if self._closed:
             # Teardown has started; closing the request's connection still aborts it.
             return
+        self._enqueue(request_id)
+        if _RESEND_DELAYS_SECONDS:
+            resend = asyncio.get_running_loop().create_task(self._resend_later(request_id))
+            self._resends.add(resend)
+            resend.add_done_callback(self._resends.discard)
+
+    def _enqueue(self, request_id: str) -> None:
         self._pending.append(request_id)
         if self._task is None or self._task.done():
             self._task = asyncio.get_running_loop().create_task(self._drain())
+
+    async def _resend_later(self, request_id: str) -> None:
+        elapsed = 0.0
+        for delay in _RESEND_DELAYS_SECONDS:
+            await asyncio.sleep(delay - elapsed)
+            elapsed = delay
+            if self._closed:
+                return
+            self.resent += 1
+            self._enqueue(request_id)
 
     async def wait_idle(self) -> None:
         """Wait for queued aborts to be sent; used by tests and orderly teardown."""
@@ -63,8 +87,12 @@ class RequestAborter:
             await asyncio.shield(self._task)
 
     async def close(self, timeout: float = _CLOSE_TIMEOUT_SECONDS) -> None:
-        """Stop taking aborts; send queued ones within ``timeout``, then cancel the rest."""
+        """Stop taking aborts and resends; send queued ones within ``timeout``, then cancel the rest."""
         self._closed = True
+        resends = list(self._resends)
+        for resend in resends:
+            resend.cancel()
+        await asyncio.gather(*resends, return_exceptions=True)
         task = self._task
         if task is None or task.done():
             return

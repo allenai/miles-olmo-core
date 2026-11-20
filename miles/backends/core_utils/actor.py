@@ -26,7 +26,7 @@ from miles.backends.core_utils import (
     scheduler,
 )
 from miles.backends.core_utils import scoring as config
-from miles.backends.core_utils import stopping
+from miles.backends.core_utils import stopping, training_objective
 from miles.backends.core_utils.publication import (
     cache_protocol,
     engine_delivery,
@@ -485,10 +485,13 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                     return loss, values
                 with stopping.capture_readiness(module.model, batch, readiness, self.args.context_parallel_size):
                     logits = self._forward(module, batch)
-                if capture:
-                    batch["training_log_probs"] = self._training_log_probs(logits, batch)
-                loss, _, metrics = miles_loss.loss_function(
-                    self.args, batch, count, logits, apply_megatron_loss_scaling=False
+                loss, _, metrics = training_objective.loss_with_scores(
+                    self.args,
+                    batch,
+                    count,
+                    logits,
+                    capture=capture,
+                    fallback_scores=self._training_log_probs,
                 )
                 if self.args.calculate_per_token_loss:
                     loss = normalization.scale_token_loss(loss)

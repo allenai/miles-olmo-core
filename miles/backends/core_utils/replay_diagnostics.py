@@ -8,7 +8,7 @@ from contextlib import contextmanager
 
 import torch
 
-from miles.backends.core_utils import contract, data
+from miles.backends.core_utils import context_parallel, contract, data
 
 
 @contextmanager
@@ -16,7 +16,11 @@ def checked_context(actor, module, batch, context):
     # Rollout IDs arrive on CPU; the router copies them to its compute device.
     # Keep diagnostic references/counters together without changing replay inputs.
     device = batch["tokens"].device
-    expected = {name: ids.to(device) for name, ids in data.router_routes(module.model, batch).items()}
+    expected = context_parallel.replay_routes(
+        module.model,
+        {name: ids.to(device) for name, ids in data.router_routes(module.model, batch).items()},
+        packed="doc_lens" in batch,
+    )
     routers = dict(module.model.named_modules())
     calls = {name: {"entered": 0, "returned": 0, "grad_enabled": 0} for name in expected}
     mismatches = torch.zeros((), dtype=torch.int64, device=batch["tokens"].device)
@@ -49,15 +53,16 @@ def checked_context(actor, module, batch, context):
         # Validation-only contexts deliberately perform no forward.
         if any(row["entered"] for row in calls.values()):
             mismatch_count = int(mismatches)
+            tokens, captured = context_parallel.replay_counts(module.model, batch)
             contract.record(
                 actor.args,
                 dict(
                     event="replay_routes",
                     rollout_id=actor.clock.next_rollout_id,
                     phase="training" if module.model.training else "scoring",
-                    tokens=int(batch["tokens"].numel()),
-                    captured_tokens=int(batch["tokens"].numel()) - len(batch.get("total_lengths", [None])),
-                    synthetic_tail_tokens=len(batch.get("total_lengths", [None])),
+                    tokens=tokens,
+                    captured_tokens=captured,
+                    synthetic_tail_tokens=tokens - captured,
                     samples=len(batch.get("total_lengths", [None])),
                     mismatches=mismatch_count,
                     layers=calls,

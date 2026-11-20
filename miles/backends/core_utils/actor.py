@@ -13,7 +13,7 @@ import torch
 from safetensors import torch as safetensors_torch
 from torch import distributed as dist
 
-from miles.backends.core_utils import checkpoint, contract, data, expert_schedule, layer_profile
+from miles.backends.core_utils import checkpoint, context_parallel, contract, data, expert_schedule, layer_profile
 from miles.backends.core_utils import metrics as training_metrics
 from miles.backends.core_utils import (
     models,
@@ -36,14 +36,12 @@ from miles.backends.core_utils.publication import (
 )
 from miles.backends.core_utils.publication.state import PolicyClock
 from miles.backends.core_utils.timing import startup_stage
-from miles.backends.training_utils import parallel
 from miles.backends.training_utils.data import rollout as miles_data
 from miles.backends.training_utils.loss import objective as miles_loss
 from miles.backends.training_utils.types import TrainStepOutcome, TrainStepOutput
 from miles.backends.training_utils.weight_update import session
 from miles.ray.train_actor import TrainRayActor
 from miles.utils import async_utils, distributed_utils, logger_utils
-from miles.utils.ft_utils.process_group_utils import GroupInfo
 from miles.utils.function_registry import load_function
 from miles.utils.hf_utils.config import HF_EXPORT_COMPLETE_MARKER
 from miles.utils.processing_utils import load_tokenizer
@@ -73,25 +71,8 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         self._agree(lambda: training_metrics.init_tracking(args))
         self._observed_response_tokens = 0
         torch.manual_seed(args.seed)
-        world = dist.get_world_size()
-        rank = dist.get_rank()
-        # Expert parallel ranks own different prompt samples, like Megatron's EP-inside-DP layout.
-        dp = GroupInfo(rank=rank, size=world, group=dist.group.WORLD, gloo_group=distributed_utils.get_gloo_group())
-        trivial = GroupInfo(rank=0, size=1, group=None)
-        parallel.set_parallel_state(
-            parallel.ParallelState(
-                intra_dp=dp,
-                intra_dp_cp=dp,
-                cp=trivial,
-                tp=trivial,
-                pp=trivial,
-                ep=trivial,
-                etp=trivial,
-                indep_dp=trivial,
-            )
-        )
-        self.train_parallel_config = {"dp_size": world}
         self.train_module, self.hf_config, self.model_config = models.build_train_module(args)
+        self.train_parallel_config = context_parallel.configure(self.train_module)
         self.model = self.train_module.model
         self.optimizer = self.train_module.optim
         self.lr_scheduler = scheduler.CoreLRScheduler(args, self.optimizer)
@@ -173,6 +154,7 @@ class OLMoCoreTrainRayActor(TrainRayActor):
 
     def _score_contract(self, rollout, rollout_id, source):
         """Validate the behavior-policy agreement gate and profile before any weight change."""
+        rollout = context_parallel.diagnostic_view(rollout)
         self._agree(lambda: contract.validate_training_data(rollout))
         agreement = self._agree(lambda: data.score_agreement(rollout))
         dist.all_reduce(agreement)
@@ -208,7 +190,11 @@ class OLMoCoreTrainRayActor(TrainRayActor):
     def _check_training_scores(self, rollout, training_scores):
         # Agree on local shape/finite-value failures before entering tensor collectives.
         sums, maximum = self._agree(
-            lambda: contract.scoring_check(rollout["log_probs"], training_scores, rollout["loss_masks"])
+            lambda: contract.scoring_check(
+                rollout["log_probs"],
+                training_scores,
+                context_parallel.local_masks(rollout, getattr(self.args, "context_parallel_size", 1)),
+            )
         )
         dist.all_reduce(sums)
         dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
@@ -251,7 +237,9 @@ class OLMoCoreTrainRayActor(TrainRayActor):
 
     def _batch_steps(self, rollout):
         samples = self._agree(lambda: data.sample_batches(rollout, self.args.olmo_core.max_sequence_length))
-        local_batch = self.args.global_batch_size // dist.get_world_size()
+        local_batch = self.args.global_batch_size // context_parallel.data_parallel_size(
+            getattr(self.args, "context_parallel_size", 1)
+        )
         self._agree(lambda: self._validate_step_batches(samples, local_batch))
         contract.validate_batch_schedule(len(samples), local_batch, samples[0]["tokens"].device)
         steps = [samples[i : i + local_batch] for i in range(0, len(samples), local_batch)]
@@ -266,7 +254,10 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             result.append(
                 self._agree(
                     lambda step=step, plan=plan, count=int(count): [
-                        packing.combine(step, indices) for indices in packing.equalize(plan, count)
+                        context_parallel.prepare_pack(
+                            packing.combine(step, indices), getattr(self.args, "context_parallel_size", 1)
+                        )
+                        for indices in packing.equalize(plan, count)
                     ]
                 )
             )
@@ -300,7 +291,9 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             steps = self._batch_steps(rollout)
             prepared_at = time.perf_counter()
             batches = [batch for step in steps for batch in step]
-            local_batch = self.args.global_batch_size // dist.get_world_size()
+            local_batch = self.args.global_batch_size // context_parallel.data_parallel_size(
+                getattr(self.args, "context_parallel_size", 1)
+            )
             if self.args.use_rollout_routing_replay:
                 self._agree(lambda: self._validate_replay_batches(batches))
             if self.args.olmo_core.publication_mode == "refresh":
@@ -357,8 +350,8 @@ class OLMoCoreTrainRayActor(TrainRayActor):
         capture = not decision.standalone
         scoring_mode = "standalone" if decision.standalone else ("checked" if checked else "skipped")
         miles_loss.compute_advantages_and_returns(self.args, rollout)
-        self._agree(lambda: contract.validate_training_data(rollout))
-        advantages = training_metrics.advantage_metrics(rollout)
+        self._agree(lambda: contract.validate_training_data(context_parallel.diagnostic_view(rollout)))
+        advantages = training_metrics.advantage_metrics(context_parallel.diagnostic_view(rollout))
         for step_batches in packing.bind_training_fields(steps, rollout):
             expert_metrics = None
             profile_interval = getattr(self.args.olmo_core, "layer_profile_interval", 0)
@@ -403,7 +396,9 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             self._agree(
                 lambda current=step_versions: self.clock.validate_versions(current, self.args.olmo_core.max_policy_lag)
             )
-            normalization = contract.step_normalization(step_batches, self.args.global_batch_size)
+            normalization = contract.step_normalization(
+                step_batches, self.args.global_batch_size, cp_size=context_parallel.degree()
+            )
             for batch in step_batches:
                 batch["aux_loss_div_factor"] = normalization.auxiliary_denominator
                 batch["aux_loss_response_div_factor"] = normalization.samples / normalization.world_size
@@ -492,6 +487,10 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                 )
                 if self.args.calculate_per_token_loss:
                     loss = normalization.scale_token_loss(loss)
+                else:
+                    # MILES scales response means for DP averaging. Core's
+                    # dense gradients average over DP x CP, so restore CP here.
+                    loss = loss * context_parallel.degree()
                 self._agree(lambda: self._validate_loss(loss))
                 values = training_metrics.loss_metrics(metrics, loss)
                 if getattr(self.args.olmo_core, "forced_exit_positions", 0):

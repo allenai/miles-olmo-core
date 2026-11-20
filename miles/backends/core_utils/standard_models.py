@@ -64,8 +64,7 @@ def _rope_scaling(model_type, rope):
     )
     if not math.isclose(supplied, expected, rel_tol=1e-12, abs_tol=1e-12):
         raise InputError(
-            f"Core YaRN derives attention_factor={expected}; HF specifies {supplied}. "
-            "A custom attention rescale factor requires explicit implementation and parity validation."
+            f"Core YaRN derives attention_factor={expected}; HF specifies {supplied}. A custom attention rescale factor requires explicit implementation and parity validation."
         )
     return scaling
 
@@ -124,6 +123,8 @@ def model_config_from_hf(hf: Any, options: Any) -> transformer.TransformerConfig
 
 def validate_training_options(args):
     """Reject MoE-only operations before model storage or checkpoint allocation."""
+    if getattr(args, "context_parallel_size", 1) > 1:
+        raise ValueError("Core Ulysses currently requires the MoE trainer")
     if args.olmo_core.compile_optimizer or args.olmo_core.use_reduce_scatter:
         raise InputError("Optimizer compilation and reduce-scatter controls currently require the Core MoE trainer")
     if getattr(args, "use_rollout_routing_replay", False):

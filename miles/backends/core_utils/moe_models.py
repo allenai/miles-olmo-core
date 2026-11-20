@@ -10,7 +10,7 @@ from olmo_core.optim import OLMoDDPOptimizerConfig
 from olmo_core.train.train_module import transformer as train_transformer
 from olmo_core.train.train_module.transformer import config as train_config
 
-from miles.backends.core_utils import data, fla_compat, fla_conv_compat
+from miles.backends.core_utils import context_parallel, data, fla_compat, fla_conv_compat
 from miles.backends.core_utils.timing import startup_stage
 
 
@@ -92,6 +92,11 @@ def build_train_module(args, *, common, optim, hf_config, hf_state):
         dp_config=train_config.TransformerDataParallelConfig(
             name=DataParallelType.ddp, use_reduce_scatter=args.olmo_core.use_reduce_scatter
         ),
+        cp_config=(
+            train_config.TransformerContextParallelConfig.ulysses(args.context_parallel_size)
+            if getattr(args, "context_parallel_size", 1) > 1
+            else None
+        ),
         ep_config=(
             train_config.TransformerExpertParallelConfig(degree=args.olmo_core.expert_parallel_size)
             if args.olmo_core.expert_parallel_size > 1
@@ -124,7 +129,11 @@ def load_native(module, path, *, optim=True):
 
 def validate_training_options(args):
     """MoE routing replay and expert parallelism are supported by this backend."""
+    context_parallel.validate_options(args)
 
 
 def replay_context(module, batch):
-    return replay.replay_routes(module.model, data.router_routes(module.model, batch))
+    routes = context_parallel.replay_routes(
+        module.model, data.router_routes(module.model, batch), packed="doc_lens" in batch
+    )
+    return replay.replay_routes(module.model, routes)

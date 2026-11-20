@@ -40,6 +40,7 @@ def _assert_the_snapshot_is_handed_back_unchanged(controller: _OrderRecordingInf
 
 class _ColocatedCellStub:
     def __init__(self) -> None:
+        self.startup_failure: str | None = None
         self.init_count = 0
         self.ready = False
 

@@ -42,8 +42,13 @@ def _worker(rank, rendezvous):
             for length, pg, clipped in samples:
                 count = length if token_average else 1
                 payload = {
-                    "keys": ["pg_loss", "pg_clipfrac", "train_rollout_logprob_abs_diff"],
-                    "values": torch.tensor([count, count * pg, count * clipped, count * pg / 10]),
+                    "keys": [
+                        "pg_loss",
+                        "pg_clipfrac",
+                        "train_rollout_logprob_abs_diff",
+                        "train_rollout_logprob_abs_diff_max",
+                    ],
+                    "values": torch.tensor([count, count * pg, count * clipped, count * pg / 10, pg / 4]),
                 }
                 batches.append(metrics.loss_metrics(payload, torch.tensor(pg / 10)))
             actual = metrics.aggregate_losses(batches)
@@ -51,6 +56,8 @@ def _worker(rank, rendezvous):
             assert actual["pg_loss"] == pytest.approx((54 if token_average else 14) / denominator)
             assert actual["pg_clipfrac"] == pytest.approx((6.5 if token_average else 1.5) / denominator)
             assert actual["train_rollout_logprob_abs_diff"] == pytest.approx(actual["pg_loss"] / 10)
+            # Extremes take the global maximum across microbatches and ranks, undivided.
+            assert actual["train_rollout_logprob_abs_diff_max"] == pytest.approx(2.0)
             assert "normalized_policy_objective" not in actual
             assert "_miles_metric_count" not in actual
             summary = metrics.step_summary(batches, {"load_balancing": 0.1 * rank, "router_z": 0.0}, 2.0 + rank)

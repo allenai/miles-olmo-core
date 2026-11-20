@@ -443,6 +443,11 @@ def log_cpu_memory(rollout_id: int, args: Namespace, label: str) -> None:
     tracking.log(args, log_dict, step_key=step_key)
 
 
+# Loss-function metrics that are extrema, not sums: combined across
+# micro-batches and ranks with MAX and never divided by the sample/token count.
+MAX_REDUCED_LOSS_KEYS = frozenset({"train_rollout_logprob_abs_diff_max"})
+
+
 def aggregate_train_losses(
     losses_reduced: list[dict[str, list[str] | torch.Tensor]],
     num_rollouts: int | None = None,
@@ -469,21 +474,33 @@ def aggregate_train_losses(
         return {}
 
     keys = losses_reduced[0]["keys"]
+    # values[0] is the count, so metric i lives at values[i + 1].
+    max_positions = [index + 1 for index, key in enumerate(keys) if key in MAX_REDUCED_LOSS_KEYS]
 
     values = None
     for log_dict in losses_reduced:
         if values is None:
             values = log_dict["values"].clone()
         else:
-            values += log_dict["values"]
+            current = log_dict["values"]
+            maxima = torch.maximum(values[max_positions], current[max_positions]) if max_positions else None
+            values += current
+            if max_positions:
+                values[max_positions] = maxima
 
     assert len(keys) + 1 == values.numel(), f"Expected {len(keys) + 1} values, got {values.numel()}"
 
+    maxima = values[max_positions].clone() if max_positions else None
     for group in parallel_state.effective_dp_cp.groups_inner_to_outer:
         MultiPGUtil.all_reduce(values, [group], op=dist.ReduceOp.SUM)
+        if max_positions:
+            MultiPGUtil.all_reduce(maxima, [group], op=dist.ReduceOp.MAX)
 
     loss_reduced = {}
     values = values.tolist()
+    maxima_by_key = (
+        dict(zip((keys[i - 1] for i in max_positions), maxima.tolist(), strict=True)) if max_positions else {}
+    )
     if num_rollouts is not None:
         num_samples_or_tokens = num_rollouts
         cp_factor = 1
@@ -492,7 +509,10 @@ def aggregate_train_losses(
         cp_factor = parallel_state.cp.size
 
     for key, value in zip(keys, values[1:], strict=False):
-        loss_reduced[key] = value * cp_factor / num_samples_or_tokens
+        if key in maxima_by_key:
+            loss_reduced[key] = maxima_by_key[key]
+        else:
+            loss_reduced[key] = value * cp_factor / num_samples_or_tokens
 
     return loss_reduced
 

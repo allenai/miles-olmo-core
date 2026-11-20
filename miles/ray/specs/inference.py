@@ -199,7 +199,7 @@ def _compute_spec_router(args, model_idx: int, model_cfg: ModelConfig) -> Comman
             _compute_router_primary_port_info(args, model_idx=model_idx),
             PortInfo(name="prometheus", static_port=9000, allow_dynamic=True),
         ],
-        env_var=lambda _ctx: {},
+        env_var=lambda _ctx: _router_test_env(),
         scheduling=SchedulingSpec.single(
             num_gpus_per_worker=0,
             # TODO: refactor the flag
@@ -207,6 +207,13 @@ def _compute_spec_router(args, model_idx: int, model_cfg: ModelConfig) -> Comman
         ),
         launch_command=_compute_launch_command,
     )
+
+
+def _router_test_env() -> dict[str, str]:
+    # TEST-ONLY (hardening integration, not for merge): preload a shim into the
+    # Rust router that drops reqwest's TCP_USER_TIMEOUT=30s socket option.
+    shim = os.environ.get("MILES_ROUTER_LD_PRELOAD")
+    return {"LD_PRELOAD": shim} if shim else {}
 
 
 def _compute_router_primary_port_info(args, model_idx: int) -> PortInfo:

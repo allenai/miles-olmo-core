@@ -73,7 +73,7 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         # Group tasks keyed for failure bookkeeping; a transport failure on one
         # request discards its whole group and requeues the pristine prompts.
         self._task_groups: dict[asyncio.Task[Any], int] = {}
-        self._errors = rollout_errors.RolloutErrors()
+        self._errors = rollout_errors.from_args(self.args)
         self._retry_after = 0.0
         self._ready_completion_counts: dict[int, dict[str, int]] = {}
         self._shutdown_unqueued_counts = dict(groups=0, samples=0, response_tokens=0)
@@ -272,7 +272,7 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
             category,
             rollout_errors.failure_description(error),
             retry,
-            rollout_errors.MAX_GROUP_RETRIES,
+            self._errors.max_group_retries,
             self._errors.failures.total(),
         )
         return True

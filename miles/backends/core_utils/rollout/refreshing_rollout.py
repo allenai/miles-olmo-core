@@ -15,6 +15,7 @@ from miles.backends.core_utils.rollout import (
     pipeline_observer,
     prompt_preparation,
     refresh_routing,
+    request_abort,
     rollout_errors,
     sibling_timing,
 )
@@ -29,6 +30,7 @@ from miles.rollout.generate_utils.generate_endpoint_utils import (
     update_sample_from_response,
 )
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
+from miles.rollout.inference_rollout.inference_rollout_train import get_worker_urls
 from miles.utils import logger_utils
 from miles.utils.http_utils import post
 from miles.utils.types import Sample
@@ -64,6 +66,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         self._partial_stats = None
         if self._min_group_size is not None:
             self._partial_stats = self._errors.partial = partial_groups.PartialGroupStats()
+        self._request_aborter = request_abort.RequestAborter(lambda: get_worker_urls(self.args))
 
     async def dispose(self):
         try:
@@ -202,6 +205,10 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             )
             if timing is not None:
                 timing["response_decoded_ready_unix"] = time.time()
+        except asyncio.CancelledError:
+            # A failed sibling or shutdown cancelled the await, not the engine request.
+            self._abort_abandoned_request(payload["rid"])
+            raise
         except httpx.HTTPError as error:
             logger.exception(
                 "Policy refresh HTTP failure: request=%s group=%s sample=%s url=%s elapsed_seconds=%.3f detail=%s attempts=1 delivery=unknown; correlate request with router/engine logs. No HTTP-level retry; passing failure to the producer for bounded group recovery.",
@@ -214,6 +221,8 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             )
             raise
         except TimeoutError as error:
+            # The deadline cancels the await; the engine would keep decoding to the end.
+            self._abort_abandoned_request(payload["rid"])
             raise GenerationRequestTimeout(
                 f"Policy refresh request {payload['rid']} exceeded core.refresh_request_timeout={timeout:g}s. "
                 "This covers serving queue time, generation and refresh pauses. Check engine progress and "
@@ -236,6 +245,12 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             record["replay_version"],
         )
         return GenerateFnOutput(samples=sample)
+
+    def _abort_abandoned_request(self, request_id):
+        # Constructor-less test doubles call _generate_response_impl directly.
+        aborter = getattr(self, "_request_aborter", None)
+        if aborter is not None:
+            aborter.abort(request_id)
 
     async def prepare_publication(self):
         """Park calls not yet admitted; finish only active generation for engine reuse."""

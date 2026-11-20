@@ -5,8 +5,12 @@ import math
 import torch
 from torch import distributed as dist
 
+from miles.backends.core_utils import contract
 from miles.backends.training_utils.metrics import log_utils
+from miles.utils import logger_utils
 from miles.utils.tracking_utils import tracking
+
+logger = logger_utils.setup_logger(__name__)
 
 _COUNT = "_miles_metric_count"
 _OBJECTIVE = "normalized_policy_objective"
@@ -145,4 +149,28 @@ def log_step(
     output.update({f"advantages/{key}": value for key, value in (advantages or {}).items()})
     output["train/step"] = clock.completed_steps - 1
     tracking.log(args, output, step_key="train/step")
+    return output
+
+
+def log_skipped_batches(args, clock, rollout_id, excluded):
+    """Record excluded optimizer batches on a collection axis, without fake steps."""
+    for index, normalization in excluded.items():
+        event = {
+            "event": "optimizer_skipped",
+            "reason": "no_active_tokens",
+            "rollout_id": rollout_id,
+            "batch_index": index,
+            "step": clock.completed_steps,
+            "normalization": vars(normalization),
+        }
+        logger.info("Core optimizer batch skipped: %s", contract.record(args, event))
+    if dist.get_rank() != 0:
+        return None
+    output = {
+        "train_skips/rollout_id": rollout_id,
+        "train_skips/no_active_token_batches": len(excluded),
+        "train_skips/excluded_samples": sum(item.samples for item in excluded.values()),
+        "train_skips/completed_steps": clock.completed_steps,
+    }
+    tracking.log(args, output, step_key="train_skips/rollout_id")
     return output

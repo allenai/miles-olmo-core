@@ -124,6 +124,14 @@ class NeverGiveUp(UnusedSamplesHandler):
         """Whether a failed attempt at ``chain_id`` would be retried rather than dropped."""
         return chain_id in self._chains
 
+    def pre_staleness_filter(self, group: list[Sample], *, current_version: int | None) -> list[Sample]:
+        return prune_stale_attempts(
+            group,
+            attempt_size=self._args.n_samples_per_prompt,
+            current_version=current_version,
+            max_staleness=self._args.max_weight_staleness,
+        )
+
     def _merge_into_kept(self, group: list[Sample]) -> None:
         """Replace the kept group with the chain's fresh-enough buffered attempts plus itself, each
         sample carrying the chain-wide baseline."""

@@ -24,7 +24,6 @@ from miles.rollout.filter_hub.common_filters import (
     group_staleness,
     group_weight_version_stats,
 )
-from miles.rollout.never_give_up import prune_stale_attempts
 from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
 
@@ -139,6 +138,8 @@ class DefaultDataBuffer(DataBuffer):
         assert self._capacity >= 1
 
         self._unused_handler_fn = input.unused_handler_fn
+        # Plain callable handlers predate the optional dequeue hook.
+        self._pre_staleness_filter = getattr(input.unused_handler_fn, "pre_staleness_filter", None)
         self._dynamic_filter = load_function(args.dynamic_sampling_filter_path)
         self._cond = asyncio.Condition()
         self._current_version: int | None = None
@@ -197,13 +198,8 @@ class DefaultDataBuffer(DataBuffer):
                     await self._cond.wait()
                 entry = self._buffer.pop(0)
                 self._cond.notify_all()  # wake producers blocked on a full buffer
-                if getattr(self._args, "async_unused_samples_handler", None) == "never_give_up":
-                    entry.group = prune_stale_attempts(  # only a merged never_give_up group has attempts to prune
-                        entry.group,
-                        attempt_size=self._args.n_samples_per_prompt,
-                        current_version=current_version,
-                        max_staleness=self._args.max_weight_staleness,
-                    )
+                if self._pre_staleness_filter is not None:
+                    entry.group = self._pre_staleness_filter(entry.group, current_version=current_version)
 
                 version_stats = group_weight_version_stats(entry.group)
                 staleness = version_stats.oldest_lag(current_version)

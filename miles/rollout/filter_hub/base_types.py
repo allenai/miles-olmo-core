@@ -31,6 +31,16 @@ class UnusedSamplesHandler(Protocol):
     def collect_metrics(self) -> dict[str, float]:
         return {}
 
+    def pre_staleness_filter(
+        self, group: list[Sample | list[Sample]], *, current_version: int | None
+    ) -> list[Sample | list[Sample]]:
+        """Return the nonempty group to check at dequeue time; by default, preserve it.
+
+        Handlers may trim retained work here. The buffer still applies its normal
+        whole-group staleness check and rejection callback to the returned group.
+        """
+        return group
+
 
 def discard_unused(data_source, prompt_group: list[Sample]) -> None:
     """Retire unused work without crediting training; legacy sources only have acknowledgements."""

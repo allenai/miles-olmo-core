@@ -83,8 +83,11 @@ leave the engines idle.
 Generation is the only thing that runs continuously. Everything else still happens on
 the driver's step schedule:
 
-1. The trainer drains `--rollout-batch-size` groups from the buffer, waiting if not
-   enough have finished yet.
+1. The trainer drains groups from the buffer until it holds
+   `--rollout-batch-size * --n-samples-per-prompt` completions, waiting if not enough have
+   finished yet. That is `--rollout-batch-size` groups unless `never_give_up` merged earlier
+   attempts into some of them. With a fixed global batch size, the oldest merged attempts that
+   overshoot are dropped; with `--use-dynamic-global-batch-size`, the step keeps them.
 2. It runs the optimizer step while the worker keeps generating.
 3. Every `--update-weights-interval` steps it pauses generation, synchronizes the new
    weights through the configured update mode, and resumes. The

@@ -100,8 +100,9 @@ class TestARayReferenceOnTheWire:
         with pytest.raises(RuntimeError, match="pin ray < 2.59"):
             _ray_store().remove(restored)
 
-    def test_ray_communication_leaves_the_object_to_reference_counting(self, monkeypatch, ray_local_mode):
-        """Nothing pins the object on that wire, and a free would destroy it for every other holder."""
+    def test_ray_communication_frees_the_object_too(self, monkeypatch, ray_local_mode):
+        """remove runs once every consumer is done; reference counting alone left one shard per trainer rank
+        per update in the producer's store, which then spilled to disk without bound."""
         from miles.utils import object_store
 
         freed: list[list] = []
@@ -111,7 +112,21 @@ class TestARayReferenceOnTheWire:
 
         store.remove(ref)
 
-        assert freed == []
+        assert freed == [[ref.payload]]
+
+    def test_ray_communication_without_the_free_api_falls_back_to_reference_counting(
+        self, monkeypatch, ray_local_mode
+    ):
+        """Nothing on this wire needs the free to be correct, so a newer ray warns instead of failing the run."""
+        from miles.utils import object_store
+
+        monkeypatch.setattr(object_store, "_ray_free", None)
+        store = _ray_store(frees_objects=False)
+        ref = store.put("payload")
+
+        with pytest.warns(RuntimeWarning, match="reference counting"):
+            store.remove(ref)
+
         assert store.get(ref).value == "payload"
 
 

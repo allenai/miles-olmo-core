@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import os
+import warnings
 from abc import ABC, abstractmethod
 from argparse import Namespace
 from collections.abc import Callable
@@ -144,8 +145,17 @@ class _RayStoreObjectRef(_BaseStoreObjectRef):
 
 
 class RayObjectStore(BaseObjectStore):
+    """``remove`` is called once every consumer is done with an object (the driver
+    after the train step, or a cancelled prepared batch), so it frees the object
+    for every holder. Reference counting alone is not enough on either wire: any
+    copy of the reference that outlives the step (a cloudpickled one is pinned
+    for the worker's lifetime) keeps a per-DP-rank batch shard in the producer's
+    store, which then spills to disk without bound."""
+
     def __init__(self, *, frees_objects: bool) -> None:
+        # True when the wire cloudpickles references (rpc), so nothing but a free can release them.
         self._frees_objects = frees_objects
+        self._warned_no_free = False
 
     def put(self, value: Any, value_spec: dict[str, ValueSpec] | None = None) -> StoreObjectRef:
         return _RayStoreObjectRef(payload=ray.put(value))
@@ -154,14 +164,24 @@ class RayObjectStore(BaseObjectStore):
         return ObjectStoreGetResult(value=ray.get(ref.payload), release_fn=_release_noop)
 
     def remove(self, ref: StoreObjectRef) -> None:
-        if not self._frees_objects:
-            return
         if _ray_free is None:
-            raise RuntimeError(
-                "this ray (>= 2.59) removed ray._private.internal_api.free, so an object pinned by a "
-                "serialized reference cannot be released by hand; pin ray < 2.59 for the rpc object wire"
-            )
-        _ray_free([ref.payload])
+            if self._frees_objects:
+                raise RuntimeError(
+                    "this ray (>= 2.59) removed ray._private.internal_api.free, so an object pinned by a "
+                    "serialized reference cannot be released by hand; pin ray < 2.59 for the rpc object wire"
+                )
+            if not self._warned_no_free:
+                self._warned_no_free = True
+                warnings.warn(
+                    "this ray (>= 2.59) has no ray._private.internal_api.free; removed objects are left to "
+                    "reference counting and leak if any reference outlives the step",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            return
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            _ray_free([ref.payload])
 
 
 def _release_noop(value: Any) -> None:

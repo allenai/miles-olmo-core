@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import pytest
+import ray
 import torch
 from pydantic import TypeAdapter, ValidationError
 
@@ -177,8 +178,8 @@ class TestRayObjectStore:
     def _ray_minicluster(self, ray_local_mode):
         yield
 
-    def test_roundtrip_and_noop_remove(self):
-        """RayObjectStore puts/gets a rollout dict and remove is a no-op."""
+    def test_roundtrip_and_remove(self):
+        """RayObjectStore puts/gets a rollout dict and remove frees it."""
         args = Namespace(object_store_backend="ray", worker_comm_backend="ray")
         store = object_store.init_instance(args)
         assert isinstance(store, object_store.RayObjectStore)
@@ -190,7 +191,9 @@ class TestRayObjectStore:
         with get_result:
             pass
         store.remove(ref)
-        _assert_roundtrip_equal(store.get(ref).value, data)
+        if object_store._ray_free is not None:
+            with pytest.raises(ray.exceptions.ObjectLostError):
+                ray.get(ref.payload, timeout=60)
 
     def test_get_instance_requires_init(self):
         """get_instance asserts when init_instance was never called."""

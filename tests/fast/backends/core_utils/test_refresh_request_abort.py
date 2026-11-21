@@ -309,3 +309,35 @@ def test_each_abort_is_sent_once_per_engine(engines):
 
     asyncio.run(scenario())
     assert aborted(engines) == ["a"]
+
+
+def test_a_large_abort_burst_does_not_block_the_event_loop(engines):
+    # A terminal drain cancels hundreds of groups at once. Queueing every
+    # (engine, rid) post on the httpx pool made httpcore's hand-off quadratic and
+    # held the producer loop for the whole final drain; posts are now bounded.
+    async def urls():
+        return [engine.url for engine in engines]
+
+    async def scenario():
+        lag = 0.0
+        done = False
+
+        async def ticker():
+            nonlocal lag
+            while not done:
+                started = asyncio.get_running_loop().time()
+                await asyncio.sleep(0.01)
+                lag = max(lag, asyncio.get_running_loop().time() - started - 0.01)
+
+        watcher = asyncio.create_task(ticker())
+        aborter = request_abort.RequestAborter(urls)
+        for index in range(1000):
+            aborter.abort(f"r{index}")
+        await asyncio.wait_for(aborter.wait_idle(), 60)
+        done = True
+        await watcher
+        return lag
+
+    lag = asyncio.run(scenario())
+    assert lag < 1.0
+    assert len(aborted(engines)) == 1000

@@ -90,8 +90,19 @@ class RequestAborter:
                 if not urls:
                     logger.warning("Could not abort %d abandoned generation request(s): no engines", len(request_ids))
                     continue
+                # Keep at most one connection pool's worth of posts in flight. httpcore
+                # rescans its whole wait queue on every connection hand-off, so queueing
+                # every (engine, rid) post at once is quadratic and blocks the event loop:
+                # 575 groups x 8 rids x 23 engines held the producer loop for the whole
+                # 2,700 s final drain (hardening-01).
+                slots = asyncio.Semaphore(_ABORT_LIMITS.max_connections)
+
+                async def bounded(url, request_id):
+                    async with slots:
+                        return await self._post(client, url, request_id)
+
                 results = await asyncio.gather(
-                    *(self._post(client, url, request_id) for url in urls for request_id in request_ids)
+                    *(bounded(url, request_id) for url in urls for request_id in request_ids)
                 )
                 failed = results.count(False)
                 if failed:

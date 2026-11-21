@@ -10,7 +10,7 @@ import httpx
 
 from miles.backends.core_utils import infra_timeouts
 from miles.backends.core_utils.publication import policy_refresh
-from miles.backends.core_utils.rollout import fault_injection
+from miles.backends.core_utils.rollout import fault_injection, loop_watchdog
 from miles.backends.core_utils.rollout import (
     partial_groups,
     pipeline_observer,
@@ -104,6 +104,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
     async def _generate_group(self, prompt_group):
         if any(s.generate_function_path or s.response_length or s.multimodal_inputs for s in prompt_group):
             raise ValueError("Policy refresh supports fresh, single-turn text requests without custom generators")
+        loop_watchdog.start(asyncio.get_running_loop(), self)
         observed = getattr(self.args.olmo_core, "pipeline_observation_interval", 0) > 0
         records = sibling_timing.start_group(prompt_group) if observed else None
         outcome = "completed"
@@ -360,6 +361,7 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         if self._shutdown_complete:
             return
         quiesced = False
+        loop_watchdog.start(asyncio.get_running_loop(), self)
         try:
             await pipeline_observer.write_lifecycle(self, "shutdown_start")
             if not abort:

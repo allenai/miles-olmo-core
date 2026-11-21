@@ -86,6 +86,7 @@ def make_args(**overrides) -> Namespace:
         async_max_concurrent_samples=None,
         async_data_buffer_capacity_factor=1000.0,
         async_unused_samples_handler="drop",
+        use_dynamic_global_batch_size=False,
         custom_async_data_buffer_path=None,
         custom_async_data_buffer_path_per_model=None,
         megatron_config=None,

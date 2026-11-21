@@ -20,10 +20,10 @@ The :class:`NeverGiveUp` handler is told why a group is or is not trained on:
   ``--max-weight-staleness`` weight versions old), so it holds a multiple of
   ``n_samples_per_prompt`` samples, and the chain ends.
 
-Without ``--use-dynamic-global-batch-size`` the rollout drains a fixed sample budget instead of a
-fixed group count, and :func:`fit_to_sample_budget` drops the oldest buffered attempts that
-overshoot it, so every collection still holds exactly ``rollout_batch_size * n_samples_per_prompt``
-samples.
+A rollout drains ``rollout_batch_size * n_samples_per_prompt`` completions rather than a fixed
+group count (see ``rollout_budget.py``). Without ``--use-dynamic-global-batch-size``,
+:func:`~miles.rollout.rollout_budget.drop_oldest_completions_to_fit` then drops the oldest buffered
+attempts that overshoot it, so every collection holds exactly that many completions.
 
 A merged group trains against its whole chain, stale-pruned attempts included: before the GRPO
 step, :func:`chain_rewards_and_std` shifts the rewards below the group max so the group's mean is
@@ -256,31 +256,6 @@ def prune_stale_attempts(
     attempts = _split_attempts(group, attempt_size=attempt_size)
     kept = [attempt for attempt in attempts[:-1] if not is_stale(attempt)]
     return [sample for attempt in [*kept, attempts[-1]] for sample in attempt]
-
-
-def fit_to_sample_budget(groups: list[list[Sample]], *, budget: int, attempt_size: int) -> list[list[Sample]]:
-    """Drop the oldest buffered attempts of merged groups until the groups hold ``budget`` samples.
-
-    The kept attempt (the last one) of every group always stays, so this needs at most
-    ``budget // attempt_size`` groups. Like stale pruning, the chain-wide baseline on the samples
-    still counts the dropped attempts' rewards.
-    """
-    attempts = [_split_attempts(group, attempt_size=attempt_size) for group in groups]
-    total = sum(len(group) for group in groups)
-    assert (
-        len(groups) * attempt_size <= budget <= total and (total - budget) % attempt_size == 0
-    ), f"cannot fit {len(groups)} groups of {total} samples to a budget of {budget}"
-
-    def age(position: tuple[int, int]) -> tuple[float, int]:
-        oldest = group_weight_version_stats(attempts[position[0]][position[1]]).oldest_version
-        return (float("-inf") if oldest is None else oldest, position[1])
-
-    buffered = [(g, a) for g, group_attempts in enumerate(attempts) for a in range(len(group_attempts) - 1)]
-    dropped = set(sorted(buffered, key=age)[: (total - budget) // attempt_size])
-    return [
-        [sample for a, attempt in enumerate(group_attempts) if (g, a) not in dropped for sample in attempt]
-        for g, group_attempts in enumerate(attempts)
-    ]
 
 
 def chain_rewards_and_std(

@@ -45,7 +45,7 @@ from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample
 from miles.rollout.group_metrics import group_size_metrics
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
-from miles.rollout.never_give_up import fit_to_sample_budget
+from miles.rollout.rollout_budget import rollout_budget
 from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.rollout.unused_samples import make_unused_samples_handler
 from miles.utils.function_registry import load_function
@@ -75,6 +75,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         # default to sample level backfill for fully async rollout
         self._scheduler = make_submission_scheduler(input.args, default="sample")
         self._handle_unused = make_unused_samples_handler(input.args, self.data_source)
+        self._budget = rollout_budget(input.args)
         self._sample_filter = load_function(input.args.rollout_sample_filter_path)
         self._worker: asyncio.Task | None = None
         self._eval_prompt_dataset_cache: dict = {}
@@ -196,18 +197,10 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         args = self.args
         assert args.rollout_global_dataset
 
-        target_data_size = args.rollout_batch_size
-        # Merged never_give_up groups vary the sample count, which a fixed global batch size cannot
-        # absorb: drain a sample budget instead, and fit the overshoot below.
-        sample_budget = (
-            args.rollout_batch_size * args.n_samples_per_prompt
-            if args.async_unused_samples_handler == "never_give_up" and not args.use_dynamic_global_batch_size
-            else None
-        )
         data: list[Group] = []
         do_print = True
 
-        while len(data) < target_data_size if sample_budget is None else sum(map(len, data)) < sample_budget:
+        while not self._budget.is_met(data):
             entry = await self._next_group(
                 current_version=input.weight_version, trainer_model_id=input.trainer_model_id
             )
@@ -227,8 +220,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             data.append(entry.group)
 
         metrics = group_size_metrics(data, attempt_size=args.n_samples_per_prompt, stage="selected")
-        if sample_budget is not None:
-            data = fit_to_sample_budget(data, budget=sample_budget, attempt_size=args.n_samples_per_prompt)
+        data = self._budget.fit(data)
         metrics["rollout/groups/budget_trimmed_samples"] = metrics["rollout/groups/selected/samples"] - sum(
             map(len, data)
         )

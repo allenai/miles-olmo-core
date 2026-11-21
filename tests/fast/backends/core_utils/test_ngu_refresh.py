@@ -14,12 +14,8 @@ from miles.rollout.base_types import RolloutFnConstructorInput
 from miles.rollout.data_source import RolloutDataSourceWithBuffer
 from miles.rollout.filter_hub.base_types import FilterOutput
 from miles.rollout.fully_async_data_buffer import DataBufferConstructorInput, DataBufferInput
-from miles.rollout.never_give_up import (
-    NGU_BASELINE_SAMPLE_COUNT_KEY,
-    NeverGiveUp,
-    chain_rewards_and_std,
-    fit_to_sample_budget,
-)
+from miles.rollout.never_give_up import NGU_BASELINE_SAMPLE_COUNT_KEY, NeverGiveUp, chain_rewards_and_std
+from miles.rollout.rollout_budget import drop_oldest_completions_to_fit
 from miles.utils.types import Sample
 
 
@@ -129,7 +125,7 @@ def test_refresh_retries_merge_then_prune_by_the_oldest_behavior_token(current_v
     spans = provenance(group)
     assert spans[-1][0]["version"] == 3
     assert spans[0][0]["version"] == (1 if expected_size == 16 else 3)
-    fitted = fit_to_sample_budget([group], budget=8, attempt_size=8)[0]
+    fitted = drop_oldest_completions_to_fit([group], target=8, attempt_size=8)[0]
     assert len(provenance(fitted)) == 8
     assert fitted[0].metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] == 16
     assert metrics["rollout/ngu/accepted_retried_chains"] == 1

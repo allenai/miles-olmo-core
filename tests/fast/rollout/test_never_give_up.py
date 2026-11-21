@@ -20,10 +20,10 @@ from miles.rollout.never_give_up import (
     NGU_BASELINE_SAMPLE_COUNT_KEY,
     NeverGiveUp,
     chain_rewards_and_std,
-    fit_to_sample_budget,
     make_retry_group,
     prune_stale_attempts,
 )
+from miles.rollout.rollout_budget import rollout_budget
 from miles.utils.arguments import _validate_never_give_up_args
 from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
 
@@ -416,24 +416,15 @@ class TestSampleBudget:
         assert metrics[prefix + "attempts_4/count"] == 0
         assert all(value == 0 for value in group_size_metrics([], attempt_size=4, stage="empty").values())
 
-    def test_the_oldest_buffered_attempts_go_first_and_the_kept_ones_stay(self):
-        groups = [_versioned(0, 3, 5), _versioned(1, 1, 2, 6), _versioned(2, 6)]
-
-        fitted = fit_to_sample_budget(groups, budget=4 * GROUP_SIZE, attempt_size=GROUP_SIZE)
-
-        assert [[sample.index for sample in group[::GROUP_SIZE]] for group in fitted] == [[0, 4], [8], [0]]
-
-    def test_a_budget_already_met_is_left_alone(self):
-        groups = [_versioned(0, 3, 5), _versioned(1, 6)]
-
-        assert fit_to_sample_budget(groups, budget=3 * GROUP_SIZE, attempt_size=GROUP_SIZE) == groups
-
-    def test_drain_fills_the_sample_budget_with_merged_groups(self):
-        """A fixed global batch size needs the same sample count every rollout, merged groups or not."""
-        entries = [_versioned(0, 1, 2), _versioned(1, 3, 4, 5), _versioned(2, 6)]
-        args = _args(rollout_global_dataset=True, rollout_batch_size=3, use_dynamic_global_batch_size=False)
+    @staticmethod
+    def _run_drain(entries: list[list[Sample]], *, use_dynamic_global_batch_size: bool):
+        args = _args(
+            rollout_global_dataset=True,
+            rollout_batch_size=3,
+            use_dynamic_global_batch_size=use_dynamic_global_batch_size,
+        )
         fn = object.__new__(FullyAsyncRolloutFn)
-        fn.args, fn._sample_filter = args, None
+        fn.args, fn._sample_filter, fn._budget = args, None, rollout_budget(args)
         fn._handle_unused = NeverGiveUp(args, data_source=Namespace())
         fn._output = Namespace(get_metrics=lambda trainer_model_id=None: {})
 
@@ -441,7 +432,13 @@ class TestSampleBudget:
             return DataBufferInput(prompt_group=[], group=entries.pop(0))
 
         fn._next_group = next_group
-        output = asyncio.run(fn._drain(Namespace(weight_version=6, trainer_model_id=None)))
+        return asyncio.run(fn._drain(Namespace(weight_version=6, trainer_model_id=None)))
+
+    def test_drain_fills_the_sample_budget_with_merged_groups(self):
+        """A fixed global batch size needs the same sample count every rollout, merged groups or not."""
+        entries = [_versioned(0, 1, 2), _versioned(1, 3, 4, 5), _versioned(2, 6)]
+
+        output = self._run_drain(entries, use_dynamic_global_batch_size=False)
 
         assert sum(map(len, output.samples)) == 3 * GROUP_SIZE
         assert [len(group) // GROUP_SIZE for group in output.samples] == [1, 2]  # both kept attempts survive
@@ -449,6 +446,16 @@ class TestSampleBudget:
         assert output.metrics["rollout/groups/selected/size_mean"] == 2.5 * GROUP_SIZE
         assert output.metrics["rollout/groups/training/size_mean"] == 1.5 * GROUP_SIZE
         assert output.metrics["rollout/groups/budget_trimmed_samples"] == 2 * GROUP_SIZE
+
+    def test_dynamic_global_batch_size_keeps_the_completion_overshoot(self):
+        """The drain still stops at the completion target, but the trainer absorbs the overshoot."""
+        entries = [_versioned(0, 1, 2), _versioned(1, 3, 4, 5), _versioned(2, 6)]
+
+        output = self._run_drain(entries, use_dynamic_global_batch_size=True)
+
+        assert [len(group) // GROUP_SIZE for group in output.samples] == [2, 3]
+        assert entries == [_versioned(2, 6)]
+        assert output.metrics["rollout/groups/budget_trimmed_samples"] == 0
 
 
 class TestValidateNeverGiveUpArgs:

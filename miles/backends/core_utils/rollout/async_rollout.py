@@ -24,10 +24,8 @@ import httpx
 from miles.backends.core_utils import async_capacity, infra_timeouts
 from miles.backends.core_utils.rollout import observation_io, pipeline_observer, rollout_errors
 from miles.backends.core_utils.rollout.errors import FINITE_POOL_PROVIDERS, GenerationInterrupted, PromptPoolExhausted
-from miles.rollout.filter_hub.common_filters import FilterReason
 from miles.rollout.fully_async_rollout import FullyAsyncRolloutFn
 from miles.rollout.inference_rollout.inference_rollout_train import get_worker_urls
-from miles.rollout.never_give_up import NeverGiveUp
 from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils import logger_utils
 from miles.utils.http_utils import post
@@ -87,41 +85,6 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         self._interrupted_groups: list[int] = []
         self._publication_paused = False
         self._drain_yield_at = 0.0
-        if getattr(self.args, "async_unused_samples_handler", None) == "drop":
-            self._handle_unused = self._acknowledge_unused
-        elif isinstance(self._handle_unused, NeverGiveUp):
-            mode = getattr(getattr(self.args, "olmo_core", None), "publication_mode", "barrier")
-            if mode not in ("barrier", "refresh"):
-                raise ValueError(f"never_give_up supports barrier or refresh publication, not {mode}")
-            self._never_give_up = self._handle_unused
-            self._handle_unused = self._never_give_up_unused
-
-    def _acknowledge_unused(self, prompt_group: list[Any], *, group: Any, reason: str | None) -> None:
-        """Retire a dropped group from the restart ledger.
-
-        Kept groups retire when their batch drains, and filter rejections when the producer's put
-        returns False, so only aborted and stale groups retire here.
-        """
-        if reason in (FilterReason.aborted, FilterReason.stale):
-            self._discard_unused(prompt_group)
-
-    def _never_give_up_unused(self, prompt_group: list[Any], *, group: Any, reason: str | None) -> None:
-        """Run never_give_up, retiring the aborted attempts it drops.
-
-        A requeued retry keeps its chain's group_index: the data source registers it again when the
-        retry is next drawn, so the chain stays in the restart ledger until it trains or is dropped.
-        """
-        dropped = reason == FilterReason.aborted and not self._never_give_up.has_pending_chain(
-            prompt_group[0].group_index
-        )
-        self._never_give_up(prompt_group, group=group, reason=reason)
-        if dropped:
-            self._discard_unused(prompt_group)
-
-    def _discard_unused(self, prompt_group: list[Any]) -> None:
-        # Dropped work must not count as optimizer exposure for feedback providers.
-        discard = getattr(self.data_source, "discard_groups", self.data_source.acknowledge_groups)
-        discard([prompt_group])
 
     async def dispose(self):
         try:

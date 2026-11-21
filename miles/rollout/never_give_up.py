@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from miles.rollout.filter_hub.base_types import UnusedSamplesHandler
+from miles.rollout.filter_hub.base_types import UnusedSamplesHandler, discard_unused
 from miles.rollout.filter_hub.common_filters import FilterReason, group_staleness, group_weight_version_stats
 from miles.utils.types import Sample
 
@@ -75,6 +75,9 @@ class NeverGiveUp(UnusedSamplesHandler):
     """
 
     def __init__(self, args, *, data_source: "RolloutDataSourceWithBuffer"):
+        mode = getattr(getattr(args, "olmo_core", None), "publication_mode", "barrier")
+        if mode not in ("barrier", "refresh"):
+            raise ValueError(f"never_give_up supports barrier or refresh publication, not {mode}")
         self._args = args
         self._data_source = data_source
         self._rng = random.Random(args.rollout_seed)
@@ -108,6 +111,10 @@ class NeverGiveUp(UnusedSamplesHandler):
             self._merge_into_kept(group)
         elif reason in (FilterReason.aborted, FilterReason.missing_reward):
             self._retry_pending_chain(group)
+            # Missing rewards are retired by the producer's False put result. Aborted
+            # work reaches this handler without that result and needs explicit retirement.
+            if reason == FilterReason.aborted and not self.has_pending_chain(prompt_group[0].group_index):
+                discard_unused(self._data_source, prompt_group)
         elif reason == FilterReason.stale:
             self._keep_going_after_stale(group)
         else:

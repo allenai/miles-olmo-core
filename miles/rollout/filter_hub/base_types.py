@@ -28,9 +28,17 @@ class UnusedSamplesHandler(Protocol):
         self, prompt_group: list[Sample], *, group: list[Sample | list[Sample]], reason: str | None
     ) -> None: ...
 
+    def collect_metrics(self) -> dict[str, float]:
+        return {}
 
-def drop_unused(prompt_group: list[Sample], *, group: list[Sample | list[Sample]], reason: str | None) -> None:
-    """The ``drop`` handler: every unused group is discarded."""
+
+def discard_unused(data_source, prompt_group: list[Sample]) -> None:
+    """Retire unused work without crediting training; legacy sources only have acknowledgements."""
+    discard = getattr(data_source, "discard_groups", None)
+    if discard is None:
+        discard = getattr(data_source, "acknowledge_groups", None)
+    if discard is not None:
+        discard([prompt_group])
 
 
 def iter_samples(group: list[Sample | list[Sample]]) -> Iterator[Sample]:

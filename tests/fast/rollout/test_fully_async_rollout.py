@@ -976,7 +976,7 @@ async def test_custom_data_buffer_path_replaces_default(monkeypatch):
     output = await fn(RolloutFnTrainInput(rollout_id=0))
 
     assert type(fn._output) is RecordingBuffer
-    assert RecordingBuffer.constructed_with.unused_handler_fn == fn._recycle
+    assert RecordingBuffer.constructed_with.unused_handler_fn is fn._handle_unused
     assert len(output.samples) == 2
 
 

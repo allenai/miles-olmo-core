@@ -6,12 +6,12 @@ from argparse import Namespace
 import pytest
 
 from miles.backends.core_utils.rollout.async_buffer import HomogeneousPolicyDataBuffer, MeasuredDataBuffer
-from miles.backends.core_utils.rollout.async_rollout import ManagedFullyAsyncRolloutFn
 from miles.rollout.data_source import RolloutDataSourceWithBuffer
 from miles.rollout.filter_hub.base_types import FilterOutput, MetricGatherer
 from miles.rollout.filter_hub.common_filters import FilterReason
 from miles.rollout.fully_async_data_buffer import DataBufferConstructorInput, DataBufferInput
 from miles.rollout.never_give_up import NeverGiveUp
+from miles.rollout.unused_samples import DropUnused
 from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
 
 
@@ -25,16 +25,16 @@ class _Ledger:
 
 @pytest.mark.parametrize("reason", [FilterReason.aborted, FilterReason.stale])
 def test_dropped_work_uses_discard_feedback(reason):
-    rollout = object.__new__(ManagedFullyAsyncRolloutFn)
-    rollout.data_source = _Ledger()
+    source = _Ledger()
+    handler = DropUnused(source)
     discarded = []
-    rollout.data_source.discard_groups = discarded.extend
+    source.discard_groups = discarded.extend
     group = _group(2)
 
-    rollout._acknowledge_unused(group, group=group, reason=reason)
+    handler(group, group=group, reason=reason)
 
     assert discarded == [group]
-    assert rollout.data_source.acknowledged == []
+    assert source.acknowledged == []
 
 
 def _group(size: int) -> list:
@@ -43,16 +43,16 @@ def _group(size: int) -> list:
 
 def test_drop_retires_every_unused_group_but_not_a_kept_one():
     """A kept group retires when its batch drains; retiring it here too would fail that drain."""
-    rollout = object.__new__(ManagedFullyAsyncRolloutFn)
-    rollout.data_source = _Ledger()
+    source = _Ledger()
+    handler = DropUnused(source)
     group = _group(2)
 
-    rollout._acknowledge_unused(group, group=group, reason=FilterReason.kept)
-    assert rollout.data_source.acknowledged == []
+    handler(group, group=group, reason=FilterReason.kept)
+    assert source.acknowledged == []
 
     for reason in (FilterReason.aborted, FilterReason.stale):
-        rollout._acknowledge_unused(group, group=group, reason=reason)
-    assert rollout.data_source.acknowledged == [group, group]
+        handler(group, group=group, reason=reason)
+    assert source.acknowledged == [group, group]
 
 
 def test_a_rejected_policy_group_reaches_the_handler_as_aborted():
@@ -72,13 +72,13 @@ def test_a_rejected_policy_group_reaches_the_handler_as_aborted():
 
 def test_drop_leaves_a_filter_rejection_to_the_producer():
     """The producer retires a group whose put returns False; retiring it here too would fail that call."""
-    rollout = object.__new__(ManagedFullyAsyncRolloutFn)
-    rollout.data_source = _Ledger()
+    source = _Ledger()
+    handler = DropUnused(source)
     group = _group(2)
 
-    rollout._acknowledge_unused(group, group=group, reason="zero_std")
+    handler(group, group=group, reason="zero_std")
 
-    assert rollout.data_source.acknowledged == []
+    assert source.acknowledged == []
 
 
 def test_a_filter_rejection_reaches_the_handler_and_the_producer_retires_it():
@@ -98,42 +98,19 @@ def test_a_filter_rejection_reaches_the_handler_and_the_producer_retires_it():
     assert calls == ["zero_std"]
 
 
-class _NeverGiveUp:
-    def __init__(self, pending: bool):
-        self.pending, self.calls = pending, []
+@pytest.mark.parametrize("feedback", [False, True])
+def test_never_give_up_retires_an_aborted_attempt_it_drops(feedback):
+    source = _Ledger()
+    discarded = []
+    if feedback:
+        source.discard_groups = discarded.extend
+    handler = NeverGiveUp(Namespace(rollout_seed=0), data_source=source)
+    group = _group(2)
 
-    def has_pending_chain(self, chain_id):
-        return self.pending
+    handler(group, group=group, reason=FilterReason.aborted)
 
-    def __call__(self, prompt_group, *, group, reason):
-        self.calls.append(reason)
-
-
-def _never_give_up_rollout(pending: bool) -> ManagedFullyAsyncRolloutFn:
-    rollout = object.__new__(ManagedFullyAsyncRolloutFn)
-    rollout.data_source = _Ledger()
-    rollout._never_give_up = _NeverGiveUp(pending)
-    return rollout
-
-
-def test_never_give_up_retires_an_aborted_attempt_it_drops():
-    """A dropped prompt that stays outstanding would be regenerated after every resume."""
-    rollout, group = _never_give_up_rollout(pending=False), _group(2)
-
-    rollout._never_give_up_unused(group, group=group, reason=FilterReason.aborted)
-
-    assert rollout._never_give_up.calls == [FilterReason.aborted]
-    assert rollout.data_source.acknowledged == [group]
-
-
-def test_never_give_up_keeps_an_aborted_attempt_it_retries_outstanding():
-    """The retry reuses the chain's group_index, which must still be outstanding when it trains."""
-    for reason in (FilterReason.aborted, FilterReason.stale, FilterReason.kept, "zero_std"):
-        rollout, group = _never_give_up_rollout(pending=reason == FilterReason.aborted), _group(2)
-
-        rollout._never_give_up_unused(group, group=group, reason=reason)
-
-        assert rollout.data_source.acknowledged == []
+    assert discarded == ([group] if feedback else [])
+    assert source.acknowledged == ([] if feedback else [group])
 
 
 class _LedgerDataSource(RolloutDataSourceWithBuffer):
@@ -171,7 +148,8 @@ def _versioned_group(rewards, *, first_index):
     ]
 
 
-def test_a_never_give_up_chain_stays_in_the_ledger_until_its_merged_group_drains():
+@pytest.mark.parametrize("abort_retry", [False, True])
+def test_a_never_give_up_chain_stays_in_the_ledger_until_its_merged_group_drains(abort_retry):
     """The retry reuses the chain's group_index after the producer retired the rejected attempt."""
     args = Namespace(
         rollout_global_dataset=False,
@@ -188,12 +166,8 @@ def test_a_never_give_up_chain_stays_in_the_ledger_until_its_merged_group_drains
         max_weight_staleness=4,
     )
     source = _LedgerDataSource(args)
-    rollout = object.__new__(ManagedFullyAsyncRolloutFn)
-    rollout.data_source = source
-    rollout._never_give_up = NeverGiveUp(args, data_source=source)
-    buffer = HomogeneousPolicyDataBuffer(
-        DataBufferConstructorInput(args=args, unused_handler_fn=rollout._never_give_up_unused)
-    )
+    handler = NeverGiveUp(args, data_source=source)
+    buffer = HomogeneousPolicyDataBuffer(DataBufferConstructorInput(args=args, unused_handler_fn=handler))
 
     async def run():
         first = _versioned_group([0.0, 0.0], first_index=0)
@@ -202,6 +176,10 @@ def test_a_never_give_up_chain_stays_in_the_ledger_until_its_merged_group_drains
         source.acknowledge_groups([first])  # what the producer does on False
 
         [retry] = source.get_samples(1)
+        if abort_retry:
+            handler(retry, group=retry, reason=FilterReason.aborted)
+            assert 0 in source.pending
+            [retry] = source.get_samples(1)
         for sample, reward in zip(retry, [1.0, 0.0], strict=True):
             sample.reward, sample.status = reward, Sample.Status.COMPLETED
             sample.weight_versions = first[0].weight_versions

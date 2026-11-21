@@ -96,7 +96,7 @@ def test_refresh_producer_keeps_the_ngu_handler_through_publication(monkeypatch)
         first = complete([Sample(group_index=7, index=i, prompt="prompt") for i in range(8)], versions=(1, 2))
         fn._handle_unused(first, group=first, reason="zero_std")
         await fn.begin_refresh()
-        assert fn._never_give_up.has_pending_chain(7)
+        assert fn._handle_unused.has_pending_chain(7)
         assert not fn._producer_resumed.is_set()
         await fn.end_refresh()
         assert fn._producer_resumed.is_set()
@@ -104,7 +104,7 @@ def test_refresh_producer_keeps_the_ngu_handler_through_publication(monkeypatch)
         fn._handle_unused(retry, group=retry, reason="kept")
         assert len(retry) == 16
         assert len(provenance(retry)) == 16
-        assert fn._ngu_handler.collect_metrics()["rollout/ngu/accepted_retried_chains"] == 1
+        assert fn._handle_unused.collect_metrics()["rollout/ngu/accepted_retried_chains"] == 1
 
     asyncio.run(run())
 

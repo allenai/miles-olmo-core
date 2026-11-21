@@ -434,7 +434,7 @@ class TestSampleBudget:
         args = _args(rollout_global_dataset=True, rollout_batch_size=3, use_dynamic_global_batch_size=False)
         fn = object.__new__(FullyAsyncRolloutFn)
         fn.args, fn._sample_filter = args, None
-        fn._handle_unused = lambda prompt_group, **_: None  # the Core producer wraps the handler
+        fn._handle_unused = NeverGiveUp(args, data_source=Namespace())
         fn._output = Namespace(get_metrics=lambda trainer_model_id=None: {})
 
         async def next_group(*, current_version, trainer_model_id=None):

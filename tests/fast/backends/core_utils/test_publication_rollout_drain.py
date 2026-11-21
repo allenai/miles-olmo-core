@@ -11,6 +11,7 @@ from miles.backends.core_utils.rollout.draining_rollout import DrainingRolloutFn
 from miles.backends.core_utils.rollout.refreshing_rollout import RefreshingRolloutFn
 from miles.rollout.base_types import RolloutFnTrainInput
 from miles.rollout.fully_async_data_buffer import DataBufferConstructorInput, DataBufferInput
+from miles.rollout.rollout_budget import rollout_budget
 from miles.utils.types import Sample
 
 
@@ -26,6 +27,7 @@ def test_native_drain_preserves_core_single_policy_contract(trainer_model_id, pr
             rollout_batch_size=1,
             n_samples_per_prompt=1,
             global_batch_size=1,
+            use_dynamic_global_batch_size=False,
             max_weight_staleness=1,
             async_data_buffer_capacity_factor=1,
             dynamic_sampling_filter_path=None,
@@ -55,6 +57,7 @@ def test_native_drain_preserves_core_single_policy_contract(trainer_model_id, pr
         producer._output = buffer_type(DataBufferConstructorInput(args, lambda samples: None))
         producer.controller = SimpleNamespace(check=lambda: None)
         producer._sample_filter = None
+        producer._budget = rollout_budget(args)
         producer._publication_paused = producer._refreshing = producer._stopping = False
         producer._producer_resumed = asyncio.Event()
         producer._reserved_groups = None

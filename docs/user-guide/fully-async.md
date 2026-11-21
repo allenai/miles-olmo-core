@@ -83,8 +83,11 @@ leave the engines idle.
 Generation is the only thing that runs continuously. Everything else still happens on
 the driver's step schedule:
 
-1. The trainer drains `--rollout-batch-size` groups from the buffer, waiting if not
-   enough have finished yet.
+1. The trainer drains groups from the buffer until it holds
+   `--rollout-batch-size * --n-samples-per-prompt` completions, waiting if not enough have
+   finished yet. That is `--rollout-batch-size` groups unless `never_give_up` merged earlier
+   attempts into some of them. With a fixed global batch size, the oldest merged attempts that
+   overshoot are dropped; with `--use-dynamic-global-batch-size`, the step keeps them.
 2. It runs the optimizer step while the worker keeps generating.
 3. Every `--update-weights-interval` steps it pauses generation, synchronizes the new
    weights through the configured update mode, and resumes. The
@@ -181,7 +184,7 @@ Staleness control decides which of those groups training is allowed to see:
 | Flag | Effect |
 |---|---|
 | `--max-weight-staleness` | Maximum gap between a group's oldest weight version and the current engine version. Unset by default, which disables the filter |
-| `--async-unused-samples-handler` | What happens to a group training does not use, either aborted or too stale. The default `drop` discards it; `retry` recycles its prompts into the data source for regeneration. Dynamic-filter rejects are always dropped |
+| `--async-unused-samples-handler` | What happens to a group training does not use, either aborted or too stale. The default `drop` discards it; `retry` recycles its prompts into the data source for regeneration. Dynamic-filter rejects are dropped, except by `never_give_up`, which retries them and merges earlier attempts into the group that finally trains |
 
 When those knobs are not enough, `--custom-async-data-buffer-path` replaces the buffer
 itself. This is a larger step than setting any flag above: your `DataBuffer` subclass

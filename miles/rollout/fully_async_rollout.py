@@ -42,9 +42,12 @@ from miles.rollout.fully_async_data_buffer import (
     first_sample,
 )
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
+from miles.rollout.group_metrics import group_size_metrics
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
+from miles.rollout.rollout_budget import rollout_budget
 from miles.rollout.submission_scheduler import make_submission_scheduler
+from miles.rollout.unused_samples import make_unused_samples_handler
 from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
 
@@ -71,11 +74,8 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self.state = GenerateState(input.args)
         # default to sample level backfill for fully async rollout
         self._scheduler = make_submission_scheduler(input.args, default="sample")
-        assert input.args.async_unused_samples_handler in ("retry", "drop")
-        # applied to every group we do not train on; "drop" discards instead of recycling
-        self._handle_unused = (
-            self._recycle if input.args.async_unused_samples_handler == "retry" else (lambda prompt_group: None)
-        )
+        self._handle_unused = make_unused_samples_handler(input.args, self.data_source)
+        self._budget = rollout_budget(input.args)
         self._sample_filter = load_function(input.args.rollout_sample_filter_path)
         self._worker: asyncio.Task | None = None
         self._eval_prompt_dataset_cache: dict = {}
@@ -197,15 +197,15 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         args = self.args
         assert args.rollout_global_dataset
 
-        target_data_size = args.rollout_batch_size
         data: list[Group] = []
         do_print = True
 
-        while len(data) < target_data_size:
+        while not self._budget.is_met(data):
             entry = await self._next_group(
                 current_version=input.weight_version, trainer_model_id=input.trainer_model_id
             )
-            assert len(entry.group) == args.n_samples_per_prompt
+            # A never_give_up group merges several attempts at its prompt.
+            assert len(entry.group) % args.n_samples_per_prompt == 0
 
             if do_print:
                 sample = first_sample(entry.group)
@@ -218,6 +218,12 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
                 do_print = False
 
             data.append(entry.group)
+
+        metrics = group_size_metrics(data, attempt_size=args.n_samples_per_prompt, stage="selected")
+        data = self._budget.fit(data)
+        metrics["rollout/groups/budget_trimmed_samples"] = metrics["rollout/groups/selected/samples"] - sum(
+            map(len, data)
+        )
 
         sample = first_sample(data[-1])
         logger.info(
@@ -232,12 +238,12 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         if self._sample_filter is not None:
             self._sample_filter(args, data)
 
-        return RolloutFnTrainOutput(samples=data, metrics=self._output.get_metrics(input.trainer_model_id))
-
-    def _recycle(self, prompt_group: list[Sample]) -> None:
-        for sample in prompt_group:
-            sample.reset_for_retry()
-        self.data_source.add_samples([prompt_group])
+        metrics.update(group_size_metrics(data, attempt_size=args.n_samples_per_prompt, stage="training"))
+        if (handler := getattr(self, "_handle_unused", None)) is not None:
+            metrics.update(handler.collect_metrics())
+        return RolloutFnTrainOutput(
+            samples=data, metrics={**self._output.get_metrics(input.trainer_model_id), **metrics}
+        )
 
 
 async def _end_worker(worker: asyncio.Task) -> None:

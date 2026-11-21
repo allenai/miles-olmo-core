@@ -6,6 +6,8 @@ from unittest.mock import Mock
 import pytest
 
 from miles.backends.core_utils.rollout import async_rollout
+from miles.rollout.unused_samples import make_unused_samples_handler
+from miles.utils.types import Sample
 
 
 @pytest.mark.parametrize("feedback", [False, True])
@@ -17,16 +19,16 @@ def test_unused_handler_preserves_drop_and_retry_contract(monkeypatch, feedback,
 
     def base_init(self, input):
         self.args, self.data_source = input.args, input.data_source
-        self._handle_unused = source.add_samples
+        self._handle_unused = make_unused_samples_handler(input.args, source)
 
     monkeypatch.setattr(async_rollout.FullyAsyncRolloutFn, "__init__", base_init)
     monkeypatch.setattr(async_rollout.async_capacity, "report", lambda *args: {"warnings": []})
     args = SimpleNamespace(async_unused_samples_handler=handling)
     producer = async_rollout.ManagedFullyAsyncRolloutFn(SimpleNamespace(args=args, data_source=source))
-    group = [SimpleNamespace(group_index=3)]
-    producer._handle_unused(group)
+    group = [Sample(group_index=3)]
+    producer._handle_unused(group, group=group, reason="stale")
     if handling == "retry":
-        source.add_samples.assert_called_once_with(group)
+        source.add_samples.assert_called_once_with([group])
         source.acknowledge_groups.assert_not_called()
         if feedback:
             source.discard_groups.assert_not_called()

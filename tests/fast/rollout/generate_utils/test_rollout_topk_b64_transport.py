@@ -32,9 +32,10 @@ def _b64_meta(logps=_LOGPS, ids=_IDS) -> dict:
     meta = _nested_meta(logps, ids)
     del meta["output_top_logprobs"]
     meta.update(
-        output_top_logprobs_val_b64=pybase64.b64encode(np.ascontiguousarray(logps, "<f4").tobytes()).decode(),
-        output_top_logprobs_idx_b64=pybase64.b64encode(np.ascontiguousarray(ids, "<i4").tobytes()).decode(),
+        output_top_logprobs_val_flat_b64=pybase64.b64encode(np.ascontiguousarray(logps, "<f4").tobytes()).decode(),
+        output_top_logprobs_idx_flat_b64=pybase64.b64encode(np.ascontiguousarray(ids, "<i4").tobytes()).decode(),
         output_top_logprobs_shape=list(logps.shape),
+        output_top_logprobs_null_prefix=0,
     )
     return meta
 
@@ -49,26 +50,27 @@ def test_native_selected_requests_request_base64_candidates() -> None:
     request = {"sampling_params": {}}
     configure_rollout_topk_logprobs_request(_args(rollout_top_logprobs_num=20), request)
     assert request["top_logprobs_num"] == 20
-    assert request["return_output_top_logprobs_b64"] is True
+    assert request["return_flat_raw_output_top_logprobs"] is True
+    assert request["return_flat_raw_top_logprobs_b64"] is True
 
 
 @pytest.mark.parametrize("openai", [False, True])
 def test_support_mode_and_openai_keep_their_formats(openai: bool) -> None:
     request = {} if openai else {"sampling_params": {}}
     configure_rollout_topk_logprobs_request(_args(rollout_top_logprobs_num=20), request, openai=openai)
-    assert ("return_output_top_logprobs_b64" in request) is not openai
+    assert ("return_flat_raw_output_top_logprobs" in request) is not openai
     request = {"top_p": 0.9} if openai else {"sampling_params": {"top_p": 0.9}}
     configure_rollout_topk_logprobs_request(
         _args(rollout_top_logprobs_num=20, rollout_sampling_logprobs_mode="support"), request, openai=openai
     )
-    assert "return_output_top_logprobs_b64" not in request
+    assert "return_flat_raw_output_top_logprobs" not in request
 
 
 def test_nested_consumer_keeps_nested_candidates() -> None:
     # Top-k OPD sets top_logprobs_num first and reads nested output_top_logprobs.
     request = {"sampling_params": {}, "top_logprobs_num": 8}
     configure_rollout_topk_logprobs_request(_args(rollout_top_logprobs_num=20), request)
-    assert "return_output_top_logprobs_b64" not in request
+    assert "return_flat_raw_output_top_logprobs" not in request
 
 
 def test_base64_matches_nested_records() -> None:
@@ -92,6 +94,16 @@ def test_narrower_server_width_is_padded() -> None:
     assert np.isneginf(sample.rollout_topk_log_probs[:, 2]).all()
 
 
+def test_leading_rows_without_candidates_are_padded() -> None:
+    meta = _b64_meta(_LOGPS[1:], _IDS[1:])
+    meta["output_token_logprobs"] = _nested_meta()["output_token_logprobs"]
+    meta["output_top_logprobs_null_prefix"] = 1
+    sample = _append(meta)
+    assert sample.rollout_topk_token_ids[0].tolist() == [-1, -1, -1]
+    assert np.isneginf(sample.rollout_topk_log_probs[0]).all()
+    np.testing.assert_array_equal(sample.rollout_topk_token_ids[1:], _IDS[1:])
+
+
 def test_row_count_mismatch_is_rejected() -> None:
     meta = _b64_meta()
     meta["output_token_logprobs"] = meta["output_token_logprobs"][:1]
@@ -109,8 +121,8 @@ def test_buffer_size_mismatch_is_rejected() -> None:
 def test_http_worker_decodes_buffers_once() -> None:
     response = compact_token_logprobs({"meta_info": _b64_meta(), "text": ""})
     meta = response["meta_info"]
-    assert isinstance(meta["output_top_logprobs_val_b64"], np.ndarray)
-    assert isinstance(meta["output_top_logprobs_idx_b64"], np.ndarray)
+    assert isinstance(meta["output_top_logprobs_val_flat_b64"], np.ndarray)
+    assert isinstance(meta["output_top_logprobs_idx_flat_b64"], np.ndarray)
     meta = pickle.loads(pickle.dumps(meta))
     sample = _append(meta)
     np.testing.assert_array_equal(sample.rollout_topk_token_ids, _IDS)

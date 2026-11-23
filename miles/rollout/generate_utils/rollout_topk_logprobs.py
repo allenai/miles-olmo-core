@@ -40,7 +40,8 @@ def configure_rollout_topk_logprobs_request(args: Namespace, request: dict[str, 
         # Another consumer (top-k OPD) reads nested output_top_logprobs.
         if "top_logprobs_num" not in request:
             # Two base64 [response, k] arrays instead of k records per token.
-            request["return_output_top_logprobs_b64"] = True
+            request["return_flat_raw_output_top_logprobs"] = True
+            request["return_flat_raw_top_logprobs_b64"] = True
         request["top_logprobs_num"] = k
 
 
@@ -58,7 +59,7 @@ def append_rollout_topk_logprobs(
         return
     n = len(meta.get("output_token_logprobs") or [])
     support_mode = sampling_logprobs_mode == "support"
-    if not support_mode and meta.get("output_top_logprobs_val_b64") is not None:
+    if not support_mode and meta.get("output_top_logprobs_val_flat_b64") is not None:
         ids, logps = decode_output_top_logprobs(meta, n, k)
         _append_topk_arrays(sample, ids, logps)
         return
@@ -88,31 +89,34 @@ def _append_topk_arrays(sample: Sample, ids: np.ndarray, logps: np.ndarray) -> N
 
 
 def decode_output_top_logprobs(meta: Mapping[str, Any], n: int, k: int) -> tuple[np.ndarray, np.ndarray]:
-    """Read SGLang's base64 candidate arrays as int32 IDs and float32 logprobs [n, k].
+    """Read SGLang's flat base64 candidates as int32 IDs and float32 logprobs [n, k].
 
-    The server pads unavailable slots with ID -1/logp -inf, matching the nested path.
-    Values may already be decoded to flat arrays by the HTTP worker.
+    ``output_top_logprobs_shape`` is [rows, width]; ``output_top_logprobs_null_prefix``
+    leading tokens have no candidates. Missing slots become ID -1/logp -inf, as in
+    the nested path. Values may already be decoded to flat arrays by the HTTP worker.
     """
     shape = meta.get("output_top_logprobs_shape")
     if shape is None or len(shape) != 2:
-        raise ValueError("SGLang base64 top logprobs require output_top_logprobs_shape")
+        raise ValueError("SGLang flat top logprobs require output_top_logprobs_shape")
     rows, width = (int(x) for x in shape)
-    if rows != n:
+    null_prefix = int(meta.get("output_top_logprobs_null_prefix") or 0)
+    if null_prefix + rows != n:
         raise ValueError(
-            f"Rollout top-k logprobs collection requires candidates for every generated token: {rows} rows for {n} tokens"
+            "Rollout top-k logprobs collection requires candidates for every generated token: "
+            f"{null_prefix} + {rows} rows for {n} tokens"
         )
-    logps = decode_float32_buffer(meta["output_top_logprobs_val_b64"])
-    ids = decode_int32_buffer(meta["output_top_logprobs_idx_b64"])
+    logps = decode_float32_buffer(meta["output_top_logprobs_val_flat_b64"])
+    ids = decode_int32_buffer(meta["output_top_logprobs_idx_flat_b64"])
     if logps.size != rows * width or ids.size != rows * width:
-        raise ValueError("SGLang base64 top logprobs do not match output_top_logprobs_shape")
+        raise ValueError("SGLang flat top logprobs do not match output_top_logprobs_shape")
     logps, ids = logps.reshape(rows, width), ids.reshape(rows, width)
-    if width == k:
+    if width == k and not null_prefix:
         return ids.copy(), logps.copy()
     out_ids = np.full((n, k), -1, dtype=np.int32)
     out_logps = np.full((n, k), -np.inf, dtype=np.float32)
     width = min(width, k)
-    out_ids[:, :width] = ids[:, :width]
-    out_logps[:, :width] = logps[:, :width]
+    out_ids[null_prefix:, :width] = ids[:, :width]
+    out_logps[null_prefix:, :width] = logps[:, :width]
     return out_ids, out_logps
 
 

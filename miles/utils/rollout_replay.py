@@ -124,7 +124,7 @@ def compact_token_logprobs(response, *, observation=None):
     if not isinstance(metadata, dict):
         return response
     records = metadata.get("output_token_logprobs")
-    candidates = metadata.get("output_top_logprobs_val_b64")
+    candidates = metadata.get("output_top_logprobs_val_flat_b64")
     compact_records = records is not None and not isinstance(records, TokenLogprobs)
     decode_candidates = isinstance(candidates, str)
     if not compact_records and not decode_candidates:
@@ -135,8 +135,8 @@ def compact_token_logprobs(response, *, observation=None):
         updated["output_token_logprobs"] = TokenLogprobs.from_records(records)
     if decode_candidates:
         # Flat buffers cross Ray without re-encoding; the sample consumer reshapes them.
-        updated["output_top_logprobs_val_b64"] = decode_float32_buffer(candidates)
-        updated["output_top_logprobs_idx_b64"] = decode_int32_buffer(metadata["output_top_logprobs_idx_b64"])
+        updated["output_top_logprobs_val_flat_b64"] = decode_float32_buffer(candidates)
+        updated["output_top_logprobs_idx_flat_b64"] = decode_int32_buffer(metadata["output_top_logprobs_idx_flat_b64"])
     if observation is not None:
         observation.update(
             token_logprobs_compact_seconds=time.monotonic() - started,

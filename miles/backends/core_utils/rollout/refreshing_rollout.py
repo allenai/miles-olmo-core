@@ -174,15 +174,17 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             # compaction. Ray transports flat arrays; the producer retains
             # shape and policy-provenance checks without rebuilding one
             # Python list per generated token.
-            output = await asyncio.wait_for(
-                post(
-                    url,
-                    payload,
-                    max_retries=1,
-                    headers=refresh_routing.request_headers(input.args, sample, payload["rid"]),
-                    decode_routed_experts=payload.get("return_routed_experts", False),
-                    compact_token_logprobs=True,
-                ),
+            # The deadline covers the request while it is outstanding at the
+            # HTTP worker (router queue, generation, refresh pauses), not the
+            # transfer of a finished response to this producer: when the
+            # completed queue backs up, delivery can lag by many minutes.
+            output = await post(
+                url,
+                payload,
+                max_retries=1,
+                headers=refresh_routing.request_headers(input.args, sample, payload["rid"]),
+                decode_routed_experts=payload.get("return_routed_experts", False),
+                compact_token_logprobs=True,
                 timeout=infra_timeouts.seconds(timeout),
             )
             if timing is not None:
@@ -207,7 +209,8 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
             self._abort_abandoned_request(payload["rid"])
             raise GenerationRequestTimeout(
                 f"Policy refresh request {payload['rid']} exceeded core.refresh_request_timeout={timeout:g}s. "
-                "This covers serving queue time, generation and refresh pauses. Check engine progress and "
+                "This covers serving queue time, generation and refresh pauses, not delivery of a finished response. "
+                "Check engine progress and "
                 "admission pressure; increase the request timeout for deliberately long responses. "
                 "core.engine_drain_timeout only controls eval/export/shutdown draining."
             ) from error

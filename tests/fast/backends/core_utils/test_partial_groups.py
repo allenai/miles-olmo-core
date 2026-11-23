@@ -60,6 +60,20 @@ def test_min_group_size_defaults_to_full_group_and_validates():
     with pytest.raises(ValueError, match="group-rm"):
         partial_groups.min_group_size(SimpleNamespace(**vars(args(7)), group_rm=True))
     assert partial_groups.min_group_size(SimpleNamespace(**vars(args(8)), group_rm=True)) is None
+    # OPD post-processing and custom converters would see dummy rows; refuse them at startup.
+    with pytest.raises(ValueError, match="use-opd"):
+        partial_groups.min_group_size(SimpleNamespace(**vars(args(7)), use_opd=True))
+    with pytest.raises(ValueError, match="custom-convert"):
+        partial_groups.min_group_size(
+            SimpleNamespace(**vars(args(7)), custom_convert_samples_to_train_data_path="custom.convert")
+        )
+    assert partial_groups.min_group_size(SimpleNamespace(**vars(args(7)), use_opd=False)) == 7
+    assert (
+        partial_groups.min_group_size(
+            SimpleNamespace(**vars(args(8)), use_opd=True, custom_convert_samples_to_train_data_path="x")
+        )
+        is None
+    )
 
 
 def failed_group(failed, lengths=None):

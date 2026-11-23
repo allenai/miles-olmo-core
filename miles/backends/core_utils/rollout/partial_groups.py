@@ -12,7 +12,9 @@ a zero loss mask, and is excluded from its group's reward mean and std, so
 advantages are computed over the members present. A custom reward post-process
 (``--custom-reward-post-process-path``) and the dynamic filter see only the
 members present; the dummy gets raw reward equal to its donor's and reward 0.
-Group reward models are not supported (``--group-rm`` is rejected).
+Group reward models, on-policy distillation and custom train-data conversion
+are not supported (``--group-rm``, ``--use-opd`` and
+``--custom-convert-samples-to-train-data-path`` are rejected).
 """
 
 import collections
@@ -47,6 +49,15 @@ def min_group_size(args) -> int | None:
         # Group reward models score the whole group before failed members are
         # replaced, so they would see the aborted, incomplete responses.
         raise ValueError("core.refresh_min_group_size below n_samples_per_prompt does not support --group-rm")
+    if getattr(args, "use_opd", False):
+        # OPD's post-process sets per-row teacher fields, which dummies would lack.
+        raise ValueError("core.refresh_min_group_size below n_samples_per_prompt does not support --use-opd")
+    if getattr(args, "custom_convert_samples_to_train_data_path", None):
+        # A custom converter receives the padded rows and would count the donor copy twice.
+        raise ValueError(
+            "core.refresh_min_group_size below n_samples_per_prompt does not support "
+            "--custom-convert-samples-to-train-data-path"
+        )
     return size
 
 

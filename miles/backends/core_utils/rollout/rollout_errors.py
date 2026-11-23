@@ -102,8 +102,10 @@ class RolloutErrors:
     """
 
     def __init__(self, max_group_retries: int = MAX_GROUP_RETRIES):
-        if type(max_group_retries) is not int or max_group_retries < 0:
-            raise ValueError(f"max_group_retries must be a non-negative integer, got {max_group_retries!r}")
+        # At least 1: a group's first failure is counted before there is evidence
+        # that its prompt, not a shared outage, is at fault.
+        if type(max_group_retries) is not int or max_group_retries < 1:
+            raise ValueError(f"max_group_retries must be a positive integer, got {max_group_retries!r}")
         self.max_group_retries = max_group_retries
         self.started = time.monotonic()
         self._buckets = collections.deque()

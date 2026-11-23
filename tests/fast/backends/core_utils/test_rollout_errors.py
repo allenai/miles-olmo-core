@@ -155,7 +155,7 @@ def test_tracking_failure_does_not_break_recovery(tmp_path, monkeypatch):
     assert (tmp_path / "rollout_errors.jsonl").is_file()
 
 
-@pytest.mark.parametrize("limit", [0, 1, 5])
+@pytest.mark.parametrize("limit", [1, 5])
 def test_isolated_group_retry_limit_is_configurable(limit):
     errors = rollout_errors.RolloutErrors(max_group_retries=limit)
     error = httpx.ConnectError("refused")
@@ -171,7 +171,7 @@ def test_default_isolated_group_retry_limit_is_three():
     assert rollout_errors.RolloutErrors().max_group_retries == rollout_errors.MAX_GROUP_RETRIES == 3
 
 
-@pytest.mark.parametrize("limit", [-1, 2.0, True, None])
+@pytest.mark.parametrize("limit", [-1, 0, 2.0, True, None])
 def test_invalid_isolated_group_retry_limit_is_rejected(limit):
     with pytest.raises(ValueError, match="max_group_retries"):
         rollout_errors.RolloutErrors(max_group_retries=limit)

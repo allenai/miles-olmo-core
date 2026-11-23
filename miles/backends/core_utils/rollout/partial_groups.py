@@ -38,7 +38,13 @@ def min_group_size(args) -> int | None:
         raise ValueError(
             f"core.refresh_min_group_size must be an integer in [2, n_samples_per_prompt={samples}], got {size!r}"
         )
-    return size if size < samples else None
+    if size == samples:
+        return None
+    if getattr(args, "group_rm", False):
+        # Group reward models score the whole group before failed members are
+        # replaced, so they would see the aborted, incomplete responses.
+        raise ValueError("core.refresh_min_group_size below n_samples_per_prompt does not support --group-rm")
+    return size
 
 
 def droppable(error: BaseException) -> bool:

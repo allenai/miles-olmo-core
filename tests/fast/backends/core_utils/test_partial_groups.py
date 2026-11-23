@@ -57,6 +57,9 @@ def test_min_group_size_defaults_to_full_group_and_validates():
     for invalid in (1, 9, 7.0, True):
         with pytest.raises(ValueError, match="refresh_min_group_size"):
             partial_groups.min_group_size(args(invalid))
+    with pytest.raises(ValueError, match="group-rm"):
+        partial_groups.min_group_size(SimpleNamespace(**vars(args(7)), group_rm=True))
+    assert partial_groups.min_group_size(SimpleNamespace(**vars(args(8)), group_rm=True)) is None
 
 
 def failed_group(failed, lengths=None):

@@ -58,7 +58,10 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         # reads the original tokenizer while another path may be using it.
         self._prompt_preparer = prompt_preparation.PromptPreparer(lambda: copy.deepcopy(self.state.tokenizer))
         self._prepared_prompt_ids = {}
-        self._request_aborter = request_abort.RequestAborter(lambda: get_worker_urls(self.args))
+        request_abort.check_early_abort()
+        self._request_aborter = request_abort.RequestAborter(
+            lambda: get_worker_urls(self.args), api_key=getattr(self.args, "sglang_api_key", None)
+        )
 
     async def dispose(self):
         try:

@@ -20,15 +20,19 @@ from miles.utils.types import Sample
 class Engine:
     """A stand-in SGLang server that records /abort_request bodies."""
 
-    def __init__(self):
+    def __init__(self, stall=None):
         self.aborts = []
+        self.authorization = []
         engine = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if stall is not None:
+                    stall.wait(30)
                 if self.path == "/abort_request":
                     engine.aborts.append(body)
+                    engine.authorization.append(self.headers.get("Authorization"))
                 self.send_response(200)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -341,3 +345,107 @@ def test_a_large_abort_burst_does_not_block_the_event_loop(engines):
     lag = asyncio.run(scenario())
     assert lag < 1.0
     assert len(aborted(engines)) == 1000
+
+
+class EntryPoint(SimpleNamespace):
+    pass
+
+
+@pytest.fixture
+def plugin_installed(monkeypatch):
+    def entry_points(group):
+        assert group == "sglang.srt.plugins"
+        return [EntryPoint(name="olmo_sglang_early_abort")]
+
+    monkeypatch.setattr(request_abort.importlib.metadata, "entry_points", entry_points)
+
+
+def test_refresh_requires_the_early_abort_plugin(monkeypatch):
+    # Without olmo-sglang#35 an abort that beats its request is dropped and the
+    # request decodes for nobody, so refresh deployments refuse such engines.
+    monkeypatch.setattr(request_abort.importlib.metadata, "entry_points", lambda group: [])
+    with pytest.raises(RuntimeError, match="olmo_sglang_early_abort"):
+        request_abort.check_early_abort({})
+    assert request_abort.check_early_abort({"MILES_ALLOW_REFRESH_WITHOUT_EARLY_ABORT": "1"}) is False
+
+
+@pytest.mark.usefixtures("plugin_installed")
+@pytest.mark.parametrize(
+    ("env", "problem"),
+    [
+        ({}, None),
+        ({"SGLANG_PLUGINS": "olmo_sglang_early_abort, other"}, None),
+        ({"OLMO_SGLANG_EARLY_ABORT_TTL_SECONDS": "600"}, None),
+        ({"SGLANG_PLUGINS": "other"}, "SGLANG_PLUGINS"),
+        ({"OLMO_SGLANG_EARLY_ABORT_TTL_SECONDS": "0"}, "turns the plugin off"),
+        ({"OLMO_SGLANG_EARLY_ABORT_TTL_SECONDS": "x"}, "not a number"),
+    ],
+)
+def test_early_abort_check_mirrors_sglang_plugin_loading(env, problem):
+    found = request_abort.early_abort_problem(env)
+    if problem is None:
+        assert found is None
+        assert request_abort.check_early_abort(env) is True
+    else:
+        assert problem in found
+        with pytest.raises(RuntimeError, match=problem):
+            request_abort.check_early_abort(env)
+
+
+def test_refresh_constructor_checks_the_plugin_and_passes_the_api_key(monkeypatch):
+    checks = []
+    monkeypatch.setattr(request_abort, "check_early_abort", lambda: checks.append(True))
+
+    def parent_init(fn, input):
+        fn.args = SimpleNamespace(
+            sglang_server_concurrency=8, rollout_num_gpus=1, rollout_num_gpus_per_engine=1, sglang_api_key="secret"
+        )
+        fn.state = SimpleNamespace(tokenizer=None)
+
+    monkeypatch.setattr(refreshing_rollout.ManagedFullyAsyncRolloutFn, "__init__", parent_init)
+    fn = refreshing_rollout.RefreshingRolloutFn(None)
+    assert checks == [True]
+    assert fn._request_aborter._headers == {"Authorization": "Bearer secret"}
+
+
+def test_aborts_carry_the_engine_api_key(engines):
+    async def urls():
+        return [engine.url for engine in engines]
+
+    async def scenario():
+        aborter = request_abort.RequestAborter(urls, api_key="secret")
+        aborter.abort("a")
+        await aborter.wait_idle()
+
+    asyncio.run(scenario())
+    assert aborted(engines) == ["a"]
+    assert [engine.authorization for engine in engines] == [["Bearer secret"], ["Bearer secret"]]
+
+
+def test_a_stalled_engine_does_not_hold_aborts_for_healthy_engines(engines):
+    # Engine-first ordering used to let one stalled engine take every slot.
+    release = threading.Event()
+    stalled = Engine(stall=release)
+
+    async def urls():
+        return [stalled.url, *(engine.url for engine in engines)]
+
+    async def scenario():
+        aborter = request_abort.RequestAborter(urls)
+        for index in range(100):
+            aborter.abort(f"r{index}")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while loop.time() < deadline and min(len(engine.aborts) for engine in engines) < 100:
+            await asyncio.sleep(0.05)
+        delivered = [len(engine.aborts) for engine in engines]
+        release.set()
+        await asyncio.wait_for(aborter.wait_idle(), 30)
+        return delivered
+
+    try:
+        # Healthy engines got every abort while the stalled one was still blocked.
+        assert asyncio.run(scenario()) == [100, 100]
+    finally:
+        release.set()
+        stalled.close()

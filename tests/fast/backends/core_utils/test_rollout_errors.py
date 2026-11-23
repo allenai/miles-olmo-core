@@ -167,17 +167,6 @@ def test_isolated_group_retry_limit_is_configurable(limit):
         errors.check_group_retry(7, error)
 
 
-def test_zero_limit_does_not_stop_before_any_generation_succeeded():
-    errors = rollout_errors.RolloutErrors(max_group_retries=0)
-    error = httpx.ConnectError("refused")
-    errors.record(failures=["transport"])
-    assert errors.check_group_retry(7, error) == 0
-    assert errors.check_group_retry(7, error) == 0
-    errors.record(successes=1)
-    with pytest.raises(RuntimeError, match="after 0 isolated retries"):
-        errors.check_group_retry(7, error)
-
-
 def test_default_isolated_group_retry_limit_is_three():
     assert rollout_errors.RolloutErrors().max_group_retries == rollout_errors.MAX_GROUP_RETRIES == 3
 

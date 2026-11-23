@@ -114,20 +114,12 @@ class RolloutErrors:
 
     def check_group_retry(self, group_index: int, error: BaseException) -> int:
         """Count isolated failures only while other generation is making progress."""
-        entry = self._group_retries.get(group_index)
-        retries, seen = entry if entry is not None else (0, self.successes)
-        if entry is not None and self.successes == seen:
+        retries, seen = self._group_retries.get(group_index, (0, self.successes))
+        if retries and self.successes == seen:
             # No successful generation since this prompt last failed. Leave
             # shared serving outages to the sustained-error-rate stop rule.
             return retries
         if retries >= self.max_group_retries:
-            if entry is None and self.successes == 0:
-                # A first failure before any generation succeeded is no evidence
-                # that this prompt is the problem (e.g. engines still starting),
-                # even with a zero retry budget. Remember it and let the
-                # outage rule decide.
-                self._group_retries[group_index] = (retries, self.successes)
-                return retries
             raise RuntimeError(
                 f"Generation group {group_index} failed again after {self.max_group_retries} isolated retries; "
                 "stopping instead of repeatedly regenerating the same failing prompts"

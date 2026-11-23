@@ -66,7 +66,10 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         self._partial_stats = None
         if self._min_group_size is not None:
             self._partial_stats = self._errors.partial = partial_groups.PartialGroupStats()
-        self._request_aborter = request_abort.RequestAborter(lambda: get_worker_urls(self.args))
+        request_abort.check_early_abort()
+        self._request_aborter = request_abort.RequestAborter(
+            lambda: get_worker_urls(self.args), api_key=getattr(self.args, "sglang_api_key", None)
+        )
 
     async def dispose(self):
         try:

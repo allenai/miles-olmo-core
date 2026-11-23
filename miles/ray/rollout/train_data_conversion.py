@@ -278,7 +278,7 @@ EXCLUDE_FROM_REWARD_BASELINE = "exclude_from_reward_baseline"
 
 
 def excluded_from_reward_baseline(sample: Sample) -> bool:
-    metadata = sample.metadata
+    metadata = getattr(sample, "metadata", None)
     return isinstance(metadata, dict) and bool(metadata.get(EXCLUDE_FROM_REWARD_BASELINE))
 
 
@@ -337,6 +337,32 @@ def _normalize_rewards_by_rollout(
     return normalized_rewards.tolist()
 
 
+def _custom_post_process_baseline_members(args, samples, post_process):
+    """Run a custom reward post-process on the rows that count toward reward baselines.
+
+    Contract: the callback never sees placeholder rows (``exclude_from_reward_baseline``,
+    e.g. partial refresh group dummies), so a callback that centers or scales rewards
+    per group computes its statistics over the members present. A placeholder row
+    keeps its stored reward as raw reward and gets normalized reward 0; its loss mask
+    is already zero. Batches without placeholders reach the callback unchanged.
+    """
+    kept = [index for index, sample in enumerate(samples) if not excluded_from_reward_baseline(sample)]
+    if len(kept) == len(samples):
+        return post_process(args, samples)
+    kept_raw, kept_rewards = post_process(args, [samples[index] for index in kept])
+    if len(kept_raw) != len(kept) or len(kept_rewards) != len(kept):
+        raise ValueError(
+            f"custom reward post-process returned {len(kept_raw)} raw and {len(kept_rewards)} rewards "
+            f"for {len(kept)} samples"
+        )
+    raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    rewards = [0.0] * len(samples)
+    for index, raw, reward in zip(kept, kept_raw, kept_rewards, strict=True):
+        raw_rewards[index] = raw
+        rewards[index] = reward
+    return raw_rewards, rewards
+
+
 def _post_process_rewards(
     args,
     samples: list[Sample] | list[list[Sample]],
@@ -344,7 +370,7 @@ def _post_process_rewards(
     prompt_group_sizes: list[int] | None = None,
 ):
     if (f := custom_reward_post_process_func) is not None:
-        return f(args, samples)
+        return _custom_post_process_baseline_members(args, samples, f)
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
     if args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"] and args.rewards_normalization:

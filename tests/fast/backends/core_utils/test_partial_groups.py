@@ -173,6 +173,94 @@ def test_unflagged_batches_normalize_exactly_as_before():
     assert normalized == reference(rewards[:8]) + reference(rewards[8:])
 
 
+def mean_centering(args, samples):
+    """A third-party post-process that centers rewards per group and knows nothing of dummies."""
+    raw = [sample.get_reward_value(args) for sample in samples]
+    groups = {}
+    for index, sample in enumerate(samples):
+        groups.setdefault(sample.group_index, []).append(index)
+    centered = [0.0] * len(samples)
+    for indices in groups.values():
+        mean = sum(raw[i] for i in indices) / len(indices)
+        for i in indices:
+            centered[i] = raw[i] - mean
+    return raw, centered
+
+
+def test_custom_post_process_sees_only_the_members_present():
+    # Survivors 0 and 1 must center to -0.5 and 0.5; a copied 0-reward donor
+    # would give -1/3 and 2/3.
+    group = [make_sample(0, 0, reward=0.0, response_length=1), make_sample(0, 1, reward=1.0, response_length=2)]
+    group.append(make_sample(0, 2, reward=1.0))
+    seen = []
+
+    def post_process(args, samples):
+        seen.append([sample.index for sample in samples])
+        return mean_centering(args, samples)
+
+    resolved = partial_groups.resolve(
+        group, {id(group[2]): router_failure()}, min_size=2, stats=partial_groups.PartialGroupStats()
+    )
+    raw, rewards = train_data_conversion._post_process_rewards(reward_args(), resolved, post_process)
+    assert seen == [[0, 1]]
+    assert rewards == pytest.approx([-0.5, 0.5, 0.0])
+    # The dummy reports its donor's stored reward and trains nothing.
+    assert raw == [0.0, 1.0, 0.0]
+    data = train_data_conversion.convert_samples_to_train_data(reward_args(), resolved, {}, None, post_process)
+    assert data["rewards"] == pytest.approx([-0.5, 0.5, 0.0])
+    assert data["loss_masks"][2] == [0]
+
+
+def test_custom_post_process_without_dummies_is_called_unchanged():
+    samples = [make_sample(0, i, reward=float(i % 2)) for i in range(4)]
+    calls = []
+
+    def post_process(args, batch):
+        calls.append(batch)
+        return [1.0] * len(batch), [2.0] * len(batch)
+
+    assert train_data_conversion._post_process_rewards(reward_args(), samples, post_process) == (
+        [1.0] * 4,
+        [2.0] * 4,
+    )
+    assert calls == [samples]
+
+
+def test_custom_post_process_must_return_one_reward_per_member():
+    group = [make_sample(0, i) for i in range(3)]
+    resolved = partial_groups.resolve(
+        group, {id(group[1]): router_failure()}, min_size=2, stats=partial_groups.PartialGroupStats()
+    )
+    with pytest.raises(ValueError, match="for 2 samples"):
+        train_data_conversion._post_process_rewards(reward_args(), resolved, lambda args, samples: ([0.0], [0.0]))
+
+
+def test_filters_and_reward_metrics_see_only_the_members_present(monkeypatch):
+    seen = []
+
+    def dynamic_filter(args, group, **kwargs):
+        seen.append([sample.index for sample in group])
+        return SimpleNamespace(keep=True, reason=None)
+
+    async def scenario():
+        buffer = RefreshPolicyDataBuffer(DataBufferConstructorInput(buffer_args(7), lambda group: None))
+        measured = buffer._delegate
+        monkeypatch.setattr(measured, "_group_filter", dynamic_filter)
+        group = [make_sample(0, i, reward=float(i == 0), response_length=1 + i) for i in range(8)]
+        resolved = partial_groups.resolve(
+            group, {id(group[4]): router_failure()}, min_size=7, stats=partial_groups.PartialGroupStats()
+        )
+        # The dummy copies the 1.0-reward shortest member; metrics must not count it twice.
+        assert resolved[4].reward == 1.0
+        assert await buffer.put(DataBufferInput(prompt_group=group, group=resolved)) is True
+        assert len(measured._buffer[0].group) == 8
+        return measured._metric_gatherer.collect()
+
+    metrics = asyncio.run(scenario())
+    assert seen == [[0, 1, 2, 3, 5, 6, 7]]
+    assert metrics["rollout/raw_reward_unfiltered"] == pytest.approx(1 / 7)
+
+
 def test_dummy_trains_nothing():
     group, failures = failed_group([6])
     resolved = partial_groups.resolve(group, failures, min_size=7, stats=partial_groups.PartialGroupStats())

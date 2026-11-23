@@ -9,7 +9,10 @@ by a fully masked dummy, as long as at least the minimum members succeeded.
 The dummy keeps every group, and so every optimizer batch, at its fixed size.
 It copies the shortest surviving sibling under the failed member's index, has
 a zero loss mask, and is excluded from its group's reward mean and std, so
-advantages are computed over the members present.
+advantages are computed over the members present. A custom reward post-process
+(``--custom-reward-post-process-path``) and the dynamic filter see only the
+members present; the dummy gets raw reward equal to its donor's and reward 0.
+Group reward models are not supported (``--group-rm`` is rejected).
 """
 
 import collections

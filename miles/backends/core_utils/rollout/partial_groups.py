@@ -9,9 +9,9 @@ by a fully masked dummy, as long as at least the minimum members succeeded.
 The dummy keeps every group, and so every optimizer batch, at its fixed size.
 It copies the shortest surviving sibling under the failed member's index, has
 a zero loss mask, and is excluded from its group's reward mean and std, so
-advantages are computed over the members present. A custom reward post-process
-(``--custom-reward-post-process-path``) and the dynamic filter see only the
-members present; the dummy gets raw reward equal to its donor's and reward 0.
+advantages are computed over the members present. The dynamic filter sees only
+the members present. A custom reward post-process (``--custom-reward-post-process-path``)
+sees the padded group and must declare ``honors_exclude_from_reward_baseline``.
 Group reward models, on-policy distillation and custom train-data conversion
 are not supported (``--group-rm``, ``--use-opd`` and
 ``--custom-convert-samples-to-train-data-path`` are rejected).
@@ -21,8 +21,9 @@ import collections
 import dataclasses
 
 from miles.backends.core_utils.rollout import rollout_errors
-from miles.ray.rollout.train_data_conversion import EXCLUDE_FROM_REWARD_BASELINE
+from miles.ray.rollout.train_data_conversion import EXCLUDE_FROM_REWARD_BASELINE, HONORS_EXCLUDE_FROM_REWARD_BASELINE
 from miles.utils import logger_utils
+from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
 
 logger = logger_utils.setup_logger(__name__)
@@ -57,6 +58,15 @@ def min_group_size(args) -> int | None:
         raise ValueError(
             "core.refresh_min_group_size below n_samples_per_prompt does not support "
             "--custom-convert-samples-to-train-data-path"
+        )
+    post_process = getattr(args, "custom_reward_post_process_path", None)
+    if post_process and not getattr(load_function(post_process), HONORS_EXCLUDE_FROM_REWARD_BASELINE, False):
+        # The callback sees the padded group; unless it excludes flagged dummies from
+        # its statistics, the donor copy would count twice.
+        raise ValueError(
+            "core.refresh_min_group_size below n_samples_per_prompt requires a custom reward post-process that "
+            f"sets {HONORS_EXCLUDE_FROM_REWARD_BASELINE} = True (excludes rows flagged "
+            f"{EXCLUDE_FROM_REWARD_BASELINE} from reward statistics and gives them reward 0); got {post_process}"
         )
     return size
 

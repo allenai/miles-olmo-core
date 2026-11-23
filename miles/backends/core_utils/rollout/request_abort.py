@@ -31,8 +31,6 @@ EARLY_ABORT_PLUGIN = "olmo_sglang_early_abort"
 _PLUGIN_GROUP = "sglang.srt.plugins"
 _EARLY_ABORT_TTL_ENV = "OLMO_SGLANG_EARLY_ABORT_TTL_SECONDS"
 _EARLY_ABORT_DEFAULT_TTL = "1800"
-# Set to 1 to run refresh against engines without the plugin (warning only).
-ALLOW_WITHOUT_EARLY_ABORT_ENV = "MILES_ALLOW_REFRESH_WITHOUT_EARLY_ABORT"
 
 
 def early_abort_problem(env=None) -> str | None:
@@ -60,24 +58,24 @@ def early_abort_problem(env=None) -> str | None:
 
 
 def check_early_abort(env=None) -> bool:
-    """Refuse a refresh deployment whose engines cannot abort a request whose abort
-    arrived first, unless ``MILES_ALLOW_REFRESH_WITHOUT_EARLY_ABORT=1``.
+    """Warn when the early-abort plugin cannot be confirmed; return whether it was.
 
-    Returns True when the plugin is active, False when allowed to run without it.
+    Never fatal: without the plugin an abort that beats its request is dropped and
+    that request decodes to the end for nobody, as before request aborts existed.
+    That wastes serving capacity but does not affect training correctness. The
+    check reads this process's environment, so engines deployed separately are
+    not covered by it.
     """
-    env = os.environ if env is None else env
     problem = early_abort_problem(env)
     if problem is None:
         return True
-    message = (
-        "Core refresh aborts the generations it abandons, but SGLang engines started here cannot abort a request "
-        f"whose abort arrives before the request: {problem}. Such a request decodes to its token limit for nobody. "
-        f"Install olmo-sglang with its early-abort plugin, or set {ALLOW_WITHOUT_EARLY_ABORT_ENV}=1 to run without it."
+    logger.warning(
+        "Cannot confirm SGLang's early-abort plugin: %s. Aborts that reach an engine before its request are "
+        "ignored there, and those requests decode to the end unused (pre-abort behavior). Install olmo-sglang "
+        "with its early-abort plugin to reclaim that capacity.",
+        problem,
     )
-    if env.get(ALLOW_WITHOUT_EARLY_ABORT_ENV) == "1":
-        logger.warning(message)
-        return False
-    raise RuntimeError(message)
+    return False
 
 
 class RequestAborter:
@@ -92,8 +90,8 @@ class RequestAborter:
     The abort can reach the engine before the router delivers the generation.
     Pinned SGLang forgets an abort for a request id it has not registered, so
     olmo-sglang's early-abort plugin keeps such ids for a time to live and aborts
-    the request when it arrives (allenai/olmo-sglang#35). ``check_early_abort``
-    refuses refresh deployments without the plugin unless explicitly allowed.
+    the request when it arrives (allenai/olmo-sglang#35). Without the plugin such a
+    request decodes to the end unused; ``check_early_abort`` warns at startup.
 
     Posts carry the engines' API key when one is configured. Each engine gets at
     most its share of the concurrent posts, so one stalled engine cannot hold the

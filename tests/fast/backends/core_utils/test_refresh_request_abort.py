@@ -360,13 +360,14 @@ def plugin_installed(monkeypatch):
     monkeypatch.setattr(request_abort.importlib.metadata, "entry_points", entry_points)
 
 
-def test_refresh_requires_the_early_abort_plugin(monkeypatch):
+def test_missing_early_abort_plugin_only_warns(monkeypatch):
     # Without olmo-sglang#35 an abort that beats its request is dropped and the
-    # request decodes for nobody, so refresh deployments refuse such engines.
+    # request decodes unused, as before aborts existed: a waste, not a correctness bug.
     monkeypatch.setattr(request_abort.importlib.metadata, "entry_points", lambda group: [])
-    with pytest.raises(RuntimeError, match="olmo_sglang_early_abort"):
-        request_abort.check_early_abort({})
-    assert request_abort.check_early_abort({"MILES_ALLOW_REFRESH_WITHOUT_EARLY_ABORT": "1"}) is False
+    warnings = []
+    monkeypatch.setattr(request_abort.logger, "warning", lambda message, *a: warnings.append(message % a))
+    assert request_abort.check_early_abort({}) is False
+    assert len(warnings) == 1 and "olmo_sglang_early_abort" in warnings[0]
 
 
 @pytest.mark.usefixtures("plugin_installed")
@@ -388,8 +389,7 @@ def test_early_abort_check_mirrors_sglang_plugin_loading(env, problem):
         assert request_abort.check_early_abort(env) is True
     else:
         assert problem in found
-        with pytest.raises(RuntimeError, match=problem):
-            request_abort.check_early_abort(env)
+        assert request_abort.check_early_abort(env) is False
 
 
 def test_refresh_constructor_checks_the_plugin_and_passes_the_api_key(monkeypatch):

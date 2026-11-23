@@ -97,7 +97,7 @@ class RequestAborter:
                 # 2,700 s final drain (hardening-01).
                 slots = asyncio.Semaphore(_ABORT_LIMITS.max_connections)
 
-                async def bounded(url, request_id):
+                async def bounded(url, request_id, slots=slots):
                     async with slots:
                         return await self._post(client, url, request_id)
 

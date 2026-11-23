@@ -7,6 +7,7 @@ import random
 import socket
 import subprocess
 import time
+import uuid
 
 import httpx
 
@@ -331,6 +332,51 @@ def _rollout_client_limits(concurrency):
     return httpx.Limits(max_connections=max(1, concurrency), max_keepalive_connections=0)
 
 
+class _HeldResults:
+    """Worker-side generation deadline, separated from delivery to the caller.
+
+    ``run`` bounds only the HTTP call (serving queue, generation, engine pauses)
+    and returns a small status that Ray inlines in the task reply. The response
+    stays here until ``take`` ships it, so a slow object transfer to a busy
+    caller cannot turn a finished generation into a timeout.
+    """
+
+    def __init__(self):
+        self._results = {}
+        # Keys the caller gave up on before their call finished.
+        self._abandoned = set()
+
+    async def run(self, key, call, timeout):
+        started = time.monotonic()
+        try:
+            result = await asyncio.wait_for(call, timeout)
+        except asyncio.TimeoutError:
+            # Cancelling the call closes its connection, which aborts the request in SGLang.
+            self._abandoned.discard(key)
+            return {"timed_out": True, "elapsed_seconds": time.monotonic() - started}
+        if isinstance(result, HTTPPostFailure):
+            self._abandoned.discard(key)
+            return {"failure": result}
+        if key in self._abandoned:
+            self._abandoned.discard(key)
+        else:
+            self._results[key] = result
+        return {"elapsed_seconds": time.monotonic() - started, "completed_unix": time.time()}
+
+    def take(self, key):
+        return self._results.pop(key)
+
+    def discard(self, key):
+        if self._results.pop(key, _MISSING) is _MISSING:
+            self._abandoned.add(key)
+
+
+_MISSING = object()
+# Backstop for a worker that never reports. The worker enforces the generation
+# deadline itself, so its status normally arrives by then.
+_WORKER_STATUS_GRACE_SECONDS = 300.0
+
+
 def _init_ray_distributed_post(args):
     """Initialize one or more Ray async actors per node for HTTP POST.
 
@@ -359,6 +405,18 @@ def _init_ray_distributed_post(args):
                 limits=_rollout_client_limits(concurrency),
                 timeout=httpx.Timeout(None),
             )
+            self._held = _HeldResults()
+
+        async def post_and_hold(self, key, url, payload, max_retries=60, headers=None, *, timeout, **options):
+            return await self._held.run(
+                key, self.do_post(url, payload, max_retries, headers=headers, **options), timeout
+            )
+
+        async def take_result(self, key):
+            return self._held.take(key)
+
+        async def discard_result(self, key):
+            self._held.discard(key)
 
         async def do_post(
             self,
@@ -452,6 +510,7 @@ async def post(
     return_bytes=False,
     decode_routed_experts=False,
     compact_token_logprobs=False,
+    timeout=None,
 ):
     """POST ``payload`` and return the parsed response.
 
@@ -459,12 +518,29 @@ async def post(
     and ``compact_token_logprobs`` turns per-token logprob records into flat
     arrays. Both run where the JSON was parsed, so a distributed HTTP worker
     ships buffers to the producer instead of nested Python objects.
+
+    ``timeout`` bounds the HTTP call where it runs and raises ``TimeoutError``.
+    It does not include shipping a finished response from a distributed worker
+    to this process: that wait is caller backpressure, not slow generation.
     """
     # If distributed mode is enabled and actors exist, dispatch via Ray.
     if _distributed_post_enabled and _post_actors:
         # A remote failure can follow successful request delivery. Propagate it;
         # the rollout's bounded whole-group recovery owns retries, not this layer.
         actor = _next_actor()
+        if actor is not None and timeout is not None:
+            return await _post_remote_with_deadline(
+                actor,
+                url,
+                payload,
+                max_retries,
+                headers=headers,
+                timeout=timeout,
+                action=action,
+                return_bytes=return_bytes,
+                decode_routed_experts=decode_routed_experts,
+                compact_token_logprobs=compact_token_logprobs,
+            )
         if actor is not None:
             ref = actor.do_post.remote(
                 url,
@@ -488,22 +564,56 @@ async def post(
                 raise result.exception()
             return result
 
-    response = await _post(
-        _rollout_client(),
-        url,
-        payload,
-        max_retries,
-        action=action,
-        headers=headers,
-        return_bytes=return_bytes,
-    )
-    if return_bytes:
+    async def local():
+        response = await _post(
+            _rollout_client(),
+            url,
+            payload,
+            max_retries,
+            action=action,
+            headers=headers,
+            return_bytes=return_bytes,
+        )
+        if return_bytes:
+            return response
+        if decode_routed_experts:
+            response = decode_response_routes(response)
+        if compact_token_logprobs:
+            response = compact_token_logprobs_response(response)
         return response
-    if decode_routed_experts:
-        response = decode_response_routes(response)
-    if compact_token_logprobs:
-        response = compact_token_logprobs_response(response)
-    return response
+
+    # In-process, the response is delivered when the call returns.
+    return await local() if timeout is None else await asyncio.wait_for(local(), timeout)
+
+
+async def _post_remote_with_deadline(actor, url, payload, max_retries, *, headers, timeout, **options):
+    """Judge the deadline on the worker's finished call; then fetch its response unbounded."""
+    key = uuid.uuid4().hex
+    try:
+        status = await asyncio.wait_for(
+            _await_ref(
+                actor.post_and_hold.remote(key, url, payload, max_retries, headers=headers, timeout=timeout, **options)
+            ),
+            timeout + _WORKER_STATUS_GRACE_SECONDS,
+        )
+    except BaseException:
+        # Timed out waiting for the worker, or cancelled: free a result that may still arrive.
+        try:
+            actor.discard_result.remote(key)
+        except Exception as error:
+            logger.warning("Could not discard abandoned distributed HTTP result: %s", error)
+        raise
+    if "failure" in status:
+        raise status["failure"].exception()
+    if status.get("timed_out"):
+        raise TimeoutError(f"HTTP worker deadline {timeout:g}s passed after {status['elapsed_seconds']:.1f}s")
+    # Delivery: the generation already finished in time. Do not count transfer
+    # or caller backpressure against the deadline. Actor death still raises.
+    return await actor.take_result.remote(key)
+
+
+async def _await_ref(ref):
+    return await ref
 
 
 def _cancel_remote_post(ref) -> None:

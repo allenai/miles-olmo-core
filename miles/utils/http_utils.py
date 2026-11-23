@@ -343,23 +343,26 @@ class _HeldResults:
 
     def __init__(self):
         self._results = {}
-        # Keys the caller gave up on before their call finished.
+        self._running = set()
+        # Running calls the caller gave up on; their results are dropped.
         self._abandoned = set()
 
     async def run(self, key, call, timeout):
         started = time.monotonic()
+        self._running.add(key)
         try:
             result = await asyncio.wait_for(call, timeout)
         except asyncio.TimeoutError:
-            # Cancelling the call closes its connection, which aborts the request in SGLang.
-            self._abandoned.discard(key)
+            # Cancelling the call closes its connection to the router.
             return {"timed_out": True, "elapsed_seconds": time.monotonic() - started}
+        finally:
+            # Also on cancellation (ray.cancel), so nothing about this key stays behind.
+            self._running.discard(key)
+            abandoned = key in self._abandoned
+            self._abandoned.discard(key)
         if isinstance(result, HTTPPostFailure):
-            self._abandoned.discard(key)
             return {"failure": result}
-        if key in self._abandoned:
-            self._abandoned.discard(key)
-        else:
+        if not abandoned:
             self._results[key] = result
         return {"elapsed_seconds": time.monotonic() - started, "completed_unix": time.time()}
 
@@ -367,8 +370,11 @@ class _HeldResults:
         return self._results.pop(key)
 
     def discard(self, key):
-        if self._results.pop(key, _MISSING) is _MISSING:
+        if self._results.pop(key, _MISSING) is _MISSING and key in self._running:
             self._abandoned.add(key)
+
+    def __len__(self):
+        return len(self._results) + len(self._running) + len(self._abandoned)
 
 
 _MISSING = object()
@@ -417,6 +423,9 @@ def _init_ray_distributed_post(args):
 
         async def discard_result(self, key):
             self._held.discard(key)
+
+        async def held_requests(self):
+            return len(self._held)
 
         async def do_post(
             self,
@@ -589,19 +598,14 @@ async def post(
 async def _post_remote_with_deadline(actor, url, payload, max_retries, *, headers, timeout, **options):
     """Judge the deadline on the worker's finished call; then fetch its response unbounded."""
     key = uuid.uuid4().hex
+    ref = actor.post_and_hold.remote(key, url, payload, max_retries, headers=headers, timeout=timeout, **options)
     try:
-        status = await asyncio.wait_for(
-            _await_ref(
-                actor.post_and_hold.remote(key, url, payload, max_retries, headers=headers, timeout=timeout, **options)
-            ),
-            timeout + _WORKER_STATUS_GRACE_SECONDS,
-        )
+        status = await asyncio.wait_for(_await_ref(ref), timeout + _WORKER_STATUS_GRACE_SECONDS)
     except BaseException:
-        # Timed out waiting for the worker, or cancelled: free a result that may still arrive.
-        try:
-            actor.discard_result.remote(key)
-        except Exception as error:
-            logger.warning("Could not discard abandoned distributed HTTP result: %s", error)
+        # Cancelled, or the worker never reported: stop the call (a queued call never
+        # dispatches, a running one closes its connection) and free any held result.
+        _cancel_remote_post(ref)
+        _discard_remote_result(actor, key)
         raise
     if "failure" in status:
         raise status["failure"].exception()
@@ -609,7 +613,19 @@ async def _post_remote_with_deadline(actor, url, payload, max_retries, *, header
         raise TimeoutError(f"HTTP worker deadline {timeout:g}s passed after {status['elapsed_seconds']:.1f}s")
     # Delivery: the generation already finished in time. Do not count transfer
     # or caller backpressure against the deadline. Actor death still raises.
-    return await actor.take_result.remote(key)
+    try:
+        return await actor.take_result.remote(key)
+    except asyncio.CancelledError:
+        # The take may not have run yet; do not leave the response held.
+        _discard_remote_result(actor, key)
+        raise
+
+
+def _discard_remote_result(actor, key) -> None:
+    try:
+        actor.discard_result.remote(key)
+    except Exception as error:  # the caller is already unwinding
+        logger.warning("Could not discard abandoned distributed HTTP result: %s", error)
 
 
 async def _await_ref(ref):

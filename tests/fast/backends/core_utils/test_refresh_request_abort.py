@@ -103,7 +103,8 @@ def test_request_deadline_aborts_the_engine_request(monkeypatch, tmp_path, engin
 
     async def hang(url, payload, **kwargs):
         payloads.append(payload)
-        await asyncio.Event().wait()
+        # post() owns the request deadline (the HTTP worker enforces it).
+        await asyncio.wait_for(asyncio.Event().wait(), kwargs["timeout"])
 
     monkeypatch.setattr(refreshing_rollout, "post", hang)
     args = make_args(tmp_path, timeout=0.05)

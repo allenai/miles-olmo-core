@@ -143,40 +143,46 @@ class RequestAborter:
                 await task
 
     async def _drain(self) -> None:
-        async with httpx.AsyncClient(timeout=_ABORT_TIMEOUT, limits=_ABORT_LIMITS, headers=self._headers) as client:
-            while self._pending:
-                request_ids, self._pending = self._pending, []
-                urls = await self._worker_urls()
-                if not urls:
-                    logger.warning("Could not abort %d abandoned generation request(s): no engines", len(request_ids))
-                    continue
-                # Keep at most one connection pool's worth of posts in flight. httpcore
-                # rescans its whole wait queue on every connection hand-off, so queueing
-                # every (engine, rid) post at once is quadratic and blocks the event loop:
-                # 575 groups x 8 rids x 23 engines held the producer loop for the whole
-                # 2,700 s final drain (hardening-01).
-                # A post waits for its engine's share first, so a stalled engine holds
-                # at most that share of the global slots and the rest keep flowing.
-                slots = asyncio.Semaphore(_ABORT_LIMITS.max_connections)
-                share = max(1, _ABORT_LIMITS.max_connections // len(urls))
-                engine_slots = {url: asyncio.Semaphore(share) for url in urls}
+        # Closing the client can yield to abort(). Recheck the queue before returning.
+        while self._pending:
+            async with httpx.AsyncClient(
+                timeout=_ABORT_TIMEOUT, limits=_ABORT_LIMITS, headers=self._headers
+            ) as client:
+                while self._pending:
+                    request_ids, self._pending = self._pending, []
+                    urls = await self._worker_urls()
+                    if not urls:
+                        logger.warning(
+                            "Could not abort %d abandoned generation request(s): no engines", len(request_ids)
+                        )
+                        continue
+                    # Keep at most one connection pool's worth of posts in flight. httpcore
+                    # rescans its whole wait queue on every connection hand-off, so queueing
+                    # every (engine, rid) post at once is quadratic and blocks the event loop:
+                    # 575 groups x 8 rids x 23 engines held the producer loop for the whole
+                    # 2,700 s final drain (hardening-01).
+                    # A post waits for its engine's share first, so a stalled engine holds
+                    # at most that share of the global slots and the rest keep flowing.
+                    slots = asyncio.Semaphore(_ABORT_LIMITS.max_connections)
+                    share = max(1, _ABORT_LIMITS.max_connections // len(urls))
+                    engine_slots = {url: asyncio.Semaphore(share) for url in urls}
 
-                async def bounded(url, request_id, slots=slots, engine_slots=engine_slots):
-                    async with engine_slots[url], slots:
-                        return await self._post(client, url, request_id)
+                    async def bounded(url, request_id, slots=slots, engine_slots=engine_slots):
+                        async with engine_slots[url], slots:
+                            return await self._post(client, url, request_id)
 
-                results = await asyncio.gather(
-                    *(bounded(url, request_id) for url in urls for request_id in request_ids)
-                )
-                failed = results.count(False)
-                if failed:
-                    self.failed_posts += failed
-                    logger.warning(
-                        "Abort of %d abandoned generation request(s): %d of %d engine posts failed",
-                        len(request_ids),
-                        failed,
-                        len(results),
+                    results = await asyncio.gather(
+                        *(bounded(url, request_id) for url in urls for request_id in request_ids)
                     )
+                    failed = results.count(False)
+                    if failed:
+                        self.failed_posts += failed
+                        logger.warning(
+                            "Abort of %d abandoned generation request(s): %d of %d engine posts failed",
+                            len(request_ids),
+                            failed,
+                            len(results),
+                        )
 
     async def _worker_urls(self) -> list[str]:
         if time.monotonic() - self._urls_fetched >= _URL_CACHE_SECONDS or not self._urls:

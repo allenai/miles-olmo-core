@@ -255,6 +255,36 @@ def test_stalled_discovery_does_not_strand_later_aborts(monkeypatch, engines):
     assert [body["rid"] for body in engines[0].aborts] == ["b"]
 
 
+@pytest.mark.parametrize("finish", ["wait_idle", "close"])
+def test_abort_arriving_during_http_client_close_is_sent(monkeypatch, engines, finish):
+    async def scenario():
+        closing = asyncio.Event()
+        allow_close = asyncio.Event()
+
+        class PausedCloseClient(httpx.AsyncClient):
+            async def __aexit__(self, exc_type, exc_value, traceback):
+                closing.set()
+                await allow_close.wait()
+                await super().__aexit__(exc_type, exc_value, traceback)
+
+        monkeypatch.setattr(request_abort.httpx, "AsyncClient", PausedCloseClient)
+
+        async def urls():
+            return [engine.url for engine in engines]
+
+        aborter = request_abort.RequestAborter(urls)
+        aborter.abort("before-close")
+        await asyncio.wait_for(closing.wait(), 5)
+        aborter.abort("during-close")
+        finished = asyncio.create_task(getattr(aborter, finish)())
+        await asyncio.sleep(0)
+        allow_close.set()
+        await asyncio.wait_for(finished, 5)
+
+    asyncio.run(scenario())
+    assert aborted(engines) == ["before-close", "during-close"]
+
+
 def test_close_bounds_pending_aborts_and_refuses_new_ones():
     async def scenario():
         hung = asyncio.Event()

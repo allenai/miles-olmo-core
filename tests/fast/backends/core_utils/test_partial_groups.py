@@ -7,6 +7,7 @@ import httpx
 import numpy as np
 import pytest
 import torch
+from tests.fast.ray.rollout.conftest import make_args
 
 from miles.backends.core_utils import data as core_data
 from miles.backends.core_utils import observability, packing
@@ -15,6 +16,7 @@ from miles.backends.core_utils.rollout import partial_groups, rollout_errors
 from miles.backends.core_utils.rollout.async_buffer import RefreshPolicyDataBuffer
 from miles.backends.core_utils.rollout.errors import GenerationRequestTimeout
 from miles.backends.core_utils.rollout.refreshing_rollout import RefreshingRolloutFn
+from miles.ray.rollout import metrics as rollout_metrics
 from miles.ray.rollout import train_data_conversion
 from miles.rollout.base_types import GenerateFnOutput
 from miles.rollout.fully_async_data_buffer import DataBufferConstructorInput, DataBufferInput
@@ -423,3 +425,18 @@ def test_first_padding_row_survives_conversion_and_behavior_metrics():
     batch["metadata"][0] = {}
     with pytest.raises(ValueError, match="no provenance"):
         policy_refresh.validate_batch(batch)
+
+
+@pytest.mark.parametrize("with_padding", [False, True])
+def test_rollout_tracking_counts_selected_incomplete_groups_once(monkeypatch, with_padding):
+    args = make_args(advantage_estimator="ppo", ci_test=False, log_passrate=False)
+    complete_group = [make_sample(0, i) for i in range(4)]
+    group = [make_sample(1, i + 4) for i in range(4)]
+    if with_padding:
+        failures = {id(sample): router_failure() for sample in group[:2]}
+        group = partial_groups.resolve(group, failures, min_size=2, stats=partial_groups.PartialGroupStats())
+    logged = {}
+    monkeypatch.setattr(rollout_metrics.tracking, "log", lambda _args, metrics, **_kwargs: logged.update(metrics))
+    rollout_metrics.log_rollout_data(0, args, complete_group + group, {"errors/partial_groups_accepted": 7}, 1.0)
+    assert logged["errors/partial_groups_accepted"] == 7
+    assert logged["rollout/incomplete_groups"] == int(with_padding)

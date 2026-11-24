@@ -16,7 +16,7 @@ from miles.utils.metric_utils import (
     namespace_metrics,
 )
 from miles.utils.tracking_utils import tracking
-from miles.utils.types import Sample
+from miles.utils.types import Sample, is_partial_group_padding
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +83,12 @@ def log_rollout_data(
         return
 
     log_dict = {**(rollout_extra_metrics or {})}
+    if "errors/partial_groups_accepted" in log_dict:
+        # Acceptance is cumulative and happens before queue filtering. Count
+        # distinct partial groups in this collection after selection and trimming.
+        log_dict["rollout/incomplete_groups"] = len(
+            {sample.group_index for sample in samples if is_partial_group_padding(sample.metadata)}
+        )
     log_dict |= dict_add_prefix(_compute_metrics_from_samples(args, samples), "rollout/")
     log_dict |= dict_add_prefix(_compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
     if args.log_passrate:

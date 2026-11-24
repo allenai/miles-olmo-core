@@ -31,6 +31,7 @@ from pathlib import Path
 
 from miles.backends.core_utils.publication import policy_versions
 from miles.utils import logger_utils
+from miles.utils.types import PARTIAL_GROUP_PADDING, is_partial_group_padding
 
 logger = logger_utils.setup_logger(__name__)
 
@@ -172,7 +173,9 @@ def response_record(sample, text, fresh_run):
         "policy_versions": versions,
         "policy_scope": policy_scope(versions, fresh_run),
     }
-    if text:
+    if is_partial_group_padding(metadata):
+        record.update({"reward": None, PARTIAL_GROUP_PADDING: True})
+    elif text:
         record["response"] = sample.response
     return record
 

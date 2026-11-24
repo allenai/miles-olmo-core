@@ -5,6 +5,8 @@ import math
 import torch
 from torch import distributed as dist
 
+from miles.utils.types import is_partial_group_padding
+
 AGE_LABELS = ("0", "1_2", "3_4", "5_8", "9_12", "13_plus")
 LENGTH_LABELS = ("le_4096", "4097_8192", "8193_16384", "16385_plus")
 ERROR_EDGES = (0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0)
@@ -19,12 +21,13 @@ def _active_tokens(rollout, current_version):
         delta = score.detach().double() - torch.as_tensor(behavior, device=score.device).double()
         age = torch.empty_like(score, dtype=torch.int64)
         prefix = torch.empty_like(active)
-        record = metadata["policy_refresh"]
-        # The caller validates contiguous spans and finite scores before aggregation.
-        for span in record["spans"]:
-            section = slice(span["start"], span["end"])
-            age[section] = current_version - span["version"]
-            prefix[section] = span["version"] < record["replay_version"]
+        if not is_partial_group_padding(metadata):
+            record = metadata["policy_refresh"]
+            # The caller validates contiguous spans before aggregation.
+            for span in record["spans"]:
+                section = slice(span["start"], span["end"])
+                age[section] = current_version - span["version"]
+                prefix[section] = span["version"] < record["replay_version"]
         deltas.append(delta[active])
         ages.append(age[active])
         lengths.append(torch.full_like(age[active], len(score)))

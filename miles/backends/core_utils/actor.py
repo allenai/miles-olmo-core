@@ -306,7 +306,11 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             if self.args.olmo_core.publication_mode == "refresh":
                 self._agree(lambda: policy_refresh.validate_batch(rollout))
             versions = self._agree(lambda: data.policy_versions(rollout))
-            self._agree(lambda: self.clock.validate_versions(versions, self.args.olmo_core.max_policy_lag))
+            self._agree(
+                lambda: (
+                    self.clock.validate_versions(versions, self.args.olmo_core.max_policy_lag) if versions else None
+                )
+            )
             contract.record(
                 self.args,
                 {
@@ -401,7 +405,9 @@ class OLMoCoreTrainRayActor(TrainRayActor):
                 )
             step_versions = [version for batch in step_batches for version in data.policy_versions(batch)]
             self._agree(
-                lambda current=step_versions: self.clock.validate_versions(current, self.args.olmo_core.max_policy_lag)
+                lambda current=step_versions: (
+                    self.clock.validate_versions(current, self.args.olmo_core.max_policy_lag) if current else None
+                )
             )
             normalization = contract.step_normalization(
                 step_batches, self.args.global_batch_size, getattr(self.args, "loss_constant_token_denominator", None)

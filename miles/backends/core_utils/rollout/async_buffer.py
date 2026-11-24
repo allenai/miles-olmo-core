@@ -7,11 +7,20 @@ from dataclasses import is_dataclass, replace
 from miles.backends.core_utils.data import policy_versions
 from miles.backends.core_utils.publication import policy_refresh
 from miles.backends.core_utils.rollout.queue_metrics import QueueMetrics
+from miles.ray.rollout.train_data_conversion import excluded_from_reward_baseline
 from miles.rollout.filter_hub.base_types import call_dynamic_filter, iter_samples
 from miles.rollout.filter_hub.common_filters import apply_missing_reward_filter
 from miles.rollout.fully_async_data_buffer import DefaultDataBuffer
 from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
+
+
+def baseline_members(group):
+    """The group without rows excluded from its reward baseline (partial-group dummies)."""
+    if not isinstance(group, list) or not all(isinstance(sample, Sample) for sample in group):
+        return group
+    kept = [sample for sample in group if not excluded_from_reward_baseline(sample)]
+    return kept if len(kept) != len(group) else group
 
 
 class MeasuredDataBuffer(DefaultDataBuffer):
@@ -40,9 +49,11 @@ class MeasuredDataBuffer(DefaultDataBuffer):
             if self._records is not None:
                 self._records.record_group(samples, decision="aborted")
         else:
-            output = apply_missing_reward_filter(self._args, item.group)
+            # Filters judge the members present: a partial group's placeholders carry no reward evidence.
+            group = baseline_members(item.group)
+            output = apply_missing_reward_filter(self._args, group)
             if output.keep:
-                output = call_dynamic_filter(self._group_filter, self._args, item.group)
+                output = call_dynamic_filter(self._group_filter, self._args, group)
             if self._records is not None:
                 self._records.record_group(
                     samples, decision="passed" if output.keep else "filtered", reason=output.reason
@@ -52,6 +63,11 @@ class MeasuredDataBuffer(DefaultDataBuffer):
                 return False
         await super().put(item)
         return True
+
+    def _preput_filter(self, input):
+        # The pre-filter reward metric counts the members present, not dummies.
+        group = baseline_members(input.group)
+        return super()._preput_filter(input if group is input.group else replace(input, group=group))
 
     def on_dequeue(self, entry, *, staleness, accepted):
         if self._records is not None:
@@ -184,6 +200,7 @@ class RefreshPolicyDataBuffer(HomogeneousPolicyDataBuffer):
                 "metadata": [s.train_metadata for s in samples],
                 "response_lengths": [s.response_length for s in samples],
                 "weight_versions": [s.weight_versions for s in samples],
+                "total_lengths": [len(s.tokens) for s in samples],
             }
         )
         return await self._delegate.put(item)

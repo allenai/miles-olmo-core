@@ -112,9 +112,10 @@ def distributed_masked_whiten(
     """
     Performs whitening on a tensor using global statistics from all participating GPUs.
 
-    It calculates the global mean and variance across all ranks in the default
-    process group (the WORLD) and uses these global statistics to normalize the
-    local data on each rank.
+    It calculates the global mean and variance across all ranks in the selected
+    process group and uses these global statistics to normalize the
+    local data on each rank. Empty shards contribute zero statistics. If the
+    entire process group has no positions, return the empty tensors unchanged.
 
     Args:
         values (torch.Tensor): The local tensor of values to whiten.
@@ -133,7 +134,7 @@ def distributed_masked_whiten(
     local_mask_sum = mask.sum()
 
     stats_tensor = torch.tensor(
-        [local_sum, local_sum_sq, local_mask_sum],
+        [local_sum, local_sum_sq, local_mask_sum, values.numel()],
         device=values.device,
         dtype=torch.float32,
     )
@@ -142,9 +143,11 @@ def distributed_masked_whiten(
     GeneralPGUtil.create(process_group).all_reduce(stats_tensor, process_group, op=dist.ReduceOp.SUM)
 
     # Calculate global stats from aggregated results
-    global_sum, global_sum_sq, global_mask_sum = stats_tensor
+    global_sum, global_sum_sq, global_mask_sum, global_num_positions = stats_tensor
 
     if global_mask_sum.item() == 0:
+        if global_num_positions.item() == 0:
+            return values
         raise ValueError("The global mask sum across all participating GPUs is zero.")
 
     global_mean = global_sum / global_mask_sum

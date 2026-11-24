@@ -115,9 +115,9 @@ def normalize_advantages(
 ) -> list[torch.Tensor]:
     """Whiten advantages across the DP group using `loss_masks` for weighting.
 
-    Under CP > 1 the mask is sliced to this rank's tokens; when the local
-    mask is empty the inputs pass through unchanged. Output shapes match
-    `advantages`.
+    Under CP > 1 the mask is sliced to this rank's tokens. Every DP rank
+    participates, including ranks with no local response tokens. Output shapes
+    match `advantages`.
     """
     num_samples = len(advantages)
     assert len(loss_masks) == num_samples
@@ -164,19 +164,13 @@ def normalize_advantages(
 
         all_masks = torch.cat(mask_chunks)
 
-    if all_masks.numel() > 0:
-        assert (
-            all_advs.size() == all_masks.size()
-        ), f"Shape mismatch before whitening: advantages {all_advs.size()}, masks {all_masks.size()}"
-        dp_group = parallel_state.effective_dp.group
-
-        whitened_advs_flat = distributed_masked_whiten(
-            all_advs,
-            all_masks,
-            process_group=dp_group,
-            shift_mean=True,
-        )
-        chunk_lengths = [chunk.size(0) for chunk in advantages]
-        advantages = list(torch.split(whitened_advs_flat, chunk_lengths))
-
-    return advantages
+    assert (
+        all_advs.size() == all_masks.size()
+    ), f"Shape mismatch before whitening: advantages {all_advs.size()}, masks {all_masks.size()}"
+    whitened = distributed_masked_whiten(
+        all_advs,
+        all_masks,
+        process_group=parallel_state.effective_dp.group,
+        shift_mean=True,
+    )
+    return list(torch.split(whitened, [chunk.size(0) for chunk in advantages]))

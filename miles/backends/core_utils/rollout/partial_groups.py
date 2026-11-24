@@ -143,6 +143,7 @@ def padding(failed: Sample, example: Sample) -> Sample:
         rollout_routed_experts=(
             example.rollout_routed_experts[:0] if example.rollout_routed_experts is not None else None
         ),
+        rollout_indexer_topk=(example.rollout_indexer_topk[:0] if example.rollout_indexer_topk is not None else None),
         rollout_topk_token_ids=(
             example.rollout_topk_token_ids[:0] if example.rollout_topk_token_ids is not None else None
         ),

@@ -398,6 +398,24 @@ def test_partial_groups_guard_router_losses(weight):
     assert partial_groups.min_group_size(args) is None
 
 
+@pytest.mark.parametrize("failed", [0, 7])
+def test_padding_carries_an_empty_indexer_replay_array(failed):
+    # Indexer replay needs a token-aligned array on every row, padding first or last.
+    original, failures = failed_group([failed])
+    for sample in original:
+        if sample is not original[failed]:
+            sample.rollout_indexer_topk = np.zeros((len(sample.tokens) - 1, 2, 3), dtype=np.int32)
+    group = partial_groups.resolve(original, failures, min_size=7, stats=partial_groups.PartialGroupStats())
+    group[failed].validate()
+    args = reward_args()
+    args.use_rollout_indexer_replay = True
+    batch = train_data_conversion.convert_samples_to_train_data(args, group, {}, None, None)
+    rows = batch["rollout_indexer_topk"]
+    assert rows[failed].shape == (0, 2, 3)
+    assert all(row is not None for row in rows)
+    assert [tuple(torch.from_numpy(row).shape[1:]) for row in rows] == [(2, 3)] * 8
+
+
 def test_first_padding_row_survives_conversion_and_behavior_metrics():
     original, failures = failed_group([0])
     for sample in original[1:]:

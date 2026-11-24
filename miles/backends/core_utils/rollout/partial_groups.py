@@ -50,6 +50,18 @@ def min_group_size(args) -> int | None:
         raise ValueError(
             "Experimental partial refresh groups require core.router_aux_loss_weight=0 and core.router_z_loss_weight=0"
         )
+    rollout_batch_size, global_batch_size = getattr(args, "rollout_batch_size", None), getattr(
+        args, "global_batch_size", None
+    )
+    if rollout_batch_size is not None and global_batch_size is not None:
+        if rollout_batch_size * samples != global_batch_size:
+            # Rows are sharded and split into steps without regard to padding, so with
+            # several steps per collection one step could hold only padding rows.
+            raise ValueError(
+                "core.refresh_min_group_size below n_samples_per_prompt requires one optimizer step per "
+                f"collection (rollout_batch_size * n_samples_per_prompt = {rollout_batch_size * samples} "
+                f"!= global_batch_size = {global_batch_size})"
+            )
     if getattr(args, "group_rm", False):
         # Group reward models score the whole group before failed members are
         # replaced, so they would see the aborted, incomplete responses.

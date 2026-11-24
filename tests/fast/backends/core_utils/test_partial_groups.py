@@ -398,6 +398,25 @@ def test_partial_groups_guard_router_losses(weight):
     assert partial_groups.min_group_size(args) is None
 
 
+def test_partial_groups_require_one_optimizer_step_per_collection():
+    # With two steps per collection, four successes followed by four timeouts would
+    # leave the second step all padding.
+    def args(global_batch_size):
+        return SimpleNamespace(
+            n_samples_per_prompt=8,
+            rollout_batch_size=1,
+            global_batch_size=global_batch_size,
+            olmo_core=SimpleNamespace(refresh_min_group_size=2),
+        )
+
+    with pytest.raises(ValueError, match="one optimizer step per collection"):
+        partial_groups.min_group_size(args(4))
+    assert partial_groups.min_group_size(args(8)) == 2
+    full = args(4)
+    full.olmo_core.refresh_min_group_size = 8
+    assert partial_groups.min_group_size(full) is None
+
+
 @pytest.mark.parametrize("failed", [0, 7])
 def test_padding_carries_an_empty_indexer_replay_array(failed):
     # Indexer replay needs a token-aligned array on every row, padding first or last.

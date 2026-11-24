@@ -153,3 +153,34 @@ def test_tracking_failure_does_not_break_recovery(tmp_path, monkeypatch):
     monkeypatch.setattr(rollout_errors.tracking, "log", failed)
     rollout_errors.RolloutErrors().report(SimpleNamespace(save=str(tmp_path)))
     assert (tmp_path / "rollout_errors.jsonl").is_file()
+
+
+@pytest.mark.parametrize("limit", [1, 5])
+def test_isolated_group_retry_limit_is_configurable(limit):
+    errors = rollout_errors.RolloutErrors(max_group_retries=limit)
+    error = httpx.ConnectError("refused")
+    for retry in range(1, limit + 1):
+        errors.record(successes=1)
+        assert errors.check_group_retry(7, error) == retry
+    errors.record(successes=1)
+    with pytest.raises(RuntimeError, match=f"after {limit} isolated retries"):
+        errors.check_group_retry(7, error)
+
+
+def test_default_isolated_group_retry_limit_is_three():
+    assert rollout_errors.RolloutErrors().max_group_retries == rollout_errors.MAX_GROUP_RETRIES == 3
+
+
+@pytest.mark.parametrize("limit", [-1, 0, 2.0, True, None])
+def test_invalid_isolated_group_retry_limit_is_rejected(limit):
+    with pytest.raises(ValueError, match="max_group_retries"):
+        rollout_errors.RolloutErrors(max_group_retries=limit)
+
+
+def test_limit_comes_from_core_config_with_default_for_older_configs():
+    assert (
+        rollout_errors.from_args(SimpleNamespace(olmo_core=SimpleNamespace(max_group_retries=6))).max_group_retries
+        == 6
+    )
+    assert rollout_errors.from_args(SimpleNamespace(olmo_core=SimpleNamespace())).max_group_retries == 3
+    assert rollout_errors.from_args(SimpleNamespace()).max_group_retries == 3

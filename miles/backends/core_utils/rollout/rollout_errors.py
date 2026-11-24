@@ -18,6 +18,7 @@ WINDOW_SECONDS = 300
 FAILURE_FRACTION = 0.5
 RETRY_DELAY_SECONDS = 1.0
 REPORT_INTERVAL_SECONDS = 15
+# Default isolated retries per prompt group; core.max_group_retries overrides it.
 MAX_GROUP_RETRIES = 3
 CATEGORIES = ("transport", "overload", "unavailable", "timeout")
 
@@ -86,6 +87,12 @@ def failure_description(error: BaseException) -> str:
     return description
 
 
+def from_args(args) -> "RolloutErrors":
+    """Use core.max_group_retries when the Core config provides it (older configs omit it)."""
+    core = getattr(args, "olmo_core", None)
+    return RolloutErrors(max_group_retries=getattr(core, "max_group_retries", MAX_GROUP_RETRIES))
+
+
 class RolloutErrors:
     """Count terminal group attempts, excluding cancellation and reward filtering.
 
@@ -94,7 +101,12 @@ class RolloutErrors:
     Empty windows reset the timer; a short burst cannot become fatal while idle.
     """
 
-    def __init__(self):
+    def __init__(self, max_group_retries: int = MAX_GROUP_RETRIES):
+        # At least 1: a group's first failure is counted before there is evidence
+        # that its prompt, not a shared outage, is at fault.
+        if type(max_group_retries) is not int or max_group_retries < 1:
+            raise ValueError(f"max_group_retries must be a positive integer, got {max_group_retries!r}")
+        self.max_group_retries = max_group_retries
         self.started = time.monotonic()
         self._buckets = collections.deque()
         self._bad_since = None
@@ -111,9 +123,9 @@ class RolloutErrors:
             # No successful generation since this prompt last failed. Leave
             # shared serving outages to the sustained-error-rate stop rule.
             return retries
-        if retries >= MAX_GROUP_RETRIES:
+        if retries >= self.max_group_retries:
             raise RuntimeError(
-                f"Generation group {group_index} failed again after {MAX_GROUP_RETRIES} isolated retries; "
+                f"Generation group {group_index} failed again after {self.max_group_retries} isolated retries; "
                 "stopping instead of repeatedly regenerating the same failing prompts"
             ) from error
         self._group_retries[group_index] = (retries + 1, self.successes)

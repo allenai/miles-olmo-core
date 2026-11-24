@@ -142,6 +142,7 @@ def producer(tmp_path, monkeypatch):
 
     # Use the real refresh constructor while avoiding unrelated data/engine setup.
     monkeypatch.setattr(async_rollout.ManagedFullyAsyncRolloutFn, "__init__", parent_init)
+    monkeypatch.setattr(refreshing_rollout.request_abort, "check_early_abort", lambda: True)
     return refreshing_rollout.RefreshingRolloutFn(None)
 
 

@@ -49,8 +49,7 @@ class MeasuredDataBuffer(DefaultDataBuffer):
             if self._records is not None:
                 self._records.record_group(samples, decision="aborted")
         else:
-            # Filters judge the members present: a partial group's placeholder rows copy
-            # a survivor and would weight its reward twice.
+            # Filters judge the members present: a partial group's placeholders carry no reward evidence.
             group = baseline_members(item.group)
             output = apply_missing_reward_filter(self._args, group)
             if output.keep:
@@ -201,6 +200,7 @@ class RefreshPolicyDataBuffer(HomogeneousPolicyDataBuffer):
                 "metadata": [s.train_metadata for s in samples],
                 "response_lengths": [s.response_length for s in samples],
                 "weight_versions": [s.weight_versions for s in samples],
+                "total_lengths": [len(s.tokens) for s in samples],
             }
         )
         return await self._delegate.put(item)

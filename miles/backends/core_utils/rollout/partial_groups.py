@@ -1,18 +1,15 @@
-"""Keep a policy-refresh prompt group when a member fails in transport.
+"""Experimentally keep a policy-refresh prompt group when a member fails in transport.
 
 By default (``core.refresh_min_group_size`` unset or equal to
 ``n_samples_per_prompt``) any recognized serving failure discards the whole
 group and requeues its pristine prompts. With a smaller minimum, a member whose
 request fails with a transport error or ``refresh_request_timeout`` is replaced
-by a fully masked dummy, as long as at least the minimum members succeeded.
+by a one-token padding row with no response, as long as at least the minimum members succeeded.
 
-The dummy keeps every group, and so every optimizer batch, at its fixed size.
-It copies the shortest surviving sibling under the failed member's index, has
-a zero loss mask, and is excluded from its group's reward mean and std, so
-advantages are computed over the members present. The dynamic filter sees only
-the members present. A custom reward post-process (``--custom-reward-post-process-path``)
+Padding preserves the fixed optimizer batch size. Reward statistics and filtering
+use only the actual completions. The padding row has no behavior-policy provenance. A custom reward post-process (``--custom-reward-post-process-path``)
 sees the padded group and must declare ``honors_exclude_from_reward_baseline``.
-Group reward models, on-policy distillation and custom train-data conversion
+Router auxiliary losses, group reward models, on-policy distillation and custom train-data conversion
 are not supported (``--group-rm``, ``--use-opd`` and
 ``--custom-convert-samples-to-train-data-path`` are rejected).
 """
@@ -24,14 +21,13 @@ from miles.backends.core_utils.rollout import rollout_errors
 from miles.ray.rollout.train_data_conversion import EXCLUDE_FROM_REWARD_BASELINE, HONORS_EXCLUDE_FROM_REWARD_BASELINE
 from miles.utils import logger_utils
 from miles.utils.function_registry import load_function
-from miles.utils.types import Sample
+from miles.utils.types import PARTIAL_GROUP_PADDING, Sample
 
 logger = logger_utils.setup_logger(__name__)
 
 # Failures of one request that say nothing about its prompt. Overload and
 # no-worker responses are fleet-wide and keep the whole-group retry path.
 DROPPABLE_CATEGORIES = ("transport", "timeout")
-DUMMY_KEY = "partial_group_dummy"
 
 
 def min_group_size(args) -> int | None:
@@ -46,6 +42,14 @@ def min_group_size(args) -> int | None:
         )
     if size == samples:
         return None
+    core = args.olmo_core
+    # To enable router losses, carry the padding marker through packing and use it
+    # to exclude these tokens from expert counts, loss sums and global denominators.
+    # Keep forwards aligned and handle packs that contain only padding.
+    if getattr(core, "router_aux_loss_weight", 0) or getattr(core, "router_z_loss_weight", 0):
+        raise ValueError(
+            "Experimental partial refresh groups require core.router_aux_loss_weight=0 and core.router_z_loss_weight=0"
+        )
     if getattr(args, "group_rm", False):
         # Group reward models score the whole group before failed members are
         # replaced, so they would see the aborted, incomplete responses.
@@ -54,7 +58,7 @@ def min_group_size(args) -> int | None:
         # OPD's post-process sets per-row teacher fields, which dummies would lack.
         raise ValueError("core.refresh_min_group_size below n_samples_per_prompt does not support --use-opd")
     if getattr(args, "custom_convert_samples_to_train_data_path", None):
-        # A custom converter receives the padded rows and would count the donor copy twice.
+        # A custom converter must understand the padding rows.
         raise ValueError(
             "core.refresh_min_group_size below n_samples_per_prompt does not support "
             "--custom-convert-samples-to-train-data-path"
@@ -62,7 +66,7 @@ def min_group_size(args) -> int | None:
     post_process = getattr(args, "custom_reward_post_process_path", None)
     if post_process and not getattr(load_function(post_process), HONORS_EXCLUDE_FROM_REWARD_BASELINE, False):
         # The callback sees the padded group; unless it excludes flagged dummies from
-        # its statistics, the donor copy would count twice.
+        # its statistics, the padding reward would change the baseline.
         raise ValueError(
             "core.refresh_min_group_size below n_samples_per_prompt requires a custom reward post-process that "
             f"sets {HONORS_EXCLUDE_FROM_REWARD_BASELINE} = True (excludes rows flagged "
@@ -102,26 +106,52 @@ def resolve(group: list[Sample], failures: dict[int, BaseException], *, min_size
     if len(group) - len(errors) < min_size:
         stats.requeued_groups += 1
         raise next(iter(errors.values()))
-    survivors = [sample for position, sample in enumerate(group) if position not in errors]
-    donor = min(survivors, key=lambda sample: (len(sample.tokens), sample.index))
+    example = next(sample for position, sample in enumerate(group) if position not in errors)
     categories = {group[position].index: rollout_errors.recovery_category(error) for position, error in errors.items()}
     stats.accepted_groups += 1
     stats.dropped_members.update(categories.values())
     logger.warning(
         "Keeping partial group %s: %d/%d members succeeded, masked dummies for %s",
         group[0].group_index,
-        len(survivors),
+        len(group) - len(errors),
         len(group),
         categories,
     )
-    return [dummy(donor, sample.index) if position in errors else sample for position, sample in enumerate(group)]
+    return [padding(sample, example) if position in errors else sample for position, sample in enumerate(group)]
 
 
-def dummy(donor: Sample, index: int) -> Sample:
+def padding(failed: Sample, example: Sample) -> Sample:
+    """Keep the failed slot's identity and use only the survivor's tensor shapes."""
+    metadata = {**failed.metadata, PARTIAL_GROUP_PADDING: True, EXCLUDE_FROM_REWARD_BASELINE: True}
+    if "raw_reward" in example.metadata:
+        metadata["raw_reward"] = 0.0
+    if "round_number" in example.metadata:
+        metadata.setdefault("round_number", example.metadata["round_number"])
+
     return dataclasses.replace(
-        donor,
-        index=index,
+        failed,
+        # Single valid vocabulary ID. This one-token document has no target.
+        tokens=[0],
+        response="",
+        response_length=0,
+        status=Sample.Status.FAILED,
+        reward=dict.fromkeys(example.reward, 0.0) if isinstance(example.reward, dict) else 0.0,
         remove_sample=True,
-        loss_mask=[0] * donor.response_length,
-        metadata={**donor.metadata, DUMMY_KEY: True, EXCLUDE_FROM_REWARD_BASELINE: True},
+        loss_mask=[],
+        weight_versions=[],
+        rollout_log_probs=[],
+        rollout_routed_experts=(
+            example.rollout_routed_experts[:0] if example.rollout_routed_experts is not None else None
+        ),
+        rollout_topk_token_ids=(
+            example.rollout_topk_token_ids[:0] if example.rollout_topk_token_ids is not None else None
+        ),
+        rollout_topk_log_probs=(
+            example.rollout_topk_log_probs[:0] if example.rollout_topk_log_probs is not None else None
+        ),
+        rollout_sampling_mask=(
+            example.rollout_sampling_mask.prefix(0) if example.rollout_sampling_mask is not None else None
+        ),
+        metadata=metadata,
+        train_metadata={PARTIAL_GROUP_PADDING: True},
     )

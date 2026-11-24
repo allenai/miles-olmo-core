@@ -4,9 +4,12 @@ import asyncio
 from types import SimpleNamespace
 
 import httpx
+import numpy as np
 import pytest
 import torch
 
+from miles.backends.core_utils import data as core_data
+from miles.backends.core_utils import observability, packing
 from miles.backends.core_utils.publication import policy_refresh
 from miles.backends.core_utils.rollout import partial_groups, rollout_errors
 from miles.backends.core_utils.rollout.async_buffer import RefreshPolicyDataBuffer
@@ -15,7 +18,8 @@ from miles.backends.core_utils.rollout.refreshing_rollout import RefreshingRollo
 from miles.ray.rollout import train_data_conversion
 from miles.rollout.base_types import GenerateFnOutput
 from miles.rollout.fully_async_data_buffer import DataBufferConstructorInput, DataBufferInput
-from miles.utils.types import Sample
+from miles.utils.inference_records import response_record
+from miles.utils.types import PARTIAL_GROUP_PADDING, Sample
 
 
 def router_failure(code="call_upstream_request_error"):
@@ -93,11 +97,16 @@ def test_seven_of_eight_keeps_group_with_masked_dummy():
     assert failures == {}
     assert [s.index for s in resolved] == list(range(8))
     assert resolved[:2] + resolved[3:] == group[:2] + group[3:]
-    # Shortest survivor's tokens, the failed member's identity, nothing trainable.
-    assert (dummy.group_index, dummy.response_length, dummy.tokens) == (3, 1, group[5].tokens)
-    assert dummy.remove_sample and dummy.loss_mask == [0]
-    assert dummy.metadata[partial_groups.DUMMY_KEY]
-    assert not group[5].metadata.get(partial_groups.DUMMY_KEY)
+    assert (dummy.group_index, dummy.response_length, dummy.tokens) == (3, 0, [0])
+    assert dummy.remove_sample and dummy.loss_mask == []
+    assert dummy.response == "" and dummy.rollout_log_probs == []
+    assert dummy.weight_versions == [] and dummy.train_metadata == {PARTIAL_GROUP_PADDING: True}
+    assert dummy.status == Sample.Status.FAILED
+    record = response_record(dummy, text=True, fresh_run=True)
+    assert record["reward"] is None and record["response_tokens"] == 0 and "response" not in record
+    assert record[PARTIAL_GROUP_PADDING]
+    assert dummy.metadata[PARTIAL_GROUP_PADDING]
+    assert not group[5].metadata.get(PARTIAL_GROUP_PADDING)
     assert (stats.accepted_groups, stats.dropped_members["timeout"], stats.requeued_groups) == (1, 1, 0)
 
 
@@ -210,7 +219,7 @@ baseline_aware.honors_exclude_from_reward_baseline = True
 
 
 def test_partial_groups_require_a_baseline_aware_custom_post_process():
-    # A callback that does not exclude dummies would count the donor twice, and one
+    # A callback that does not exclude padding would count its placeholder reward, and one
     # that reshapes by n_samples_per_prompt cannot see prompt boundaries otherwise.
     args = SimpleNamespace(n_samples_per_prompt=8, olmo_core=SimpleNamespace(refresh_min_group_size=7))
     path = f"{__name__}.mean_centering"
@@ -224,7 +233,7 @@ def test_partial_groups_require_a_baseline_aware_custom_post_process():
 
 
 def test_baseline_aware_post_process_sees_the_padded_group():
-    # Survivors 0 and 1 center to -0.5 and 0.5; counting the 0-reward donor twice would give -1/3 and 2/3.
+    # Survivors 0 and 1 center to -0.5 and 0.5; counting the zero placeholder would give -1/3 and 2/3.
     group = [make_sample(0, 0, reward=0.0, response_length=1), make_sample(0, 1, reward=1.0, response_length=2)]
     group.append(make_sample(0, 2, reward=1.0))
     resolved = partial_groups.resolve(
@@ -232,7 +241,7 @@ def test_baseline_aware_post_process_sees_the_padded_group():
     )
     data = train_data_conversion.convert_samples_to_train_data(reward_args(), resolved, {}, None, baseline_aware)
     assert data["rewards"] == pytest.approx([-0.5, 0.5, 0.0])
-    assert data["loss_masks"][2] == [0]
+    assert data["loss_masks"][2] == []
 
 
 def test_filters_and_reward_metrics_see_only_the_members_present(monkeypatch):
@@ -250,8 +259,8 @@ def test_filters_and_reward_metrics_see_only_the_members_present(monkeypatch):
         resolved = partial_groups.resolve(
             group, {id(group[4]): router_failure()}, min_size=7, stats=partial_groups.PartialGroupStats()
         )
-        # The dummy copies the 1.0-reward shortest member; metrics must not count it twice.
-        assert resolved[4].reward == 1.0
+        # A failed slot contributes no reward evidence.
+        assert resolved[4].reward == 0.0
         assert await buffer.put(DataBufferInput(prompt_group=group, group=resolved)) is True
         assert len(measured._buffer[0].group) == 8
         return measured._metric_gatherer.collect()
@@ -334,7 +343,7 @@ def test_producer_keeps_group_after_one_droppable_failure(error, category):
     producer = refresh_producer(7, scripted({3: error}))
     entry = asyncio.run(producer._generate_group(prompt_group()))
     assert len(entry.group) == 8
-    assert [partial_groups.DUMMY_KEY in s.metadata for s in entry.group] == [i == 3 for i in range(8)]
+    assert [PARTIAL_GROUP_PADDING in s.metadata for s in entry.group] == [i == 3 for i in range(8)]
     assert producer._failed_members == {}
     metrics = producer._errors.metrics()
     assert metrics["errors/partial_groups_accepted"] == 1
@@ -375,3 +384,42 @@ def test_default_config_output_is_unchanged():
 
     assert run(None) == run(7)
     assert not any(key.startswith("errors/partial_") for key in refresh_producer(None, None)._errors.metrics())
+
+
+@pytest.mark.parametrize("weight", ["router_aux_loss_weight", "router_z_loss_weight"])
+def test_partial_groups_guard_router_losses(weight):
+    core = SimpleNamespace(refresh_min_group_size=7, **{weight: 0.1})
+    args = SimpleNamespace(n_samples_per_prompt=8, olmo_core=core)
+    with pytest.raises(ValueError, match=rf"Experimental partial refresh groups require .*{weight}=0"):
+        partial_groups.min_group_size(args)
+    core.refresh_min_group_size = 8
+    assert partial_groups.min_group_size(args) is None
+
+
+def test_first_padding_row_survives_conversion_and_behavior_metrics():
+    original, failures = failed_group([0])
+    for sample in original[1:]:
+        sample.rollout_routed_experts = np.zeros((len(sample.tokens) - 1, 1, 1), dtype=np.int32)
+    group = partial_groups.resolve(original, failures, min_size=7, stats=partial_groups.PartialGroupStats())
+    args = reward_args()
+    args.use_rollout_routing_replay = True
+    batch = train_data_conversion.convert_samples_to_train_data(args, group, {}, None, None)
+    batch["total_lengths"] = [len(tokens) for tokens in batch["tokens"]]
+    assert batch["rollout_routed_experts"][0].shape == (0, 1, 1)
+    assert core_data.policy_versions(batch) == [0] * 7
+    assert policy_refresh.validate_batch(batch)[0] == []
+    for key in ("tokens", "loss_masks", "rollout_log_probs", "rollout_routed_experts"):
+        batch[key] = [torch.as_tensor(row) for row in batch[key]]
+    packed = packing.combine(core_data.sample_batches(batch, 64), range(8))
+    block = torch.nn.Module()
+    block.routed_experts_router = torch.nn.Identity()
+    model = torch.nn.Module()
+    model.blocks = torch.nn.ModuleList([block])
+    routes = core_data.router_routes(model, packed)["blocks.0.routed_experts_router"]
+    assert routes.shape == (1, packed["tokens"].numel(), 1)
+    batch["log_probs"] = batch["rollout_log_probs"]
+    assert policy_refresh.score_metrics(batch, current_version=0, clip_low=0.8, clip_high=1.2)["response_count"] == 7
+    assert observability._active_tokens(batch, current_version=0)[0].numel() == 21
+    batch["metadata"][0] = {}
+    with pytest.raises(ValueError, match="no provenance"):
+        policy_refresh.validate_batch(batch)

@@ -64,6 +64,13 @@ class RewardSpec:
     custom_rm_path: str | None = None
 
 
+PARTIAL_GROUP_PADDING = "partial_group_padding"
+
+
+def is_partial_group_padding(metadata) -> bool:
+    return isinstance(metadata, dict) and metadata.get(PARTIAL_GROUP_PADDING) is True
+
+
 @dataclass
 class Sample:
     """The sample generated"""

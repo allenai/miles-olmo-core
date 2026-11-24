@@ -5,6 +5,7 @@ from typing import Any
 import torch
 
 from miles.backends.core_utils.publication import policy_versions as provenance
+from miles.utils.types import is_partial_group_padding
 
 
 def sample_batches(data: dict[str, Any], max_length: int) -> list[dict[str, Any]]:
@@ -30,12 +31,11 @@ def sample_batches(data: dict[str, Any], max_length: int) -> list[dict[str, Any]
 
 def policy_versions(batch: dict[str, Any]) -> list[int]:
     values = batch.get("weight_versions")
-    if (
-        not isinstance(values, (list, tuple))
-        or not values
-        or any(not isinstance(sample, (list, tuple)) or not sample for sample in values)
-    ):
+    if not isinstance(values, (list, tuple)) or not values:
         raise ValueError("Every sample must carry its behavior policy version")
+    metadata = batch.get("metadata")
+    if metadata is not None:
+        values = [value for value, row in zip(values, metadata, strict=True) if not is_partial_group_padding(row)]
     return [version for sample in values for version in provenance.versions(sample)]
 
 

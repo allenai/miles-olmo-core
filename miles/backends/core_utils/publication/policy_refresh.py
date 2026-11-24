@@ -14,7 +14,7 @@ import torch
 from miles.backends.core_utils.publication import cache_protocol, policy_versions
 from miles.backends.sglang_utils import sglang_config
 from miles.utils.rollout_replay import TokenLogprobs
-from miles.utils.types import WeightVersionSpan, WeightVersionsPerCall
+from miles.utils.types import WeightVersionSpan, WeightVersionsPerCall, is_partial_group_padding
 
 
 def validate_pause_mode(args):
@@ -139,6 +139,18 @@ def validate_batch(batch):
         raise ValueError("Policy refresh training batch lost token-version metadata")
     result = []
     for index, (item, length, sample_versions) in enumerate(zip(metadata, lengths, versions, strict=True)):
+        if is_partial_group_padding(item):
+            if (
+                length != 0
+                or not isinstance(sample_versions, (list, tuple))
+                or sample_versions
+                or "policy_refresh" in item
+            ):
+                raise ValueError("Policy refresh padding cannot carry response tokens or behavior provenance")
+            if "total_lengths" in batch and batch["total_lengths"][index] != 1:
+                raise ValueError("Policy refresh padding requires one model token")
+            result.append([])
+            continue
         record = item.get("policy_refresh") if isinstance(item, dict) else None
         if not isinstance(record, dict):
             raise ValueError("Policy refresh training sample has no provenance")
@@ -175,6 +187,8 @@ def score_metrics(rollout, *, current_version, clip_low, clip_high):
         rollout["metadata"],
         strict=True,
     ):
+        if not spans:
+            continue
         delta = scores.detach().float() - behavior.detach().float()
         replay_version = metadata["policy_refresh"]["replay_version"]
         mixed += int(len(spans) > 1)
@@ -188,7 +202,7 @@ def score_metrics(rollout, *, current_version, clip_low, clip_high):
                 current_tokens += selected.numel()
     metrics = dict(
         mixed_responses=mixed,
-        response_count=len(spans_by_sample),
+        response_count=sum(bool(spans) for spans in spans_by_sample),
         active_tokens=tokens,
         current_version_token_fraction=current_tokens / max(tokens, 1),
     )

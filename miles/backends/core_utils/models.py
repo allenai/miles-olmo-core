@@ -93,9 +93,12 @@ def build_train_module(args, source=None, *, reference=False):
         lr=args.lr, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps, weight_decay=args.weight_decay
     )
     with startup_stage(args, "hf_read"):
-        hf_model = transformers.AutoModelForCausalLM.from_pretrained(
-            source, trust_remote_code=True, torch_dtype=torch.bfloat16
-        )
+        if kind == "moe" and "linear_attention" in (getattr(hf, "layer_types", None) or []):
+            hf_model = backend.load_kda_hf_model(source, hf)
+        else:
+            hf_model = transformers.AutoModelForCausalLM.from_pretrained(
+                source, trust_remote_code=True, torch_dtype=torch.bfloat16
+            )
     with startup_stage(args, "native_model_optimizer_build", device=torch.cuda):
         module = backend.build_train_module(
             args, common=common, optim=optim, hf_config=hf, hf_state=hf_model.state_dict()

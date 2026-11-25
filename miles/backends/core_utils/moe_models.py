@@ -6,16 +6,34 @@ from olmo_core.distributed.parallel import DataParallelType
 from olmo_core.nn import attention
 from olmo_core.nn.hf import config as hf_config_utils
 from olmo_core.nn.moe.v2 import olmo3, replay
+from olmo_core.nn.moe.v2.hf.modeling_olmo3moe import Olmo3MoeForCausalLM
 from olmo_core.optim import OLMoDDPOptimizerConfig
 from olmo_core.train.train_module import transformer as train_transformer
 from olmo_core.train.train_module.transformer import config as train_config
+from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from miles.backends.core_utils import data, fla_compat, fla_conv_compat
 from miles.backends.core_utils.timing import startup_stage
+from miles.backends.core_utils.weight_dtypes import KDA_FP32_WEIGHTS
 
 
 def register_hf_classes():
     hf_config_utils._register_olmo3moe_auto_classes()
+
+
+def load_kda_hf_model(source, config):
+    # Older checkpoints carry their own HF class in auto_map. Apply the
+    # dtype policy to that class for this load, without changing it globally.
+    reference = (getattr(config, "auto_map", None) or {}).get("AutoModelForCausalLM")
+    model_class = get_class_from_dynamic_module(reference, source) if reference else Olmo3MoeForCausalLM
+
+    class KDAHFModel(model_class):
+        _keep_in_fp32_modules_strict = [
+            *(model_class._keep_in_fp32_modules_strict or ()),
+            *KDA_FP32_WEIGHTS,
+        ]
+
+    return KDAHFModel.from_pretrained(source, config=config, torch_dtype=torch.bfloat16)
 
 
 def model_config_from_hf(hf, options):

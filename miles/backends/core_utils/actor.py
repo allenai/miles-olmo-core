@@ -36,6 +36,7 @@ from miles.backends.core_utils.publication import (
 )
 from miles.backends.core_utils.publication.state import PolicyClock
 from miles.backends.core_utils.timing import startup_stage
+from miles.backends.core_utils.weight_dtypes import needs_new_bucket, publication_dtype
 from miles.backends.training_utils import parallel
 from miles.backends.training_utils.data import rollout as miles_data
 from miles.backends.training_utils.loss import objective as miles_loss
@@ -800,13 +801,15 @@ class OLMoCoreTrainRayActor(TrainRayActor):
             stream_moe=self.args.olmo_core.stream_moe_export,
             fused_experts=self.args.olmo_core.expert_publication == "fused",
         ):
+            dtype = publication_dtype(name, tensor)
+            nbytes = tensor.numel() * dtype.itemsize
             tensor_count += 1
-            byte_count += tensor.nbytes
-            if bucket and size + tensor.nbytes > self.args.update_weight_buffer_size:
+            byte_count += nbytes
+            if needs_new_bucket(size, nbytes, dtype, self.args.update_weight_buffer_size):
                 send(bucket)
                 bucket, size = [], 0
-            bucket.append((name, tensor.to(device="cuda", dtype=torch.bfloat16).contiguous()))
-            size += tensor.nbytes
+            bucket.append((name, tensor.to(device="cuda", dtype=dtype).contiguous()))
+            size += nbytes
         if bucket:
             send(bucket)
         export_done = time.perf_counter()

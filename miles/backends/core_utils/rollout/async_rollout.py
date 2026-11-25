@@ -85,11 +85,6 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         self._interrupted_groups: list[int] = []
         self._publication_paused = False
         self._drain_yield_at = 0.0
-        if getattr(self.args, "async_unused_samples_handler", None) == "drop":
-            # Unused work is terminal under drop, unlike groups acknowledged
-            # after draining a training batch. Feedback providers need that distinction.
-            discard = getattr(self.data_source, "discard_groups", self.data_source.acknowledge_groups)
-            self._handle_unused = lambda group: discard([group])
 
     async def dispose(self):
         try:

@@ -11,12 +11,13 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 from argparse import ArgumentParser, Namespace
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
-from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter, iter_samples
+from miles.rollout.filter_hub.base_types import MetricGatherer, UnusedSamplesHandler, call_dynamic_filter, iter_samples
 from miles.rollout.filter_hub.common_filters import (
+    FilterReason,
     GroupWeightVersionStats,
     apply_aborted_filter,
     apply_missing_reward_filter,
@@ -65,7 +66,7 @@ def first_sample(group: Group) -> Sample:
 
 class DataBufferConstructorInput:
     args: Namespace
-    unused_handler_fn: Callable[[list[Sample]], None]  # --async-unused-samples-handler, applied to unused groups
+    unused_handler_fn: UnusedSamplesHandler  # --async-unused-samples-handler, applied to unused groups
 
 
 @dataclass
@@ -124,7 +125,7 @@ class DefaultDataBuffer(DataBuffer):
     (2) unused handling: ``--async-unused-samples-handler`` decides what happens
         to aborted and stale groups: drop discards them, retry recycles their
         prompts for regeneration. Missing-reward and custom-filter rejections
-        are discarded directly.
+        are discarded directly, except by never_give_up (see ``never_give_up.py``).
     """
 
     def __init__(self, input: DataBufferConstructorInput):
@@ -137,6 +138,8 @@ class DefaultDataBuffer(DataBuffer):
         assert self._capacity >= 1
 
         self._unused_handler_fn = input.unused_handler_fn
+        # Plain callable handlers predate the optional dequeue hook.
+        self._pre_staleness_filter = getattr(input.unused_handler_fn, "pre_staleness_filter", None)
         self._dynamic_filter = load_function(args.dynamic_sampling_filter_path)
         self._cond = asyncio.Condition()
         self._current_version: int | None = None
@@ -166,19 +169,22 @@ class DefaultDataBuffer(DataBuffer):
         output = apply_aborted_filter(self._args, input.group)
         if not output.keep:
             self._metric_aborted_groups += 1
-            self._unused_handler_fn(input.prompt_group)
+            self._unused_handler_fn(input.prompt_group, group=input.group, reason=output.reason)
             return False
 
         output = apply_missing_reward_filter(self._args, input.group)
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
+            self._unused_handler_fn(input.prompt_group, group=input.group, reason=output.reason)
             return False
 
         self._metric_gatherer.on_group_before_dynamic_filter(self._args, input.group)
         output = call_dynamic_filter(self._dynamic_filter, self._args, input.group)
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
+            self._unused_handler_fn(input.prompt_group, group=input.group, reason=output.reason)
             return False
+        self._unused_handler_fn(input.prompt_group, group=input.group, reason=FilterReason.kept)
         return True
 
     async def get(self, current_version: int | None = None, *, wait: bool = True, **_) -> DataBufferInput | None:
@@ -192,6 +198,8 @@ class DefaultDataBuffer(DataBuffer):
                     await self._cond.wait()
                 entry = self._buffer.pop(0)
                 self._cond.notify_all()  # wake producers blocked on a full buffer
+                if self._pre_staleness_filter is not None:
+                    entry.group = self._pre_staleness_filter(entry.group, current_version=current_version)
 
                 version_stats = group_weight_version_stats(entry.group)
                 staleness = version_stats.oldest_lag(current_version)
@@ -205,7 +213,7 @@ class DefaultDataBuffer(DataBuffer):
                     if self._args.max_weight_staleness is not None and staleness > self._args.max_weight_staleness:
                         logger.info(f"Filtered stale group ({staleness=} > max={self._args.max_weight_staleness})")
                         self._metric_stale_groups += 1
-                        self._unused_handler_fn(entry.prompt_group)
+                        self._unused_handler_fn(entry.prompt_group, group=entry.group, reason=FilterReason.stale)
                         continue
                     self._metric_consumed_staleness.append(staleness)
                 self._record_selected_version_stats(version_stats, current_version)

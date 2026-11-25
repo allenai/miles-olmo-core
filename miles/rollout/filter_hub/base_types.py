@@ -2,6 +2,7 @@ import argparse
 from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import Protocol
 
 from miles.utils.types import Sample
 
@@ -13,6 +14,41 @@ class FilterOutput:
 
 
 DynamicFilterOutput = FilterOutput
+
+
+class UnusedSamplesHandler(Protocol):
+    """The ``--async-unused-samples-handler`` contract: told what became of every finished group.
+
+    ``prompt_group`` is the resubmittable prompt, ``group`` the finished samples, and ``reason``
+    what became of it (``FilterReason`` in ``common_filters.py``, where ``kept`` means it trains,
+    or a dynamic filter's own reason, ``None`` if it gave none). Kept groups may be edited in place.
+    """
+
+    def __call__(
+        self, prompt_group: list[Sample], *, group: list[Sample | list[Sample]], reason: str | None
+    ) -> None: ...
+
+    def collect_metrics(self) -> dict[str, float]:
+        return {}
+
+    def pre_staleness_filter(
+        self, group: list[Sample | list[Sample]], *, current_version: int | None
+    ) -> list[Sample | list[Sample]]:
+        """Return the nonempty group to check at dequeue time; by default, preserve it.
+
+        Handlers may trim retained work here. The buffer still applies its normal
+        whole-group staleness check and rejection callback to the returned group.
+        """
+        return group
+
+
+def discard_unused(data_source, prompt_group: list[Sample]) -> None:
+    """Retire unused work without crediting training; legacy sources only have acknowledgements."""
+    discard = getattr(data_source, "discard_groups", None)
+    if discard is None:
+        discard = getattr(data_source, "acknowledge_groups", None)
+    if discard is not None:
+        discard([prompt_group])
 
 
 def iter_samples(group: list[Sample | list[Sample]]) -> Iterator[Sample]:

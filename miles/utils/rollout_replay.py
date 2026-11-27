@@ -21,6 +21,15 @@ def decode_int32_buffer(value: str | np.ndarray) -> np.ndarray:
     return np.frombuffer(pybase64.b64decode(value.encode("ascii")), dtype=np.int32)
 
 
+def decode_float32_buffer(value: str | np.ndarray) -> np.ndarray:
+    """Decode a base64 little-endian float32 buffer, or validate an already decoded one."""
+    if isinstance(value, np.ndarray):
+        if value.dtype != np.float32 or value.ndim != 1 or not value.flags.c_contiguous:
+            raise ValueError("Decoded candidate logprobs must be a contiguous, flat float32 array")
+        return value
+    return np.frombuffer(pybase64.b64decode(value.encode("ascii")), dtype="<f4")
+
+
 def decode_response_routes(response, *, observation=None):
     """Replace only the routing blob; leave token/policy metadata unchanged.
 
@@ -105,21 +114,33 @@ class TokenLogprobs:
 
 
 def compact_token_logprobs(response, *, observation=None):
-    """Replace nested per-token records with ``TokenLogprobs``; everything else is untouched."""
+    """Replace nested per-token records with ``TokenLogprobs`` and decode base64 candidate arrays.
+
+    Everything else is untouched.
+    """
     if not isinstance(response, dict):
         return response
     metadata = response.get("meta_info")
     if not isinstance(metadata, dict):
         return response
     records = metadata.get("output_token_logprobs")
-    if records is None or isinstance(records, TokenLogprobs):
+    candidates = metadata.get("output_top_logprobs_val_flat_b64")
+    compact_records = records is not None and not isinstance(records, TokenLogprobs)
+    decode_candidates = isinstance(candidates, str)
+    if not compact_records and not decode_candidates:
         return response
     started, cpu = time.monotonic(), time.thread_time()
-    compact = TokenLogprobs.from_records(records)
+    updated = dict(metadata)
+    if compact_records:
+        updated["output_token_logprobs"] = TokenLogprobs.from_records(records)
+    if decode_candidates:
+        # Flat buffers cross Ray without re-encoding; the sample consumer reshapes them.
+        updated["output_top_logprobs_val_flat_b64"] = decode_float32_buffer(candidates)
+        updated["output_top_logprobs_idx_flat_b64"] = decode_int32_buffer(metadata["output_top_logprobs_idx_flat_b64"])
     if observation is not None:
         observation.update(
             token_logprobs_compact_seconds=time.monotonic() - started,
             token_logprobs_compact_thread_cpu_seconds=time.thread_time() - cpu,
-            token_logprobs_count=len(compact),
+            token_logprobs_count=len(updated["output_token_logprobs"]) if records is not None else 0,
         )
-    return {**response, "meta_info": {**metadata, "output_token_logprobs": compact}}
+    return {**response, "meta_info": updated}

@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 
+from miles.utils.rollout_replay import decode_float32_buffer, decode_int32_buffer
 from miles.utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_sampling
 from miles.utils.sampling_mask import RolloutSamplingMask
 from miles.utils.types import Sample
@@ -36,6 +37,11 @@ def configure_rollout_topk_logprobs_request(args: Namespace, request: dict[str, 
         request["top_logprobs"] = k
     else:
         request.pop("sampling_logprobs_mode", None)
+        # Another consumer (top-k OPD) reads nested output_top_logprobs.
+        if "top_logprobs_num" not in request:
+            # Two base64 [response, k] arrays instead of k records per token.
+            request["return_flat_raw_output_top_logprobs"] = True
+            request["return_flat_raw_top_logprobs_b64"] = True
         request["top_logprobs_num"] = k
 
 
@@ -53,6 +59,10 @@ def append_rollout_topk_logprobs(
         return
     n = len(meta.get("output_token_logprobs") or [])
     support_mode = sampling_logprobs_mode == "support"
+    if not support_mode and meta.get("output_top_logprobs_val_flat_b64") is not None:
+        ids, logps = decode_output_top_logprobs(meta, n, k)
+        _append_topk_arrays(sample, ids, logps)
+        return
     field = "output_token_sampling_logprobs" if support_mode else "output_top_logprobs"
     rows = meta.get(field)
     if n and (rows is None or len(rows) != n):
@@ -69,9 +79,45 @@ def append_rollout_topk_logprobs(
             probabilities = [entry[0] for entry in entries[:k]]
         ids[i, : len(token_ids)] = token_ids
         logps[i, : len(token_ids)] = probabilities
+    _append_topk_arrays(sample, ids, logps)
+
+
+def _append_topk_arrays(sample: Sample, ids: np.ndarray, logps: np.ndarray) -> None:
     for name, values in (("rollout_topk_token_ids", ids), ("rollout_topk_log_probs", logps)):
         previous = getattr(sample, name)
         setattr(sample, name, values if previous is None else np.concatenate((previous, values)))
+
+
+def decode_output_top_logprobs(meta: Mapping[str, Any], n: int, k: int) -> tuple[np.ndarray, np.ndarray]:
+    """Read SGLang's flat base64 candidates as int32 IDs and float32 logprobs [n, k].
+
+    ``output_top_logprobs_shape`` is [rows, width]; ``output_top_logprobs_null_prefix``
+    leading tokens have no candidates. Missing slots become ID -1/logp -inf, as in
+    the nested path. Values may already be decoded to flat arrays by the HTTP worker.
+    """
+    shape = meta.get("output_top_logprobs_shape")
+    if shape is None or len(shape) != 2:
+        raise ValueError("SGLang flat top logprobs require output_top_logprobs_shape")
+    rows, width = (int(x) for x in shape)
+    null_prefix = int(meta.get("output_top_logprobs_null_prefix") or 0)
+    if null_prefix + rows != n:
+        raise ValueError(
+            "Rollout top-k logprobs collection requires candidates for every generated token: "
+            f"{null_prefix} + {rows} rows for {n} tokens"
+        )
+    logps = decode_float32_buffer(meta["output_top_logprobs_val_flat_b64"])
+    ids = decode_int32_buffer(meta["output_top_logprobs_idx_flat_b64"])
+    if logps.size != rows * width or ids.size != rows * width:
+        raise ValueError("SGLang flat top logprobs do not match output_top_logprobs_shape")
+    logps, ids = logps.reshape(rows, width), ids.reshape(rows, width)
+    if width == k and not null_prefix:
+        return ids.copy(), logps.copy()
+    out_ids = np.full((n, k), -1, dtype=np.int32)
+    out_logps = np.full((n, k), -np.inf, dtype=np.float32)
+    width = min(width, k)
+    out_ids[null_prefix:, :width] = ids[:, :width]
+    out_logps[null_prefix:, :width] = logps[:, :width]
+    return out_ids, out_logps
 
 
 def _support_membership(ids: np.ndarray, support: RolloutSamplingMask) -> tuple[np.ndarray, np.ndarray]:

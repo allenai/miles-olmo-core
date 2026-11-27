@@ -68,14 +68,12 @@ def _resolve_max_retained_groups(args: Any) -> int | None:
 
 
 def is_supported_retained_buffer_cls(buffer_cls: Any) -> bool:
-    """Return True if a DataBuffer class supports exact single-policy retained-group accounting."""
-    return bool(getattr(buffer_cls, "supports_retained_group_accounting", False))
+    """Return True if a DataBuffer class explicitly declares single-policy retained-group accounting."""
+    return isinstance(buffer_cls, type) and bool(buffer_cls.__dict__.get("supports_retained_group_accounting", False))
 
 
 def _is_supported_retained_buffer(output: Any) -> bool:
-    return bool(getattr(output, "supports_retained_group_accounting", False)) and callable(
-        getattr(output, "retained_group_count", None)
-    )
+    return is_supported_retained_buffer_cls(type(output)) and callable(getattr(output, "retained_group_count", None))
 
 
 def _buffered_group_count(output: Any) -> int:

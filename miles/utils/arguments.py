@@ -3906,7 +3906,9 @@ def miles_validate_args(args):
         )
         if args.custom_async_data_buffer_path is not None:
             buffer_cls = load_function(args.custom_async_data_buffer_path)
-            assert getattr(buffer_cls, "supports_retained_group_accounting", False), (
+            assert isinstance(buffer_cls, type) and buffer_cls.__dict__.get(
+                "supports_retained_group_accounting", False
+            ), (
                 f"{flag} is only supported with built-in single-policy buffers, "
                 f"got --custom-async-data-buffer-path={args.custom_async_data_buffer_path!r}"
             )

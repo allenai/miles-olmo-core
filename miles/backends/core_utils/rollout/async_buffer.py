@@ -24,6 +24,8 @@ def baseline_members(group):
 
 
 class MeasuredDataBuffer(DefaultDataBuffer):
+    supports_retained_group_accounting = True
+
     def __init__(self, input):
         if not hasattr(DefaultDataBuffer, "on_dequeue"):
             raise RuntimeError("Completed-queue metrics require the pinned MILES runtime with on_dequeue support")
@@ -197,6 +199,8 @@ class RefreshPolicyDataBuffer(HomogeneousPolicyDataBuffer):
     The delegate still uses the oldest behavior version for the lag limit and
     FIFO consumption. A refreshed suffix never conceals an old prefix.
     """
+
+    supports_retained_group_accounting = True
 
     # The managed producer consumes False to retire intentionally filtered groups.
     async def put(self, item):  # ty: ignore[invalid-method-override]

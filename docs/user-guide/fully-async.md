@@ -175,6 +175,8 @@ Buffer capacity bounds how far generation can run ahead of training:
 | Flag | Effect |
 |---|---|
 | `--async-data-buffer-capacity-factor` | Buffer holds `floor(factor * rollout_batch_size)` groups, `2.0` by default. When it is full the producer blocks until training consumes |
+| `--async-max-retained-batches` | Optional hard cap of `floor(batches * rollout_batch_size)` total retained groups across the entire single-policy pipeline (in-flight, partially completed, staged awaiting FIFO insertion, buffered in the FIFO, and reserved for a prepared batch). Unlike `--async-max-concurrent-samples`, which only bounds unfinished samples, this prevents sample-level backfill from accumulating unbounded upstream group backlog under trainer backpressure. Unset by default; requires `--fully-async` and a built-in single-policy buffer |
+| `--async-auto-jit-pacing` | Adaptive just-in-time pacing over retained groups. Starts conservatively during startup compilation, tightens retained capacity when consecutive steps see near-zero trainer wait with excess ready work, and snaps immediately back to full steam (`--async-max-retained-batches` if set, else `producer_group_budget / rollout_batch_size + async_data_buffer_capacity_factor`) if trainer wait reaches 10s (including live while waiting). Off by default; requires `--fully-async` and a built-in single-policy buffer |
 
 Staleness control decides which of those groups training is allowed to see:
 

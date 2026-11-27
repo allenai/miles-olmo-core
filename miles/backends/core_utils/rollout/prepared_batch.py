@@ -72,16 +72,13 @@ class PreparedBatch:
         pacer = getattr(self.executor.generate_rollout, "_jit_pacer", None)
         if pacer is not None and pacer.target_batches < pacer.config.max_batches and not self.task.done():
             escape_after = pacer.config.wait_escape_seconds
-            try:
-                batch = await asyncio.wait_for(asyncio.shield(self.task), timeout=escape_after)
-            except TimeoutError:
+            _, pending = await asyncio.wait({self.task}, timeout=escape_after)
+            if pending:
                 elapsed = max(time.monotonic() - waited_at, escape_after)
                 await asyncio.wrap_future(
                     async_utils.submit(self.executor.generate_rollout.trigger_jit_escape(elapsed))
                 )
-                batch = await asyncio.shield(self.task)
-        else:
-            batch = await asyncio.shield(self.task)
+        batch = await asyncio.shield(self.task)
         # Publication may have progressed while collection waited for generations.
         actual = self.executor._weight_versions_of_model_id.get(None)
         if actual != self.version:

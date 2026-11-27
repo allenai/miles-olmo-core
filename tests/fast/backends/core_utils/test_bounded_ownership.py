@@ -388,6 +388,10 @@ class _UnsupportedCustomBuffer:
         return {}
 
 
+class _UnsupportedCustomSubclass(DefaultDataBuffer):
+    """Subclass storing groups outside _buffer without declaring retained-group accounting."""
+
+
 def test_rejects_multi_policy_and_custom_buffers_when_bounded_ownership_enabled(monkeypatch):
     """Multi-policy and non-built-in custom buffers must be rejected when async_max_retained_batches is set."""
 
@@ -430,15 +434,19 @@ def test_rejects_multi_policy_and_custom_buffers_when_bounded_ownership_enabled(
         )
         assert fn._max_retained_groups() == 4
 
-    # Arbitrary custom buffer without retained-group accounting is rejected at startup.
-    custom_path = f"{__name__}._UnsupportedCustomBuffer"
-    with pytest.raises(ValueError, match="built-in single-policy buffers"):
-        fully_async_rollout.FullyAsyncRolloutFn(
-            RolloutFnConstructorInput(
-                args=SimpleNamespace(**{**base_args, "custom_async_data_buffer_path": custom_path}),
-                data_source=_FakeDataSource(),
+    # Arbitrary custom buffers (including DefaultDataBuffer subclasses that don't opt in) are rejected at startup.
+    for custom_path in (
+        f"{__name__}._UnsupportedCustomBuffer",
+        f"{__name__}._UnsupportedCustomSubclass",
+    ):
+        with pytest.raises(ValueError, match="built-in single-policy buffers"):
+            fully_async_rollout.FullyAsyncRolloutFn(
+                RolloutFnConstructorInput(
+                    args=SimpleNamespace(**{**base_args, "custom_async_data_buffer_path": custom_path}),
+                    data_source=_FakeDataSource(),
+                )
             )
-        )
+    custom_path = f"{__name__}._UnsupportedCustomBuffer"
 
     # Multi-policy config is rejected at startup to prevent cross-policy deadlock.
     monkeypatch.setattr(

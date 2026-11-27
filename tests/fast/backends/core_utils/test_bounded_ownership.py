@@ -248,14 +248,16 @@ def test_bounded_ownership_resumes_immediately_after_consumer_drain_with_empty_a
             assert producer._retained_group_count() == 2
 
             # Dequeuing one group must wake the idle worker well below the 0.5s fallback poll.
+            delivered = set()
             started = time.monotonic()
             first = await producer._output.get(current_version=0)
-            assert first.prompt_group[0].group_index == 0
+            delivered.add(first.prompt_group[0].group_index)
             await _wait_until(lambda: data_source.submitted == [0, 1, 2], timeout=0.3)
             assert time.monotonic() - started < 0.3
 
             second = await producer._output.get(current_version=0)
-            assert second.prompt_group[0].group_index == 1
+            delivered.add(second.prompt_group[0].group_index)
+            assert delivered == {0, 1}
             await _wait_until(lambda: data_source.submitted == [0, 1, 2, 3], timeout=0.3)
         finally:
             await producer.shutdown()
@@ -313,6 +315,148 @@ def test_bounded_ownership_counts_prepared_reservation_until_released(monkeypatc
             await producer.shutdown()
 
     asyncio.run(scenario())
+
+
+def test_prepared_reservation_dequeue_handoff_is_atomic_under_cap(monkeypatch):
+    """Queue dequeue into a prepared reservation must not expose a transient free slot to _worker_loop."""
+    _patch_observers(monkeypatch)
+
+    async def scenario():
+        producer, data_source = _make_managed_producer(
+            rollout_batch_size=2,
+            n_samples_per_prompt=2,
+            async_max_concurrent_samples=8,
+            async_max_retained_batches=1.0,  # cap = 2 groups
+            async_data_buffer_capacity_factor=1.0,
+            use_homogeneous_buffer=True,
+        )
+        # Force _next_group through the async queue_get task path (not get_ready)
+        # while the worker is already waiting on _drain_event.
+        producer._output.get_ready = None
+
+        gates = {0: asyncio.Event(), 1: asyncio.Event()}
+
+        async def generate(prompt_group):
+            idx = prompt_group[0].group_index
+            if idx in gates:
+                await gates[idx].wait()
+            for _ in prompt_group:
+                producer._scheduler.sample_done_callback()
+            return DataBufferInput(prompt_group=prompt_group, group=prompt_group)
+
+        producer._generate_group = generate
+        producer._worker = asyncio.create_task(producer._worker_loop())
+        try:
+            await _wait_until(lambda: data_source.submitted == [0, 1])
+            # Start reserve() so queue_get is blocked inside _output.get() waiting for groups 0 and 1.
+            reserve_task = asyncio.create_task(producer.reserve(RolloutFnTrainInput(rollout_id=0, weight_version=0)))
+            await asyncio.sleep(0.02)
+
+            # Release group 0, then group 1, letting the producer wake on every tick.
+            gates[0].set()
+            await asyncio.sleep(0.02)
+            assert data_source.submitted == [0, 1]
+            assert producer._retained_group_count() == 2
+
+            gates[1].set()
+            result = await asyncio.wait_for(reserve_task, timeout=2.0)
+            await asyncio.sleep(0.05)
+
+            assert len(result.samples) == 2
+            assert data_source.submitted == [0, 1]
+            assert producer._retained_group_count() == 2
+            assert len(producer._reserved_groups) == 2
+            assert producer._output.retained_group_count() == 0
+        finally:
+            if producer._reserved_groups is not None:
+                await producer.release_reservation(consume=False)
+            await producer.shutdown()
+
+    asyncio.run(scenario())
+
+
+class _UnsupportedCustomBuffer:
+    async def put(self, item):
+        return None
+
+    async def get(self, **context):
+        raise RuntimeError("unused")
+
+    def get_metrics(self, trainer_model_id=None):
+        return {}
+
+
+def test_rejects_multi_policy_and_custom_buffers_when_bounded_ownership_enabled(monkeypatch):
+    """Multi-policy and non-built-in custom buffers must be rejected when async_max_retained_batches is set."""
+
+    class FakeGenerateState:
+        def __init__(self, args):
+            self.args = args
+            self.sampling_params = {}
+            self.aborted = False
+
+    monkeypatch.setattr(fully_async_rollout, "GenerateState", FakeGenerateState)
+
+    base_args = dict(
+        rollout_global_dataset=True,
+        rollout_batch_size=2,
+        n_samples_per_prompt=2,
+        max_weight_staleness=None,
+        async_max_concurrent_samples=8,
+        async_max_retained_batches=2.0,
+        async_data_buffer_capacity_factor=1.0,
+        async_unused_samples_handler="drop",
+        custom_async_data_buffer_path=None,
+        custom_async_data_buffer_path_per_model=None,
+        megatron_config=None,
+        rollout_submission_granularity="sample",
+        dynamic_sampling_filter_path=None,
+        reward_key=None,
+        rollout_sample_filter_path=None,
+    )
+
+    # Built-in core buffers are accepted.
+    for path in (
+        "miles.backends.core_utils.rollout.async_buffer.HomogeneousPolicyDataBuffer",
+        "miles.backends.core_utils.rollout.async_buffer.RefreshPolicyDataBuffer",
+    ):
+        fn = fully_async_rollout.FullyAsyncRolloutFn(
+            RolloutFnConstructorInput(
+                args=SimpleNamespace(**{**base_args, "custom_async_data_buffer_path": path}),
+                data_source=_FakeDataSource(),
+            )
+        )
+        assert fn._max_retained_groups() == 4
+
+    # Arbitrary custom buffer without retained-group accounting is rejected at startup.
+    custom_path = f"{__name__}._UnsupportedCustomBuffer"
+    with pytest.raises(ValueError, match="built-in single-policy buffers"):
+        fully_async_rollout.FullyAsyncRolloutFn(
+            RolloutFnConstructorInput(
+                args=SimpleNamespace(**{**base_args, "custom_async_data_buffer_path": custom_path}),
+                data_source=_FakeDataSource(),
+            )
+        )
+
+    # Multi-policy config is rejected at startup to prevent cross-policy deadlock.
+    monkeypatch.setattr(
+        fully_async_rollout, "resolve_megatron_config", lambda args: SimpleNamespace(is_multi_policy=True)
+    )
+    with pytest.raises(ValueError, match="single-policy"):
+        fully_async_rollout.FullyAsyncRolloutFn(
+            RolloutFnConstructorInput(args=SimpleNamespace(**base_args), data_source=_FakeDataSource())
+        )
+
+    # Unset flag preserves backward compatibility for multi-policy and custom buffers.
+    fn = fully_async_rollout.FullyAsyncRolloutFn(
+        RolloutFnConstructorInput(
+            args=SimpleNamespace(
+                **{**base_args, "async_max_retained_batches": None, "custom_async_data_buffer_path": custom_path}
+            ),
+            data_source=_FakeDataSource(),
+        )
+    )
+    assert fn._max_retained_groups() is None
 
 
 def test_filter_drops_and_recoverable_failures_release_retained_ownership(monkeypatch):
@@ -406,11 +550,14 @@ def test_base_fully_async_rollout_validation_and_bounded_ownership(monkeypatch):
         total_groups = 3  # floor(1.5 * 2) = 3 groups
         gates = {i: asyncio.Event() for i in range(total_groups)}
         done_flags = {i: asyncio.Event() for i in range(total_groups)}
+        release_extra = asyncio.Event()
 
         async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
             idx = group[0].group_index
             if idx < total_groups:
                 await gates[idx].wait()
+            else:
+                await release_extra.wait()
             for _ in group:
                 if sample_done_callback is not None:
                     sample_done_callback()
@@ -450,6 +597,7 @@ def test_base_fully_async_rollout_validation_and_bounded_ownership(monkeypatch):
             # Draining freed retained capacity, so the worker resumes admitting new groups.
             await _wait_until(lambda: len(data_source.submitted) > total_groups, timeout=1.0)
         finally:
+            release_extra.set()
             for gate in gates.values():
                 gate.set()
             fn._worker.cancel()

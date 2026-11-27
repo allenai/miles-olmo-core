@@ -194,8 +194,19 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                 return entry
         # Own both outcomes: if the worker fails just as a dequeue succeeds,
         # that prompt must remain part of the interrupted batch's retry ledger.
-        queue_get = asyncio.create_task(self._output.get(current_version=current_version))
         recorded = False
+
+        async def dequeue() -> Any:
+            nonlocal recorded
+            entry = await self._output.get(current_version=current_version)
+            if self._reserved_groups is not None:
+                # Transfer prepared-batch ownership synchronously on the dequeue turn
+                # before any producer wakeup can observe a freed buffer slot.
+                self._record_dequeued(entry)
+                recorded = True
+            return entry
+
+        queue_get = asyncio.create_task(dequeue())
         try:
             while True:
                 done, _ = await asyncio.wait(
@@ -208,8 +219,9 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                     raise RuntimeError("fully-async worker exited unexpectedly")
                 if queue_get in done:
                     entry = queue_get.result()
-                    recorded = True
-                    self._record_dequeued(entry)
+                    if not recorded:
+                        recorded = True
+                        self._record_dequeued(entry)
                     return entry
                 if (
                     getattr(self.data_source, "pool_exhausted", lambda: False)()

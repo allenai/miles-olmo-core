@@ -65,31 +65,38 @@ def _resolve_max_retained_groups(args: Any) -> int | None:
     return math.floor(batches * args.rollout_batch_size)
 
 
+def is_supported_retained_buffer_cls(buffer_cls: Any) -> bool:
+    """Return True if a DataBuffer class supports exact single-policy retained-group accounting."""
+    return bool(getattr(buffer_cls, "supports_retained_group_accounting", False))
+
+
+def _is_supported_retained_buffer(output: Any) -> bool:
+    return bool(getattr(output, "supports_retained_group_accounting", False)) and callable(
+        getattr(output, "retained_group_count", None)
+    )
+
+
 def _buffered_group_count(output: Any) -> int:
-    """Count completed groups currently queued inside a data buffer without consuming them."""
+    """Count completed groups currently queued inside a supported single-policy data buffer."""
     if output is None:
         return 0
-    delegate = getattr(output, "_delegate", output)
-    buffer = getattr(delegate, "_buffer", None)
-    if buffer is not None:
-        return len(buffer)
-    inners = getattr(output, "_inners", None)
-    if isinstance(inners, dict):
-        return sum(_buffered_group_count(inner) for inner in inners.values())
-    return 0
+    if not _is_supported_retained_buffer(output):
+        raise ValueError(
+            f"async_max_retained_batches requires a built-in single-policy buffer with retained-group accounting, "
+            f"got {type(output).__name__}"
+        )
+    return int(output.retained_group_count())
 
 
 def _drain_events(output: Any) -> list[asyncio.Event]:
-    """Return drain wakeup events exposed by single- or multi-policy data buffers."""
+    """Return the drain wakeup event exposed by a supported single-policy data buffer."""
     if output is None:
         return []
-    delegate = getattr(output, "_delegate", output)
-    event = getattr(delegate, "_drain_event", None)
-    if isinstance(event, asyncio.Event):
-        return [event]
-    inners = getattr(output, "_inners", None)
-    if isinstance(inners, dict):
-        return [ev for inner in inners.values() for ev in _drain_events(inner)]
+    drain_event = getattr(output, "drain_event", None)
+    if callable(drain_event):
+        event = drain_event()
+        if isinstance(event, asyncio.Event):
+            return [event]
     return []
 
 
@@ -122,7 +129,19 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self._producer_resumed = asyncio.Event()
         self._producer_resumed.set()
         self._output: DataBuffer | None = None
-        _resolve_max_retained_groups(input.args)
+        if _resolve_max_retained_groups(input.args) is not None:
+            if resolve_megatron_config(input.args).is_multi_policy:
+                raise ValueError(
+                    "async_max_retained_batches is only supported for single-policy runs; "
+                    "multi-policy buffers can deadlock under a shared retained-group cap"
+                )
+            if (custom_path := getattr(input.args, "custom_async_data_buffer_path", None)) is not None:
+                buffer_cls = load_function(custom_path)
+                if not is_supported_retained_buffer_cls(buffer_cls):
+                    raise ValueError(
+                        f"async_max_retained_batches is only supported with built-in single-policy buffers, "
+                        f"got custom buffer {custom_path!r}"
+                    )
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if input.evaluation:
@@ -132,6 +151,11 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
                 DefaultMultiDataBuffer if resolve_megatron_config(self.args).is_multi_policy else DefaultDataBuffer
             )
             buffer_cls = load_function(self.args.custom_async_data_buffer_path) or default_buffer_cls
+            if self._max_retained_groups() is not None and not is_supported_retained_buffer_cls(buffer_cls):
+                raise ValueError(
+                    f"async_max_retained_batches is only supported with built-in single-policy buffers, "
+                    f"got {buffer_cls.__name__}"
+                )
             self._output = buffer_cls(
                 DataBufferConstructorInput(args=self.args, unused_handler_fn=self._handle_unused)
             )
@@ -167,7 +191,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         return self.args.rollout_batch_size
 
     def _max_retained_groups(self) -> int | None:
-        return _resolve_max_retained_groups(self.args)
+        return _resolve_max_retained_groups(getattr(self, "args", None))
 
     def _retained_group_count(self, producer_owned: int | None = None) -> int:
         owned = 0 if producer_owned is None else producer_owned

@@ -94,6 +94,8 @@ class MeasuredDataBuffer(DefaultDataBuffer):
 
 
 class HomogeneousPolicyDataBuffer:
+    supports_retained_group_accounting = True
+
     def __init__(self, input):
         args = copy(input.args)
         collection = args.rollout_batch_size * args.n_samples_per_prompt
@@ -137,6 +139,12 @@ class HomogeneousPolicyDataBuffer:
     async def get_ready(self, current_version=None):
         """Use the same stale-data/disposition checks without waiting for new work."""
         return await self._delegate.get(current_version=current_version, wait=False)
+
+    def retained_group_count(self) -> int:
+        return self._delegate.retained_group_count()
+
+    def drain_event(self):
+        return self._delegate.drain_event()
 
     def get_metrics(self, trainer_model_id=None):
         rejected, incomplete, mixed = self._rejected, self._incomplete, self._mixed

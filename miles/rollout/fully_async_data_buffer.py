@@ -13,6 +13,7 @@ from abc import ABC, abstractmethod
 from argparse import ArgumentParser, Namespace
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from typing import ClassVar
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter, iter_samples
@@ -127,6 +128,8 @@ class DefaultDataBuffer(DataBuffer):
         are discarded directly.
     """
 
+    supports_retained_group_accounting: ClassVar[bool] = True
+
     def __init__(self, input: DataBufferConstructorInput):
         args = input.args
         self._args = args
@@ -152,6 +155,12 @@ class DefaultDataBuffer(DataBuffer):
         self._metric_selected_versioned_tokens = 0
         self._metric_selected_samples = 0
         self._metric_selected_versioned_samples = 0
+
+    def retained_group_count(self) -> int:
+        return len(self._buffer)
+
+    def drain_event(self) -> asyncio.Event:
+        return self._drain_event
 
     async def put(self, input: DataBufferInput) -> None:
         if not self._preput_filter(input):

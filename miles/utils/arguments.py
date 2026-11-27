@@ -886,10 +886,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "Maximum total prompt groups retained across the fully async pipeline at once, as a "
                     "multiple of rollout_batch_size (floor(batches * rollout_batch_size) groups), counting "
                     "in-flight, partially completed, completed awaiting FIFO insertion, buffered in the "
-                    "completed FIFO, and reserved for a prepared batch. Bounds total group ownership "
-                    "independently of --async-max-concurrent-samples so sample-level backfill cannot "
-                    "accumulate unbounded upstream group backlog under trainer backpressure. None (default) "
-                    "leaves retained group count unbounded beyond the per-stage limits."
+                    "completed FIFO, and reserved for a prepared batch. Supported for built-in single-policy "
+                    "buffers only; multi-policy and arbitrary custom data buffers are rejected at startup. "
+                    "None (default) leaves retained group count unbounded beyond the per-stage limits."
                 ),
             )
             parser.add_argument(
@@ -3879,6 +3878,16 @@ def miles_validate_args(args):
             f"--async-max-retained-batches ({args.async_max_retained_batches}) must be a finite number >= 1.0: "
             f"a training step (and prepared-batch reservation) requires a full rollout batch of retained groups"
         )
+        assert not resolve_megatron_config(args).is_multi_policy, (
+            "--async-max-retained-batches is only supported for single-policy runs; "
+            "multi-policy buffers can deadlock under a shared retained-group cap"
+        )
+        if args.custom_async_data_buffer_path is not None:
+            buffer_cls = load_function(args.custom_async_data_buffer_path)
+            assert getattr(buffer_cls, "supports_retained_group_accounting", False), (
+                f"--async-max-retained-batches is only supported with built-in single-policy buffers, "
+                f"got --custom-async-data-buffer-path={args.custom_async_data_buffer_path!r}"
+            )
 
     _resolve_rollout_functions(args)
 

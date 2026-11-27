@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 import re
 from string import Formatter
@@ -875,6 +876,20 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "decoupling generation concurrency from the training batch size. None (default) "
                     "keeps the legacy bound of one training batch worth of trajectories "
                     "(rollout_batch_size groups, i.e. rollout_batch_size * n_samples_per_prompt)."
+                ),
+            )
+            parser.add_argument(
+                "--async-max-retained-batches",
+                type=float,
+                default=None,
+                help=(
+                    "Maximum total prompt groups retained across the fully async pipeline at once, as a "
+                    "multiple of rollout_batch_size (floor(batches * rollout_batch_size) groups), counting "
+                    "in-flight, partially completed, completed awaiting FIFO insertion, buffered in the "
+                    "completed FIFO, and reserved for a prepared batch. Bounds total group ownership "
+                    "independently of --async-max-concurrent-samples so sample-level backfill cannot "
+                    "accumulate unbounded upstream group backlog under trainer backpressure. None (default) "
+                    "leaves retained group count unbounded beyond the per-stage limits."
                 ),
             )
             parser.add_argument(
@@ -3857,6 +3872,12 @@ def miles_validate_args(args):
             f"--async-max-concurrent-samples ({args.async_max_concurrent_samples}) must be at least "
             f"--n-samples-per-prompt ({args.n_samples_per_prompt}): the worker submits whole groups, "
             f"so one group already puts n_samples_per_prompt trajectories in flight"
+        )
+
+    if args.async_max_retained_batches is not None:
+        assert math.isfinite(args.async_max_retained_batches) and args.async_max_retained_batches >= 1.0, (
+            f"--async-max-retained-batches ({args.async_max_retained_batches}) must be a finite number >= 1.0: "
+            f"a training step (and prepared-batch reservation) requires a full rollout batch of retained groups"
         )
 
     _resolve_rollout_functions(args)

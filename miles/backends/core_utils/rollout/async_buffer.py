@@ -162,6 +162,8 @@ class HomogeneousPolicyDataBuffer:
     async def release_prepared_capacity(self, count):
         async with self._delegate._cond:
             self._delegate._capacity += count
+            if hasattr(self._delegate, "_drain_event"):
+                self._delegate._drain_event.set()
             self._delegate._cond.notify_all()
 
     async def reserve_drain_capacity(self, additional):

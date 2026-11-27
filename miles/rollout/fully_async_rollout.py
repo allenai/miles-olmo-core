@@ -18,7 +18,9 @@ rollout engines, pausing producer submissions for the duration of the
 
 import asyncio
 import logging
+import math
 from dataclasses import replace
+from typing import Any
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
 from miles.rollout.base_types import (
@@ -53,6 +55,44 @@ logger = logging.getLogger(__name__)
 NO_PROGRESS_WARN_SECS = 30.0
 
 
+def _resolve_max_retained_groups(args: Any) -> int | None:
+    """Resolve --async-max-retained-batches into a concrete group ceiling."""
+    batches = getattr(args, "async_max_retained_batches", None)
+    if batches is None:
+        return None
+    if not math.isfinite(batches) or batches < 1.0:
+        raise ValueError(f"async_max_retained_batches ({batches}) must be a finite number >= 1.0")
+    return math.floor(batches * args.rollout_batch_size)
+
+
+def _buffered_group_count(output: Any) -> int:
+    """Count completed groups currently queued inside a data buffer without consuming them."""
+    if output is None:
+        return 0
+    delegate = getattr(output, "_delegate", output)
+    buffer = getattr(delegate, "_buffer", None)
+    if buffer is not None:
+        return len(buffer)
+    inners = getattr(output, "_inners", None)
+    if isinstance(inners, dict):
+        return sum(_buffered_group_count(inner) for inner in inners.values())
+    return 0
+
+
+def _drain_events(output: Any) -> list[asyncio.Event]:
+    """Return drain wakeup events exposed by single- or multi-policy data buffers."""
+    if output is None:
+        return []
+    delegate = getattr(output, "_delegate", output)
+    event = getattr(delegate, "_drain_event", None)
+    if isinstance(event, asyncio.Event):
+        return [event]
+    inners = getattr(output, "_inners", None)
+    if isinstance(inners, dict):
+        return [ev for inner in inners.values() for ev in _drain_events(inner)]
+    return []
+
+
 class FullyAsyncRolloutFn(BaseRolloutFn):
     """Continuous rollout generation decoupled from training steps.
 
@@ -82,6 +122,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self._producer_resumed = asyncio.Event()
         self._producer_resumed.set()
         self._output: DataBuffer | None = None
+        _resolve_max_retained_groups(input.args)
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if input.evaluation:
@@ -125,6 +166,48 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             return max(1, x // self.args.n_samples_per_prompt)
         return self.args.rollout_batch_size
 
+    def _max_retained_groups(self) -> int | None:
+        return _resolve_max_retained_groups(self.args)
+
+    def _retained_group_count(self, producer_owned: int | None = None) -> int:
+        owned = 0 if producer_owned is None else producer_owned
+        return owned + _buffered_group_count(getattr(self, "_output", None))
+
+    def _has_retained_capacity(self, producer_owned: int | None = None) -> bool:
+        limit = self._max_retained_groups()
+        return limit is None or self._retained_group_count(producer_owned) < limit
+
+    async def _wait_for_retained_capacity(
+        self,
+        active: set[asyncio.Task],
+        *,
+        producer_owned: int | None = None,
+        timeout: float | None = 0.5,
+    ) -> tuple[set[asyncio.Task], set[asyncio.Task]]:
+        events = _drain_events(getattr(self, "_output", None))
+        for event in events:
+            event.clear()
+        # Re-check after arming events so a drain right before clear() is never missed.
+        if self._has_retained_capacity(producer_owned):
+            return set(), active
+        waiters = {asyncio.create_task(event.wait()) for event in events}
+        stop_event = getattr(self, "_stop_requested", None)
+        if isinstance(stop_event, asyncio.Event):
+            waiters.add(asyncio.create_task(stop_event.wait()))
+        try:
+            targets = active | waiters
+            if not targets:
+                await asyncio.sleep(timeout if timeout is not None else 0.5)
+                return set(), active
+            done, pending = await asyncio.wait(targets, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+            return done - waiters, pending - waiters
+        finally:
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.cancel()
+            if waiters:
+                await asyncio.gather(*waiters, return_exceptions=True)
+
     def _submit_one_group(self) -> tuple[asyncio.Task, list[Sample]]:
         samples = self.data_source.get_samples(1)
         self._scheduler.on_submit(samples)
@@ -145,10 +228,20 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         active: dict[asyncio.Task, list[Sample]] = {}
         while True:
             await self._producer_resumed.wait()
-            while self._scheduler.has_capacity(pending_groups=len(active), group_budget=self._max_in_flight_groups()):
+            while self._has_retained_capacity(len(active)) and self._scheduler.has_capacity(
+                pending_groups=len(active), group_budget=self._max_in_flight_groups()
+            ):
                 task, prompt_group = self._submit_one_group()
                 active[task] = prompt_group
-            done, _ = await self._scheduler.wait_for_progress(set(active))
+            if not active:
+                await self._wait_for_retained_capacity(set(), producer_owned=0)
+                continue
+            if not self._has_retained_capacity(len(active)):
+                done, _ = await self._wait_for_retained_capacity(set(active), producer_owned=len(active))
+                if not done:
+                    continue
+            else:
+                done, _ = await self._scheduler.wait_for_progress(set(active))
             for task in done:
                 entry = self._collect_group_result(task, active.pop(task))
                 await self._output.put(entry)

@@ -139,6 +139,7 @@ class DefaultDataBuffer(DataBuffer):
         self._unused_handler_fn = input.unused_handler_fn
         self._dynamic_filter = load_function(args.dynamic_sampling_filter_path)
         self._cond = asyncio.Condition()
+        self._drain_event = asyncio.Event()
         self._current_version: int | None = None
 
         self._metric_gatherer = MetricGatherer()
@@ -191,6 +192,7 @@ class DefaultDataBuffer(DataBuffer):
                         return None
                     await self._cond.wait()
                 entry = self._buffer.pop(0)
+                self._drain_event.set()
                 self._cond.notify_all()  # wake producers blocked on a full buffer
 
                 version_stats = group_weight_version_stats(entry.group)

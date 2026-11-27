@@ -24,7 +24,7 @@ import httpx
 from miles.backends.core_utils import async_capacity, infra_timeouts
 from miles.backends.core_utils.rollout import observation_io, pipeline_observer, rollout_errors
 from miles.backends.core_utils.rollout.errors import FINITE_POOL_PROVIDERS, GenerationInterrupted, PromptPoolExhausted
-from miles.rollout.fully_async_rollout import FullyAsyncRolloutFn
+from miles.rollout.fully_async_rollout import FullyAsyncRolloutFn, _buffered_group_count
 from miles.rollout.inference_rollout.inference_rollout_train import get_worker_urls
 from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils import logger_utils
@@ -171,9 +171,9 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         groups = self._reserved_groups
         if not consume and groups:
             self.data_source.requeue_pending_groups([g[0].group_index for g in groups])
-        await self._output.release_prepared_capacity(len(groups))
         self._reserved_groups = None
         self._reservation_task = None
+        await self._output.release_prepared_capacity(len(groups))
         return groups
 
     async def _next_group(self, current_version: int | None, trainer_model_id: str | None = None) -> Any:
@@ -243,6 +243,11 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
             self.data_source.acknowledge_groups([entry.prompt_group])
         else:
             self._draining_groups.append(entry.prompt_group)
+
+    def _retained_group_count(self, producer_owned: int | None = None) -> int:
+        owned = len(getattr(self, "_producing_groups", ())) if producer_owned is None else producer_owned
+        reserved = len(getattr(self, "_reserved_groups", None) or ())
+        return owned + _buffered_group_count(getattr(self, "_output", None)) + reserved
 
     def _submit_managed_group(self) -> asyncio.Task:
         [group] = self.data_source.get_samples(1)
@@ -398,6 +403,7 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                 or self._stopping
                 or self._interrupted()
                 or time.monotonic() < self._retry_after
+                or not self._has_retained_capacity()
                 or not self._scheduler.has_capacity(
                     pending_groups=len(active), group_budget=self._max_in_flight_groups()
                 )
@@ -438,7 +444,10 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                     if self._stopping:
                         return
                     if self._producer_resumed.is_set():
-                        await asyncio.sleep(0.5)
+                        if not self._has_retained_capacity():
+                            await self._wait_for_retained_capacity(set())
+                        else:
+                            await asyncio.sleep(0.5)
                     else:
                         await self._producer_resumed.wait()
                     self._producer_idle.clear()
@@ -450,6 +459,11 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                 done = {task for task in active if task.done()}
                 if done:
                     active -= done
+                elif not self._has_retained_capacity():
+                    done, active = await self._wait_for_retained_capacity(active)
+                    if not done:
+                        self._active_tasks = active
+                        continue
                 else:
                     try:
                         done, active = await asyncio.wait_for(self._scheduler.wait_for_progress(active), timeout=0.5)

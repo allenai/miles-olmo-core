@@ -81,6 +81,20 @@ def snapshot(producer):
         if all(row is not None for row in ready)
         else None
     )
+    completed_queue_groups = len(buffer) if buffer is not None else None
+    reserved_groups = len(getattr(producer, "_reserved_groups", None) or ())
+    retained_groups = (
+        len(producer._producing_groups) + completed_queue_groups + reserved_groups
+        if completed_queue_groups is not None
+        else None
+    )
+    max_retained_batches = getattr(args, "async_max_retained_batches", None)
+    rollout_batch_size = getattr(args, "rollout_batch_size", None)
+    max_retained_groups = (
+        math.floor(max_retained_batches * rollout_batch_size)
+        if max_retained_batches is not None and math.isfinite(max_retained_batches) and rollout_batch_size
+        else None
+    )
     return {
         "completed_queue": completed,
         "producer_ready": ready_counts,
@@ -99,11 +113,20 @@ def snapshot(producer):
         ),
         "time_unix": time.time(),
         "producer_owned_groups": len(producer._producing_groups),
+        "producer_reserved_groups": reserved_groups,
+        "retained_groups": retained_groups,
+        "max_retained_batches": max_retained_batches,
+        "max_retained_groups": max_retained_groups,
+        "retained_ownership_saturated": (
+            retained_groups >= max_retained_groups
+            if retained_groups is not None and max_retained_groups is not None
+            else False
+        ),
         **(producer._errors.metrics() if hasattr(producer, "_errors") else {}),
         "producer_active_group_tasks": sum(not task.done() for task in producer._active_tasks),
         "producer_admission_open": producer._producer_resumed.is_set(),
         "producer_unfinished_samples": getattr(producer._scheduler, "samples_in_flight", None),
-        "completed_queue_groups": len(buffer) if buffer is not None else None,
+        "completed_queue_groups": completed_queue_groups,
         "completed_queue_capacity_groups": getattr(delegate, "_capacity", None),
         "generation_admission_paused": getattr(semaphore, "paused", None),
         "generation_admission_waiters": getattr(semaphore, "waiting", None),

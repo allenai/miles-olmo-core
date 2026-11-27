@@ -3,12 +3,13 @@
 import asyncio
 import time
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import httpx
 import pytest
 
 from miles.backends.core_utils import async_capacity
-from miles.backends.core_utils.rollout import async_rollout, pipeline_observer, rollout_errors
+from miles.backends.core_utils.rollout import async_rollout, pipeline_observer, prepared_batch, rollout_errors
 from miles.backends.core_utils.rollout.async_buffer import HomogeneousPolicyDataBuffer
 from miles.rollout import fully_async_rollout
 from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnTrainInput
@@ -928,6 +929,169 @@ def test_auto_jit_pacing_live_producer_tightens_and_escapes(monkeypatch):
         finally:
             if producer._reserved_groups is not None:
                 await producer.release_reservation(consume=False)
+            await producer.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_prepared_batch_live_escape_raises_cap_and_wakes_producer_while_waiting(monkeypatch):
+    """PreparedBatch.consume() must raise the JIT cap and wake the producer while still waiting past escape."""
+    _patch_observers(monkeypatch)
+
+    async def scenario():
+        producer, data_source = _make_managed_producer(
+            rollout_batch_size=2,
+            n_samples_per_prompt=2,
+            async_max_concurrent_samples=24,  # 12 groups = 6 batches
+            async_max_retained_batches=6.0,
+            async_data_buffer_capacity_factor=6.0,
+            use_homogeneous_buffer=True,
+        )
+        producer._jit_pacer = JitRetainedPacer(
+            JitPacerConfig(
+                rollout_batch_size=2,
+                min_batches=2.0,
+                max_batches=6.0,
+                initial_batches=3.0,  # 6 groups
+                wait_escape_seconds=0.05,
+            )
+        )
+        # Keep the first 6 groups blocked until escape raises the cap and admits groups 6..11,
+        # which finish immediately and let the waiting PreparedBatch complete.
+        hold_initial = asyncio.Event()
+
+        async def generate(prompt_group):
+            idx = prompt_group[0].group_index
+            if idx < 6:
+                await hold_initial.wait()
+            for _ in prompt_group:
+                producer._scheduler.sample_done_callback()
+            return DataBufferInput(prompt_group=prompt_group, group=prompt_group)
+
+        producer._generate_group = generate
+        producer._worker = asyncio.create_task(producer._worker_loop())
+
+        loop = asyncio.get_running_loop()
+
+        def submit_local(coro):
+            fut = loop.create_future()
+            task = asyncio.create_task(coro)
+
+            def _done(t):
+                if t.cancelled():
+                    fut.cancel()
+                elif t.exception() is not None:
+                    fut.set_exception(t.exception())
+                else:
+                    fut.set_result(t.result())
+
+            task.add_done_callback(_done)
+            return fut
+
+        monkeypatch.setattr(prepared_batch.async_utils, "submit", submit_local)
+        monkeypatch.setattr(prepared_batch.tracking, "log", Mock())
+        monkeypatch.setattr(prepared_batch, "compute_rollout_step", lambda *_: 1)
+
+        exec_args = SimpleNamespace(
+            olmo_core=SimpleNamespace(publication_mode="refresh", prepared_batch_overlap=True),
+            fully_async=True,
+            offload_rollout=False,
+            rollout_batch_size=2,
+            n_samples_per_prompt=2,
+            global_batch_size=4,
+            update_weights_interval=1,
+            async_data_buffer_capacity_factor=6.0,
+        )
+        recorded_release_kwargs = {}
+        orig_release = producer.release_reservation
+
+        async def spy_release(**kwargs):
+            recorded_release_kwargs.update(kwargs)
+            return await orig_release(**kwargs)
+
+        producer.release_reservation = spy_release
+
+        async def prepare_rollout(rollout_id, *, weight_version, reserve):
+            assert reserve is True
+            return await producer.reserve(RolloutFnTrainInput(rollout_id=rollout_id, weight_version=weight_version))
+
+        fake_executor = SimpleNamespace(
+            args=exec_args,
+            _weight_versions_of_model_id={None: 0},
+            generate_rollout=producer,
+            data_source=SimpleNamespace(acknowledge_groups=Mock(), requeue_pending_groups=Mock()),
+            _prepare_rollout=prepare_rollout,
+        )
+
+        try:
+            # Producer saturates at initial_batches=3.0 (6 groups), all blocked on hold_initial.
+            await _wait_until(lambda: len(data_source.submitted) == 6)
+            pb = prepared_batch.PreparedBatch(fake_executor, rollout_id=1)
+            fake_executor._weight_versions_of_model_id[None] = 1
+
+            # consume() waits past 0.05s; live escape MUST raise target_batches 3.0 -> 6.0 and wake
+            # the producer to admit groups 6..11 while consume() is still waiting, unblocking the batch.
+            result = await asyncio.wait_for(pb.consume(1), timeout=2.0)
+            assert len(result.samples) == 2
+            assert producer._jit_pacer.target_batches == 6.0
+            assert len(data_source.submitted) > 6
+            assert recorded_release_kwargs["consume"] is True
+            assert recorded_release_kwargs["trainer_wait_seconds"] >= 0.05
+            assert producer._jit_pacer.metrics()["rollout/fully_async/jit_pacer/escape_events"] == 1.0
+        finally:
+            hold_initial.set()
+            if producer._reserved_groups is not None:
+                await orig_release(consume=False)
+            await producer.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_direct_drain_live_escape_raises_cap_and_wakes_producer_while_waiting(monkeypatch):
+    """Direct _drain() must raise the JIT cap and wake the producer mid-wait after wait_escape_seconds."""
+    _patch_observers(monkeypatch)
+
+    async def scenario():
+        producer, data_source = _make_managed_producer(
+            rollout_batch_size=2,
+            n_samples_per_prompt=2,
+            async_max_concurrent_samples=24,
+            async_max_retained_batches=6.0,
+            async_data_buffer_capacity_factor=6.0,
+        )
+        producer._jit_pacer = JitRetainedPacer(
+            JitPacerConfig(
+                rollout_batch_size=2,
+                min_batches=2.0,
+                max_batches=6.0,
+                initial_batches=3.0,  # 6 groups
+                wait_escape_seconds=0.05,
+            )
+        )
+        producer._jit_cold_start_pending = False
+        hold_initial = asyncio.Event()
+
+        async def generate(prompt_group):
+            idx = prompt_group[0].group_index
+            if idx < 6:
+                await hold_initial.wait()
+            for _ in prompt_group:
+                producer._scheduler.sample_done_callback()
+            return DataBufferInput(prompt_group=prompt_group, group=prompt_group)
+
+        producer._generate_group = generate
+        producer._worker = asyncio.create_task(producer._worker_loop())
+        try:
+            await _wait_until(lambda: len(data_source.submitted) == 6)
+            # Direct drain blocks on the 6 held groups; live escape fires at 0.05s,
+            # raises cap 3.0 -> 6.0, wakes refill for groups 6..11, and unblocks _drain().
+            out = await asyncio.wait_for(producer(RolloutFnTrainInput(rollout_id=1, weight_version=0)), timeout=2.0)
+            assert len(out.samples) == 2
+            assert producer._jit_pacer.target_batches == 6.0
+            assert len(data_source.submitted) > 6
+            assert out.metrics["rollout/fully_async/jit_pacer/escape_events"] == 1.0
+        finally:
+            hold_initial.set()
             await producer.shutdown()
 
     asyncio.run(scenario())

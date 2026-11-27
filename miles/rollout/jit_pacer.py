@@ -102,6 +102,26 @@ class JitRetainedPacer:
         """Reset wall-clock step tracking across evals, pauses, or publication recovery."""
         self._last_handoff_at = None
 
+    def trigger_live_escape(self, *, elapsed_wait_seconds: float) -> bool:
+        """Snap immediately to ``max_batches`` while the trainer is actively waiting past escape threshold.
+
+        Returns True if ``target_batches`` was increased.
+        """
+        cfg = self.config
+        wait = max(0.0, float(elapsed_wait_seconds))
+        if wait < cfg.wait_escape_seconds:
+            return False
+        self._last_wait_seconds = wait
+        raised = False
+        if self._target_batches < cfg.max_batches:
+            self._target_batches = cfg.max_batches
+            self._escape_count += 1
+            raised = True
+        self._cooldown_remaining = cfg.escape_cooldown_steps
+        self._clear_window()
+        self._last_metrics = self._build_metrics()
+        return raised
+
     def observe_step(
         self,
         *,

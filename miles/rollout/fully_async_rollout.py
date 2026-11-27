@@ -223,6 +223,17 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             return pacer.target_groups
         return _resolve_max_retained_groups(getattr(self, "args", None))
 
+    async def trigger_jit_escape(self, elapsed_wait_seconds: float) -> bool:
+        """Raise the JIT cap to max_batches and wake the producer immediately while training waits."""
+        pacer = getattr(self, "_jit_pacer", None)
+        if pacer is None:
+            return False
+        raised = pacer.trigger_live_escape(elapsed_wait_seconds=elapsed_wait_seconds)
+        if raised:
+            for event in _drain_events(getattr(self, "_output", None)):
+                event.set()
+        return raised
+
     def _retained_group_count(self, producer_owned: int | None = None) -> int:
         owned = 0 if producer_owned is None else producer_owned
         return owned + _buffered_group_count(getattr(self, "_output", None))
@@ -348,27 +359,45 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         data: list[Group] = []
         do_print = True
         drain_started = time.monotonic()
+        pacer = getattr(self, "_jit_pacer", None)
+        escape_timer: asyncio.Task[Any] | None = None
+        if (
+            pacer is not None
+            and not getattr(self, "_jit_cold_start_pending", False)
+            and getattr(self, "_reserved_groups", None) is None
+            and pacer.target_batches < pacer.config.max_batches
+        ):
 
-        while len(data) < target_data_size:
-            entry = await self._next_group(
-                current_version=input.weight_version, trainer_model_id=input.trainer_model_id
-            )
-            assert len(entry.group) == args.n_samples_per_prompt
+            async def _live_escape() -> None:
+                await asyncio.sleep(pacer.config.wait_escape_seconds)
+                await self.trigger_jit_escape(max(time.monotonic() - drain_started, pacer.config.wait_escape_seconds))
 
-            if do_print:
-                sample = first_sample(entry.group)
-                logger.info(
-                    "First rollout sample: text_preview=%s, label=%s, reward_summary=%s",
-                    sample_text_preview(sample),
-                    str(sample.label)[:100],
-                    reward_log_summary(sample.reward),
+            escape_timer = asyncio.create_task(_live_escape())
+
+        try:
+            while len(data) < target_data_size:
+                entry = await self._next_group(
+                    current_version=input.weight_version, trainer_model_id=input.trainer_model_id
                 )
-                do_print = False
+                assert len(entry.group) == args.n_samples_per_prompt
 
-            data.append(entry.group)
+                if do_print:
+                    sample = first_sample(entry.group)
+                    logger.info(
+                        "First rollout sample: text_preview=%s, label=%s, reward_summary=%s",
+                        sample_text_preview(sample),
+                        str(sample.label)[:100],
+                        reward_log_summary(sample.reward),
+                    )
+                    do_print = False
+
+                data.append(entry.group)
+        finally:
+            if escape_timer is not None:
+                escape_timer.cancel()
+                await asyncio.gather(escape_timer, return_exceptions=True)
 
         drain_finished = time.monotonic()
-        pacer = getattr(self, "_jit_pacer", None)
         pacer_metrics: dict[str, float] = {}
         if pacer is not None and getattr(self, "_reserved_groups", None) is None:
             cold_start = getattr(self, "_jit_cold_start_pending", False)

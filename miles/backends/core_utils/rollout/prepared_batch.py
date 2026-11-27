@@ -69,24 +69,36 @@ class PreparedBatch:
         if rollout_id != self.rollout_id:
             raise RuntimeError(f"Prepared rollout {self.rollout_id} cannot serve rollout {rollout_id}")
         waited_at = time.monotonic()
-        batch = await asyncio.shield(self.task)
+        pacer = getattr(self.executor.generate_rollout, "_jit_pacer", None)
+        if pacer is not None and pacer.target_batches < pacer.config.max_batches and not self.task.done():
+            escape_after = pacer.config.wait_escape_seconds
+            try:
+                batch = await asyncio.wait_for(asyncio.shield(self.task), timeout=escape_after)
+            except TimeoutError:
+                elapsed = max(time.monotonic() - waited_at, escape_after)
+                await asyncio.wrap_future(
+                    async_utils.submit(self.executor.generate_rollout.trigger_jit_escape(elapsed))
+                )
+                batch = await asyncio.shield(self.task)
+        else:
+            batch = await asyncio.shield(self.task)
         # Publication may have progressed while collection waited for generations.
         actual = self.executor._weight_versions_of_model_id.get(None)
         if actual != self.version:
             raise RuntimeError(f"Prepared batch expected policy {self.version}, published policy is {actual}")
         # Keep the transfer result even if this consumer is cancelled. Prompts
         # remain in the checkpoint ledger until the no-await commit below.
-        consumer_wait = max(0.0, self.finished - waited_at) if self.finished is not None else 0.0
-        ready_before = max(0.0, waited_at - self.finished) if self.finished is not None else 0.0
-        self._release = asyncio.wrap_future(
-            async_utils.submit(
-                self.executor.generate_rollout.release_reservation(
-                    consume=True,
-                    trainer_wait_seconds=consumer_wait,
-                    ready_before_consumer_seconds=ready_before,
-                )
+        if pacer is not None:
+            consumer_wait = max(0.0, self.finished - waited_at) if self.finished is not None else 0.0
+            ready_before = max(0.0, waited_at - self.finished) if self.finished is not None else 0.0
+            release_coro = self.executor.generate_rollout.release_reservation(
+                consume=True,
+                trainer_wait_seconds=consumer_wait,
+                ready_before_consumer_seconds=ready_before,
             )
-        )
+        else:
+            release_coro = self.executor.generate_rollout.release_reservation(consume=True)
+        self._release = asyncio.wrap_future(async_utils.submit(release_coro))
         groups = await asyncio.shield(self._release)
         self._log_timings(rollout_id, waited_at)
         # The data source serializes ledger mutations with its cursor lock.

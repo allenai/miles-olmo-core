@@ -262,6 +262,8 @@ class RefreshingRolloutFn(ManagedFullyAsyncRolloutFn):
         self._producer_resumed.clear()
         self._publication_paused = True
         self._generation_admission.pause()
+        if (pacer := getattr(self, "_jit_pacer", None)) is not None:
+            pacer.on_pause()
         logger.info(
             "Generation admission paused: active=%d waiting=%d owned_groups=%d",
             self._generation_admission.active,

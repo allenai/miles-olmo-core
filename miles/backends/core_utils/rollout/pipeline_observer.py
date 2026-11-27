@@ -81,6 +81,32 @@ def snapshot(producer):
         if all(row is not None for row in ready)
         else None
     )
+    completed_queue_groups = len(buffer) if buffer is not None else None
+    reserved_groups_list = getattr(producer, "_reserved_groups", None) or ()
+    downstream_group_indices = {
+        entry.prompt_group[0].group_index
+        for entry in (buffer or ())
+        if getattr(entry, "prompt_group", None) and hasattr(entry.prompt_group[0], "group_index")
+    } | {group[0].group_index for group in reserved_groups_list if group and hasattr(group[0], "group_index")}
+    owned_not_downstream = len(producer._producing_groups) - sum(
+        1 for group_index in producer._producing_groups if group_index in downstream_group_indices
+    )
+    reserved_groups = len(reserved_groups_list)
+    retained_groups = (
+        owned_not_downstream + completed_queue_groups + reserved_groups if completed_queue_groups is not None else None
+    )
+    pacer = getattr(producer, "_jit_pacer", None)
+    if pacer is not None:
+        max_retained_batches = pacer.target_batches
+        max_retained_groups = pacer.target_groups
+    else:
+        max_retained_batches = getattr(args, "async_max_retained_batches", None)
+        rollout_batch_size = getattr(args, "rollout_batch_size", None)
+        max_retained_groups = (
+            math.floor(max_retained_batches * rollout_batch_size)
+            if max_retained_batches is not None and math.isfinite(max_retained_batches) and rollout_batch_size
+            else None
+        )
     return {
         "completed_queue": completed,
         "producer_ready": ready_counts,
@@ -99,11 +125,21 @@ def snapshot(producer):
         ),
         "time_unix": time.time(),
         "producer_owned_groups": len(producer._producing_groups),
+        "producer_reserved_groups": reserved_groups,
+        "retained_groups": retained_groups,
+        "jit_pacing_enabled": pacer is not None,
+        "max_retained_batches": max_retained_batches,
+        "max_retained_groups": max_retained_groups,
+        "retained_ownership_saturated": (
+            retained_groups >= max_retained_groups
+            if retained_groups is not None and max_retained_groups is not None
+            else False
+        ),
         **(producer._errors.metrics() if hasattr(producer, "_errors") else {}),
         "producer_active_group_tasks": sum(not task.done() for task in producer._active_tasks),
         "producer_admission_open": producer._producer_resumed.is_set(),
         "producer_unfinished_samples": getattr(producer._scheduler, "samples_in_flight", None),
-        "completed_queue_groups": len(buffer) if buffer is not None else None,
+        "completed_queue_groups": completed_queue_groups,
         "completed_queue_capacity_groups": getattr(delegate, "_capacity", None),
         "generation_admission_paused": getattr(semaphore, "paused", None),
         "generation_admission_waiters": getattr(semaphore, "waiting", None),

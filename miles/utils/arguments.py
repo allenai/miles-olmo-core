@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 import re
 from string import Formatter
@@ -875,6 +876,32 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "decoupling generation concurrency from the training batch size. None (default) "
                     "keeps the legacy bound of one training batch worth of trajectories "
                     "(rollout_batch_size groups, i.e. rollout_batch_size * n_samples_per_prompt)."
+                ),
+            )
+            parser.add_argument(
+                "--async-max-retained-batches",
+                type=float,
+                default=None,
+                help=(
+                    "Maximum total prompt groups retained across the fully async pipeline at once, as a "
+                    "multiple of rollout_batch_size (floor(batches * rollout_batch_size) groups), counting "
+                    "in-flight, partially completed, completed awaiting FIFO insertion, buffered in the "
+                    "completed FIFO, and reserved for a prepared batch. Supported for built-in single-policy "
+                    "buffers only; multi-policy and arbitrary custom data buffers are rejected at startup. "
+                    "None (default) leaves retained group count unbounded beyond the per-stage limits."
+                ),
+            )
+            parser.add_argument(
+                "--async-auto-jit-pacing",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable adaptive just-in-time (JIT) pacing of retained prompt groups in fully async mode. "
+                    "Dynamically tightens retained group ownership when the trainer has near-zero wait and "
+                    "excess finished rollouts accumulate (e.g. startup compilation or trainer-bound phases), "
+                    "and snaps immediately back to the full-steam ceiling (--async-max-retained-batches if set, "
+                    "else producer_group_budget / rollout_batch_size + async_data_buffer_capacity_factor) "
+                    "whenever trainer wait exceeds 10s. Requires --fully-async and a built-in single-policy buffer."
                 ),
             )
             parser.add_argument(
@@ -3860,6 +3887,31 @@ def miles_validate_args(args):
         )
 
     _resolve_rollout_functions(args)
+
+    if args.async_max_retained_batches is not None or args.async_auto_jit_pacing:
+        flag = (
+            "--async-max-retained-batches"
+            if args.async_max_retained_batches is not None
+            else "--async-auto-jit-pacing"
+        )
+        assert args.fully_async, f"{flag} requires --fully-async (or FullyAsyncRolloutFn)"
+        if args.async_max_retained_batches is not None:
+            assert math.isfinite(args.async_max_retained_batches) and args.async_max_retained_batches >= 1.0, (
+                f"--async-max-retained-batches ({args.async_max_retained_batches}) must be a finite number >= 1.0: "
+                f"a training step (and prepared-batch reservation) requires a full rollout batch of retained groups"
+            )
+        assert not resolve_megatron_config(args).is_multi_policy, (
+            f"{flag} is only supported for single-policy runs; "
+            "multi-policy buffers can deadlock under a shared retained-group cap"
+        )
+        if args.custom_async_data_buffer_path is not None:
+            buffer_cls = load_function(args.custom_async_data_buffer_path)
+            assert isinstance(buffer_cls, type) and buffer_cls.__dict__.get(
+                "supports_retained_group_accounting", False
+            ), (
+                f"{flag} is only supported with built-in single-policy buffers, "
+                f"got --custom-async-data-buffer-path={args.custom_async_data_buffer_path!r}"
+            )
 
     # Both snapshot postures drive the same RolloutManager._eval_checkpoint path.
     # (The fleet-vs-CheckpointEvalFn conflict is asserted where the posture is derived.)

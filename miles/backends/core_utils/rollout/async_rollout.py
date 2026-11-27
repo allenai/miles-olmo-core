@@ -24,7 +24,7 @@ import httpx
 from miles.backends.core_utils import async_capacity, infra_timeouts
 from miles.backends.core_utils.rollout import observation_io, pipeline_observer, rollout_errors
 from miles.backends.core_utils.rollout.errors import FINITE_POOL_PROVIDERS, GenerationInterrupted, PromptPoolExhausted
-from miles.rollout.fully_async_rollout import FullyAsyncRolloutFn
+from miles.rollout.fully_async_rollout import FullyAsyncRolloutFn, _buffered_group_count
 from miles.rollout.inference_rollout.inference_rollout_train import get_worker_urls
 from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils import logger_utils
@@ -150,7 +150,7 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
             if task.done() and self._reservation_task is task:
                 self._reservation_task = None
 
-    async def release_reservation(self, *, consume):
+    async def release_reservation(self, *, consume, trainer_wait_seconds=None, ready_before_consumer_seconds=0.0):
         """Transfer reserved prompts to the consumer, or regenerate unused work.
 
         Consumption leaves the checkpoint ledger pending. The executor commits
@@ -171,9 +171,17 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         groups = self._reserved_groups
         if not consume and groups:
             self.data_source.requeue_pending_groups([g[0].group_index for g in groups])
-        await self._output.release_prepared_capacity(len(groups))
+        if consume and trainer_wait_seconds is not None and (pacer := getattr(self, "_jit_pacer", None)) is not None:
+            self._jit_cold_start_pending = False
+            pacer.observe_step(
+                trainer_wait_seconds=trainer_wait_seconds,
+                queue_groups_after_drain=_buffered_group_count(self._output),
+                ready_before_consumer_seconds=ready_before_consumer_seconds,
+                now=time.monotonic(),
+            )
         self._reserved_groups = None
         self._reservation_task = None
+        await self._output.release_prepared_capacity(len(groups))
         return groups
 
     async def _next_group(self, current_version: int | None, trainer_model_id: str | None = None) -> Any:
@@ -194,8 +202,19 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                 return entry
         # Own both outcomes: if the worker fails just as a dequeue succeeds,
         # that prompt must remain part of the interrupted batch's retry ledger.
-        queue_get = asyncio.create_task(self._output.get(current_version=current_version))
         recorded = False
+
+        async def dequeue() -> Any:
+            nonlocal recorded
+            entry = await self._output.get(current_version=current_version)
+            if self._reserved_groups is not None:
+                # Transfer prepared-batch ownership synchronously on the dequeue turn
+                # before any producer wakeup can observe a freed buffer slot.
+                self._record_dequeued(entry)
+                recorded = True
+            return entry
+
+        queue_get = asyncio.create_task(dequeue())
         try:
             while True:
                 done, _ = await asyncio.wait(
@@ -208,8 +227,9 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                     raise RuntimeError("fully-async worker exited unexpectedly")
                 if queue_get in done:
                     entry = queue_get.result()
-                    recorded = True
-                    self._record_dequeued(entry)
+                    if not recorded:
+                        recorded = True
+                        self._record_dequeued(entry)
                     return entry
                 if (
                     getattr(self.data_source, "pool_exhausted", lambda: False)()
@@ -243,6 +263,16 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
             self.data_source.acknowledge_groups([entry.prompt_group])
         else:
             self._draining_groups.append(entry.prompt_group)
+
+    def _retained_group_count(self, producer_owned: int | None = None) -> int:
+        reserved_groups = getattr(self, "_reserved_groups", None) or ()
+        if producer_owned is None:
+            producing = getattr(self, "_producing_groups", {})
+            reserved_ids = {g[0].group_index for g in reserved_groups if g and hasattr(g[0], "group_index")}
+            owned = len(producing) - sum(1 for group_index in producing if group_index in reserved_ids)
+        else:
+            owned = producer_owned
+        return owned + _buffered_group_count(getattr(self, "_output", None)) + len(reserved_groups)
 
     def _submit_managed_group(self) -> asyncio.Task:
         [group] = self.data_source.get_samples(1)
@@ -339,6 +369,8 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
             self.data_source.requeue_pending_groups(identities)
         self._producing_groups.clear()
         self._interrupted_groups.clear()
+        if (pacer := getattr(self, "_jit_pacer", None)) is not None:
+            pacer.on_pause()
 
         self._scheduler = make_submission_scheduler(self.args, default="sample")
         self.state.reset()
@@ -398,6 +430,7 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                 or self._stopping
                 or self._interrupted()
                 or time.monotonic() < self._retry_after
+                or not self._has_retained_capacity()
                 or not self._scheduler.has_capacity(
                     pending_groups=len(active), group_budget=self._max_in_flight_groups()
                 )
@@ -438,7 +471,10 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                     if self._stopping:
                         return
                     if self._producer_resumed.is_set():
-                        await asyncio.sleep(0.5)
+                        if not self._has_retained_capacity():
+                            await self._wait_for_retained_capacity(set())
+                        else:
+                            await asyncio.sleep(0.5)
                     else:
                         await self._producer_resumed.wait()
                     self._producer_idle.clear()
@@ -450,6 +486,16 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                 done = {task for task in active if task.done()}
                 if done:
                     active -= done
+                elif self._stopping:
+                    done, active = await asyncio.wait(active, timeout=0.5, return_when=asyncio.FIRST_COMPLETED)
+                    if not done:
+                        self._active_tasks = active
+                        continue
+                elif not self._has_retained_capacity():
+                    done, active = await self._wait_for_retained_capacity(active)
+                    if not done:
+                        self._active_tasks = active
+                        continue
                 else:
                     try:
                         done, active = await asyncio.wait_for(self._scheduler.wait_for_progress(active), timeout=0.5)

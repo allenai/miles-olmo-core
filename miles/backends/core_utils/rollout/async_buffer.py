@@ -24,6 +24,8 @@ def baseline_members(group):
 
 
 class MeasuredDataBuffer(DefaultDataBuffer):
+    supports_retained_group_accounting = True
+
     def __init__(self, input):
         if not hasattr(DefaultDataBuffer, "on_dequeue"):
             raise RuntimeError("Completed-queue metrics require the pinned MILES runtime with on_dequeue support")
@@ -94,6 +96,8 @@ class MeasuredDataBuffer(DefaultDataBuffer):
 
 
 class HomogeneousPolicyDataBuffer:
+    supports_retained_group_accounting = True
+
     def __init__(self, input):
         args = copy(input.args)
         collection = args.rollout_batch_size * args.n_samples_per_prompt
@@ -138,6 +142,12 @@ class HomogeneousPolicyDataBuffer:
         """Use the same stale-data/disposition checks without waiting for new work."""
         return await self._delegate.get(current_version=current_version, wait=False)
 
+    def retained_group_count(self) -> int:
+        return self._delegate.retained_group_count()
+
+    def drain_event(self):
+        return self._delegate.drain_event()
+
     def get_metrics(self, trainer_model_id=None):
         rejected, incomplete, mixed = self._rejected, self._incomplete, self._mixed
         self._rejected = self._incomplete = self._mixed = 0
@@ -162,6 +172,8 @@ class HomogeneousPolicyDataBuffer:
     async def release_prepared_capacity(self, count):
         async with self._delegate._cond:
             self._delegate._capacity += count
+            if hasattr(self._delegate, "_drain_event"):
+                self._delegate._drain_event.set()
             self._delegate._cond.notify_all()
 
     async def reserve_drain_capacity(self, additional):
@@ -187,6 +199,8 @@ class RefreshPolicyDataBuffer(HomogeneousPolicyDataBuffer):
     The delegate still uses the oldest behavior version for the lag limit and
     FIFO consumption. A refreshed suffix never conceals an old prefix.
     """
+
+    supports_retained_group_accounting = True
 
     # The managed producer consumes False to retire intentionally filtered groups.
     async def put(self, item):  # ty: ignore[invalid-method-override]

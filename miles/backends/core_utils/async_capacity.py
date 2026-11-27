@@ -2,6 +2,8 @@
 
 import math
 
+from miles.rollout.jit_pacer import default_bounds as jit_default_bounds
+
 
 def producer_default(options):
     """One collection or two waves of requested serving slots, in whole groups."""
@@ -36,6 +38,31 @@ def report(options, max_policy_lag):
     factor = options.get("async_data_buffer_capacity_factor")
     buffer_groups = math.floor(factor * groups) if factor is not None and groups else None
     buffer_samples = buffer_groups * samples if buffer_groups is not None and samples else None
+    auto_jit_pacing = bool(options.get("async_auto_jit_pacing", False))
+    max_retained_batches = options.get("async_max_retained_batches")
+    jit_min_batches = jit_max_batches = jit_initial_batches = None
+    if auto_jit_pacing and groups and effective is not None and samples and factor is not None:
+        core = options.get("olmo_core")
+        prepared = bool(getattr(core, "prepared_batch_overlap", False)) if core is not None else False
+        jit_min_batches, jit_max_batches, jit_initial_batches = jit_default_bounds(
+            rollout_batch_size=groups,
+            producer_group_budget=effective // samples,
+            buffer_capacity_factor=factor,
+            max_retained_batches=(
+                max_retained_batches
+                if max_retained_batches is not None
+                and math.isfinite(max_retained_batches)
+                and max_retained_batches >= 1.0
+                else None
+            ),
+            prepared_batch_overlap=prepared,
+        )
+    max_retained_groups = (
+        math.floor(max_retained_batches * groups)
+        if max_retained_batches is not None and math.isfinite(max_retained_batches) and groups
+        else None
+    )
+    max_retained_samples = max_retained_groups * samples if max_retained_groups is not None and samples else None
     batch = options.get("global_batch_size")
     warnings = []
     if requested is not None and effective is not None and requested != effective:
@@ -97,10 +124,44 @@ def report(options, max_policy_lag):
             "older groups may then expire. This is a capacity warning, not a predicted discard rate. "
             "Compare drops and trainer wait when reducing async_max_concurrent_samples or the completed-buffer factor."
         )
-    if options.get("rollout_submission_granularity") == "sample":
+    if max_retained_batches is not None and (not math.isfinite(max_retained_batches) or max_retained_batches < 1.0):
         warnings.append(
-            "Sample backfill limits unfinished samples, not all retained siblings. Partly completed groups can hold "
-            "more responses than producer_sample_budget; monitor retained work, long-response age and memory."
+            f"async_max_retained_batches={max_retained_batches} is below 1.0; "
+            "set async_max_retained_batches >= 1.0 so a full rollout batch can be assembled."
+        )
+    if (
+        max_retained_samples is not None
+        and batch
+        and max_policy_lag is not None
+        and max_retained_samples > max_policy_lag * batch
+    ):
+        warnings.append(
+            f"async_max_retained_batches={max_retained_batches:g} ({max_retained_groups} groups, "
+            f"{max_retained_samples} samples) spans {max_retained_samples / batch:g} optimizer batches with "
+            f"max_policy_lag={max_policy_lag}. Under trainer backpressure, older retained groups may expire before "
+            "consumption; reduce async_max_retained_batches and measure stale-group discards."
+        )
+    if (
+        max_retained_groups is not None
+        and effective is not None
+        and samples
+        and max_retained_groups < effective // samples
+    ):
+        warnings.append(
+            f"async_max_retained_batches={max_retained_batches:g} ({max_retained_groups} groups) is below "
+            f"producer_group_budget={effective // samples}; retained ownership will cap active groups before "
+            "async_max_concurrent_samples is reached."
+        )
+    if (
+        options.get("rollout_submission_granularity") == "sample"
+        and max_retained_batches is None
+        and not auto_jit_pacing
+    ):
+        warnings.append(
+            "Sample backfill limits unfinished samples, not all retained siblings. Partly completed groups and "
+            "completed groups awaiting a full FIFO can exceed producer_sample_budget; set "
+            "--async-max-retained-batches or --async-auto-jit-pacing to bound total retained groups or monitor "
+            "retained work, long-response age and memory."
         )
     return {
         "enabled": True,
@@ -114,6 +175,13 @@ def report(options, max_policy_lag):
         "completed_buffer_groups": buffer_groups,
         "completed_buffer_samples": buffer_samples,
         "owned_plus_buffer_samples": combined,
+        "auto_jit_pacing": auto_jit_pacing,
+        "jit_min_retained_batches": jit_min_batches,
+        "jit_max_retained_batches": jit_max_batches,
+        "jit_initial_retained_batches": jit_initial_batches,
+        "max_retained_batches": max_retained_batches,
+        "max_retained_groups": max_retained_groups,
+        "max_retained_samples": max_retained_samples,
         "samples_per_collection": collection,
         "samples_per_optimizer_step": batch,
         "warnings": warnings,

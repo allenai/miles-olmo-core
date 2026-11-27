@@ -19,6 +19,7 @@ rollout engines, pausing producer submissions for the duration of the
 import asyncio
 import logging
 import math
+import time
 from dataclasses import replace
 from typing import Any
 
@@ -46,6 +47,7 @@ from miles.rollout.fully_async_data_buffer import (
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
+from miles.rollout.jit_pacer import JitPacerConfig, JitRetainedPacer, default_bounds
 from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
@@ -129,19 +131,41 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self._producer_resumed = asyncio.Event()
         self._producer_resumed.set()
         self._output: DataBuffer | None = None
-        if _resolve_max_retained_groups(input.args) is not None:
+        self._jit_pacer: JitRetainedPacer | None = None
+        jit_enabled = bool(getattr(input.args, "async_auto_jit_pacing", False))
+        explicit_max_groups = _resolve_max_retained_groups(input.args)
+        if explicit_max_groups is not None or jit_enabled:
+            flag = "async_max_retained_batches" if explicit_max_groups is not None else "async_auto_jit_pacing"
             if resolve_megatron_config(input.args).is_multi_policy:
                 raise ValueError(
-                    "async_max_retained_batches is only supported for single-policy runs; "
+                    f"{flag} is only supported for single-policy runs; "
                     "multi-policy buffers can deadlock under a shared retained-group cap"
                 )
             if (custom_path := getattr(input.args, "custom_async_data_buffer_path", None)) is not None:
                 buffer_cls = load_function(custom_path)
                 if not is_supported_retained_buffer_cls(buffer_cls):
                     raise ValueError(
-                        f"async_max_retained_batches is only supported with built-in single-policy buffers, "
+                        f"{flag} is only supported with built-in single-policy buffers, "
                         f"got custom buffer {custom_path!r}"
                     )
+        if jit_enabled:
+            min_batches, max_batches, initial_batches = default_bounds(
+                rollout_batch_size=input.args.rollout_batch_size,
+                producer_group_budget=self._max_in_flight_groups(),
+                buffer_capacity_factor=getattr(input.args, "async_data_buffer_capacity_factor", 2.0),
+                max_retained_batches=getattr(input.args, "async_max_retained_batches", None),
+                prepared_batch_overlap=bool(
+                    getattr(getattr(input.args, "olmo_core", None), "prepared_batch_overlap", False)
+                ),
+            )
+            self._jit_pacer = JitRetainedPacer(
+                JitPacerConfig(
+                    rollout_batch_size=input.args.rollout_batch_size,
+                    min_batches=min_batches,
+                    max_batches=max_batches,
+                    initial_batches=initial_batches,
+                )
+            )
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if input.evaluation:
@@ -178,6 +202,8 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         try:
             results = await run_eval_datasets(self.state, self._eval_prompt_dataset_cache)
         finally:
+            if (pacer := getattr(self, "_jit_pacer", None)) is not None:
+                pacer.on_pause()
             self._producer_resumed.set()
             logger.info("Resumed fully-async producer submissions after eval")
         return RolloutFnEvalOutput(data=results)
@@ -191,6 +217,8 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         return self.args.rollout_batch_size
 
     def _max_retained_groups(self) -> int | None:
+        if (pacer := getattr(self, "_jit_pacer", None)) is not None:
+            return pacer.target_groups
         return _resolve_max_retained_groups(getattr(self, "args", None))
 
     def _retained_group_count(self, producer_owned: int | None = None) -> int:
@@ -216,7 +244,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             return set(), active
         waiters = {asyncio.create_task(event.wait()) for event in events}
         stop_event = getattr(self, "_stop_requested", None)
-        if isinstance(stop_event, asyncio.Event):
+        if isinstance(stop_event, asyncio.Event) and not getattr(self, "_stopping", False):
             waiters.add(asyncio.create_task(stop_event.wait()))
         try:
             targets = active | waiters
@@ -317,6 +345,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         target_data_size = args.rollout_batch_size
         data: list[Group] = []
         do_print = True
+        drain_started = time.monotonic()
 
         while len(data) < target_data_size:
             entry = await self._next_group(
@@ -336,6 +365,21 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
 
             data.append(entry.group)
 
+        drain_finished = time.monotonic()
+        pacer = getattr(self, "_jit_pacer", None)
+        pacer_metrics: dict[str, float] = {}
+        if pacer is not None and getattr(self, "_reserved_groups", None) is None:
+            prev_groups = pacer.target_groups
+            pacer.observe_step(
+                trainer_wait_seconds=drain_finished - drain_started,
+                queue_groups_after_drain=_buffered_group_count(self._output),
+                now=drain_finished,
+            )
+            if pacer.target_groups > prev_groups:
+                for event in _drain_events(self._output):
+                    event.set()
+            pacer_metrics = pacer.metrics()
+
         sample = first_sample(data[-1])
         logger.info(
             "Finish rollout: text_preview=%s, label=%s, reward_summary=%s",
@@ -349,7 +393,10 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         if self._sample_filter is not None:
             self._sample_filter(args, data)
 
-        return RolloutFnTrainOutput(samples=data, metrics=self._output.get_metrics(input.trainer_model_id))
+        metrics = self._output.get_metrics(input.trainer_model_id)
+        if pacer_metrics:
+            metrics.update(pacer_metrics)
+        return RolloutFnTrainOutput(samples=data, metrics=metrics)
 
     def _recycle(self, prompt_group: list[Sample]) -> None:
         for sample in prompt_group:

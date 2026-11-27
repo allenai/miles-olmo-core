@@ -76,8 +76,16 @@ class PreparedBatch:
             raise RuntimeError(f"Prepared batch expected policy {self.version}, published policy is {actual}")
         # Keep the transfer result even if this consumer is cancelled. Prompts
         # remain in the checkpoint ledger until the no-await commit below.
+        consumer_wait = max(0.0, self.finished - waited_at) if self.finished is not None else 0.0
+        ready_before = max(0.0, waited_at - self.finished) if self.finished is not None else 0.0
         self._release = asyncio.wrap_future(
-            async_utils.submit(self.executor.generate_rollout.release_reservation(consume=True))
+            async_utils.submit(
+                self.executor.generate_rollout.release_reservation(
+                    consume=True,
+                    trainer_wait_seconds=consumer_wait,
+                    ready_before_consumer_seconds=ready_before,
+                )
+            )
         )
         groups = await asyncio.shield(self._release)
         self._log_timings(rollout_id, waited_at)
@@ -102,12 +110,15 @@ class PreparedBatch:
             "ready_before_consumer_seconds": max(0.0, waited_at - self.finished),
             "expected_policy_version": self.version,
         }
+        pacer = getattr(self.executor.generate_rollout, "_jit_pacer", None)
+        pacer_metrics = pacer.metrics() if pacer is not None else {}
         logger.info("Prepared batch timing: rollout_id=%s %s", rollout_id, timings)
         tracking.log(
             self.executor.args,
             {
                 "rollout/step": compute_rollout_step(self.executor.args, rollout_id),
                 **{f"rollout/prepared_batch/{key}": value for key, value in timings.items()},
+                **pacer_metrics,
             },
             step_key="rollout/step",
         )

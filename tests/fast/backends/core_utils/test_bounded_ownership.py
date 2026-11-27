@@ -13,6 +13,7 @@ from miles.backends.core_utils.rollout.async_buffer import HomogeneousPolicyData
 from miles.rollout import fully_async_rollout
 from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnTrainInput
 from miles.rollout.fully_async_data_buffer import DataBufferConstructorInput, DataBufferInput, DefaultDataBuffer
+from miles.rollout.jit_pacer import JitPacerConfig, JitRetainedPacer, default_bounds
 from miles.rollout.submission_scheduler import SampleBackfillSubmission
 from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
 
@@ -458,6 +459,42 @@ def test_rejects_multi_policy_and_custom_buffers_when_bounded_ownership_enabled(
     )
     assert fn._max_retained_groups() is None
 
+    # async_auto_jit_pacing enforces the same single-policy and built-in-buffer constraints.
+    with pytest.raises(ValueError, match="single-policy"):
+        fully_async_rollout.FullyAsyncRolloutFn(
+            RolloutFnConstructorInput(
+                args=SimpleNamespace(
+                    **{**base_args, "async_max_retained_batches": None, "async_auto_jit_pacing": True}
+                ),
+                data_source=_FakeDataSource(),
+            )
+        )
+    monkeypatch.setattr(
+        fully_async_rollout, "resolve_megatron_config", lambda args: SimpleNamespace(is_multi_policy=False)
+    )
+    with pytest.raises(ValueError, match="built-in single-policy buffers"):
+        fully_async_rollout.FullyAsyncRolloutFn(
+            RolloutFnConstructorInput(
+                args=SimpleNamespace(
+                    **{
+                        **base_args,
+                        "async_max_retained_batches": None,
+                        "async_auto_jit_pacing": True,
+                        "custom_async_data_buffer_path": custom_path,
+                    }
+                ),
+                data_source=_FakeDataSource(),
+            )
+        )
+    jit_fn = fully_async_rollout.FullyAsyncRolloutFn(
+        RolloutFnConstructorInput(
+            args=SimpleNamespace(**{**base_args, "async_max_retained_batches": None, "async_auto_jit_pacing": True}),
+            data_source=_FakeDataSource(),
+        )
+    )
+    assert jit_fn._jit_pacer is not None
+    assert jit_fn._max_retained_groups() == jit_fn._jit_pacer.target_groups
+
 
 def test_filter_drops_and_recoverable_failures_release_retained_ownership(monkeypatch):
     """Dynamic-filter drops and requeued serving failures must free retained ownership slots."""
@@ -638,3 +675,242 @@ def test_async_capacity_report_reflects_max_retained_batches():
 
     tighter_than_concurrency = async_capacity.report({**base, "async_max_retained_batches": 1.0}, max_policy_lag=12)
     assert any("below producer_group_budget=384" in warning for warning in tighter_than_concurrency["warnings"])
+
+    jit_only = async_capacity.report({**base, "async_auto_jit_pacing": True}, max_policy_lag=12)
+    assert jit_only["auto_jit_pacing"] is True
+    assert jit_only["jit_min_retained_batches"] == 1.5
+    assert jit_only["jit_max_retained_batches"] == pytest.approx(3.5)
+    assert jit_only["jit_initial_retained_batches"] == 2.5
+    assert not any("Sample backfill limits unfinished samples" in warning for warning in jit_only["warnings"])
+
+
+def test_shutdown_with_active_task_and_saturated_cap_does_not_spin(monkeypatch):
+    """During managed shutdown with a saturated cap and an active task, the worker loop must not busy-spin."""
+    _patch_observers(monkeypatch)
+
+    async def scenario():
+        producer, data_source = _make_managed_producer(
+            rollout_batch_size=1,
+            n_samples_per_prompt=2,
+            async_max_concurrent_samples=4,
+            async_max_retained_batches=2.0,  # cap = 2 groups
+            async_data_buffer_capacity_factor=1.0,  # FIFO holds 1 group
+        )
+        release_active = asyncio.Event()
+        active_started = asyncio.Event()
+
+        async def generate(prompt_group):
+            idx = prompt_group[0].group_index
+            if idx == 0:
+                for _ in prompt_group:
+                    producer._scheduler.sample_done_callback()
+                return DataBufferInput(prompt_group=prompt_group, group=prompt_group)
+            active_started.set()
+            await release_active.wait()
+            for _ in prompt_group:
+                producer._scheduler.sample_done_callback()
+            return DataBufferInput(prompt_group=prompt_group, group=prompt_group)
+
+        producer._generate_group = generate
+        wait_calls = 0
+        original_wait = asyncio.wait
+
+        async def counted_wait(*args, **kwargs):
+            nonlocal wait_calls
+            wait_calls += 1
+            return await original_wait(*args, **kwargs)
+
+        producer._worker = asyncio.create_task(producer._worker_loop())
+        try:
+            await asyncio.wait_for(active_started.wait(), timeout=2.0)
+            await _wait_until(lambda: len(producer._output._buffer) == 1 and data_source.submitted == [0, 1])
+
+            monkeypatch.setattr(async_rollout.asyncio, "wait", counted_wait)
+            shutdown_task = asyncio.create_task(producer.shutdown())
+            await asyncio.sleep(0.08)
+            # Waiting for group 1 to finish during shutdown must block on active, not spin on _stop_requested.
+            assert not shutdown_task.done()
+            assert wait_calls <= 3
+            release_active.set()
+            await asyncio.wait_for(shutdown_task, timeout=2.0)
+        finally:
+            release_active.set()
+            if producer._worker is not None and not producer._worker.done():
+                await producer.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_pipeline_observer_deduplicates_group_in_producing_and_buffer():
+    """Transient overlap between _producing_groups and _output._buffer must not double-count retained_groups."""
+    group0 = _make_group(0, group_size=2)
+    group1 = _make_group(1, group_size=2)
+    entry0 = DataBufferInput(prompt_group=group0, group=group0)
+    resumed = asyncio.Event()
+    resumed.set()
+    producer = SimpleNamespace(
+        args=SimpleNamespace(
+            sglang_server_concurrency=64,
+            rollout_num_gpus=1,
+            rollout_num_gpus_per_engine=1,
+            rollout_batch_size=2,
+            async_max_retained_batches=1.0,
+        ),
+        state=SimpleNamespace(generate_fn_semaphore=asyncio.Semaphore(64)),
+        _output=SimpleNamespace(_buffer=[entry0], _capacity=2),
+        _ready_completion_counts={},
+        _active_tasks=set(),
+        # Group 0 is already appended to _buffer while still transiently present in _producing_groups.
+        _producing_groups={0: group0, 1: group1},
+        _reserved_groups=None,
+        _producer_resumed=resumed,
+        _scheduler=SimpleNamespace(samples_in_flight=2),
+    )
+    snap = pipeline_observer.snapshot(producer)
+    assert snap["producer_owned_groups"] == 2
+    assert snap["completed_queue_groups"] == 1
+    assert snap["retained_groups"] == 2
+    assert snap["max_retained_groups"] == 2
+
+
+def test_jit_pacer_tightens_on_slack_bumps_on_moderate_wait_and_escapes_on_stall():
+    """Verify reverse-AIMD control law: slow tighten on zero-wait slack, bump on >2s, snap-to-max on >10s."""
+    min_b, max_b, init_b = default_bounds(
+        rollout_batch_size=256,
+        producer_group_budget=1092,
+        buffer_capacity_factor=1.5,
+        max_retained_batches=None,
+        prepared_batch_overlap=True,
+    )
+    assert min_b == 2.0
+    assert max_b == pytest.approx(1092 / 256 + 1.5)
+    assert init_b == 3.0
+
+    pacer = JitRetainedPacer(
+        JitPacerConfig(
+            rollout_batch_size=256,
+            min_batches=2.0,
+            max_batches=4.0,
+            initial_batches=3.0,
+        )
+    )
+    assert pacer.target_batches == 3.0
+    assert pacer.target_groups == 768
+
+    # Zero wait WITHOUT slack (empty queue, not early) must NOT tighten.
+    t = 100.0
+    for _ in range(6):
+        t += 120.0
+        pacer.observe_step(
+            trainer_wait_seconds=0.0, queue_groups_after_drain=0, ready_before_consumer_seconds=0.0, now=t
+        )
+    assert pacer.target_batches == 3.0
+
+    # Three consecutive calm steps with large slack (batch ready 60s early on 120s step) tighten by 0.5 -> 2.5.
+    for _ in range(3):
+        t += 120.0
+        pacer.observe_step(
+            trainer_wait_seconds=0.0, queue_groups_after_drain=256, ready_before_consumer_seconds=60.0, now=t
+        )
+    assert pacer.target_batches == 2.5
+
+    # Three more calm steps with moderate slack tighten by 0.25 -> 2.25, then clamp at floor 2.0.
+    for _ in range(3):
+        t += 120.0
+        pacer.observe_step(
+            trainer_wait_seconds=0.2, queue_groups_after_drain=80, ready_before_consumer_seconds=0.0, now=t
+        )
+    assert pacer.target_batches == 2.25
+    for _ in range(3):
+        t += 120.0
+        pacer.observe_step(
+            trainer_wait_seconds=0.0, queue_groups_after_drain=300, ready_before_consumer_seconds=0.0, now=t
+        )
+    assert pacer.target_batches == 2.0
+
+    # Moderate trainer wait (>2s, <=10s) bumps gently by +0.5 -> 2.5 and triggers cooldown.
+    t += 124.0
+    pacer.observe_step(trainer_wait_seconds=4.0, queue_groups_after_drain=0, now=t)
+    assert pacer.target_batches == 2.5
+
+    # Stall (>10s) immediately escapes to max_batches=4.0 and holds through 5-step cooldown.
+    t += 132.0
+    pacer.observe_step(trainer_wait_seconds=12.0, queue_groups_after_drain=0, now=t)
+    assert pacer.target_batches == 4.0
+    for _ in range(5):
+        t += 120.0
+        pacer.observe_step(
+            trainer_wait_seconds=0.0, queue_groups_after_drain=256, ready_before_consumer_seconds=60.0, now=t
+        )
+    # Still at 4.0 through cooldown; after 3 post-cooldown calm steps it resumes tightening.
+    assert pacer.target_batches == 4.0
+    for _ in range(3):
+        t += 120.0
+        pacer.observe_step(
+            trainer_wait_seconds=0.0, queue_groups_after_drain=256, ready_before_consumer_seconds=60.0, now=t
+        )
+    assert pacer.target_batches == 3.5
+
+    # Pause resets wall-clock baseline so long evals don't distort rolling trainer step time.
+    pacer.on_pause()
+    prev_rolling = pacer.metrics()["rollout/fully_async/jit_pacer/rolling_trainer_step_seconds"]
+    pacer.observe_step(trainer_wait_seconds=0.0, queue_groups_after_drain=0, now=t + 3600.0)
+    assert pacer.metrics()["rollout/fully_async/jit_pacer/rolling_trainer_step_seconds"] == pytest.approx(prev_rolling)
+
+
+def test_auto_jit_pacing_live_producer_tightens_and_escapes(monkeypatch):
+    """Live ManagedFullyAsyncRolloutFn with JIT pacer caps startup, tightens on slack, and snaps up on >10s wait."""
+    _patch_observers(monkeypatch)
+
+    async def scenario():
+        producer, data_source = _make_managed_producer(
+            rollout_batch_size=2,
+            n_samples_per_prompt=2,
+            async_max_concurrent_samples=16,  # 8 groups = 4 batches
+            async_max_retained_batches=4.0,
+            async_data_buffer_capacity_factor=4.0,
+            use_homogeneous_buffer=True,
+        )
+        producer._jit_pacer = JitRetainedPacer(
+            JitPacerConfig(rollout_batch_size=2, min_batches=2.0, max_batches=4.0, initial_batches=3.0)
+        )
+
+        async def generate(prompt_group):
+            for _ in prompt_group:
+                producer._scheduler.sample_done_callback()
+            return DataBufferInput(prompt_group=prompt_group, group=prompt_group)
+
+        producer._generate_group = generate
+        producer._worker = asyncio.create_task(producer._worker_loop())
+        try:
+            # Startup compilation cap starts at initial_batches=3.0 (6 groups), not max_batches=4.0 (8 groups).
+            await _wait_until(lambda: len(producer._output._delegate._buffer) == 6 and not producer._active_tasks)
+            assert len(data_source.submitted) == 6
+            snap = pipeline_observer.snapshot(producer)
+            assert snap["jit_pacing_enabled"] is True
+            assert snap["max_retained_batches"] == 3.0
+            assert snap["max_retained_groups"] == 6
+
+            # Three zero-wait prepared-batch consumptions with leftover FIFO slack tighten target 3.0 -> 2.5 (5 groups).
+            for rollout_id in range(3):
+                await producer.reserve(RolloutFnTrainInput(rollout_id=rollout_id, weight_version=0))
+                await producer.release_reservation(
+                    consume=True, trainer_wait_seconds=0.0, ready_before_consumer_seconds=30.0
+                )
+            assert producer._jit_pacer.target_batches == 2.5
+            assert producer._max_retained_groups() == 5
+
+            # A >10s trainer wait immediately snaps target to max_batches=4.0 (8 groups) and wakes refill.
+            await producer.reserve(RolloutFnTrainInput(rollout_id=3, weight_version=0))
+            await producer.release_reservation(
+                consume=True, trainer_wait_seconds=12.0, ready_before_consumer_seconds=0.0
+            )
+            assert producer._jit_pacer.target_batches == 4.0
+            assert producer._max_retained_groups() == 8
+            await _wait_until(lambda: len(producer._output._delegate._buffer) == 8, timeout=0.5)
+        finally:
+            if producer._reserved_groups is not None:
+                await producer.release_reservation(consume=False)
+            await producer.shutdown()
+
+    asyncio.run(scenario())

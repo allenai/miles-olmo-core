@@ -150,7 +150,7 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
             if task.done() and self._reservation_task is task:
                 self._reservation_task = None
 
-    async def release_reservation(self, *, consume):
+    async def release_reservation(self, *, consume, trainer_wait_seconds=None, ready_before_consumer_seconds=0.0):
         """Transfer reserved prompts to the consumer, or regenerate unused work.
 
         Consumption leaves the checkpoint ledger pending. The executor commits
@@ -171,6 +171,13 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         groups = self._reserved_groups
         if not consume and groups:
             self.data_source.requeue_pending_groups([g[0].group_index for g in groups])
+        if consume and trainer_wait_seconds is not None and (pacer := getattr(self, "_jit_pacer", None)) is not None:
+            pacer.observe_step(
+                trainer_wait_seconds=trainer_wait_seconds,
+                queue_groups_after_drain=_buffered_group_count(self._output),
+                ready_before_consumer_seconds=ready_before_consumer_seconds,
+                now=time.monotonic(),
+            )
         self._reserved_groups = None
         self._reservation_task = None
         await self._output.release_prepared_capacity(len(groups))
@@ -356,6 +363,8 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
             self.data_source.requeue_pending_groups(identities)
         self._producing_groups.clear()
         self._interrupted_groups.clear()
+        if (pacer := getattr(self, "_jit_pacer", None)) is not None:
+            pacer.on_pause()
 
         self._scheduler = make_submission_scheduler(self.args, default="sample")
         self.state.reset()
@@ -471,6 +480,11 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                 done = {task for task in active if task.done()}
                 if done:
                     active -= done
+                elif self._stopping:
+                    done, active = await asyncio.wait(active, timeout=0.5, return_when=asyncio.FIRST_COMPLETED)
+                    if not done:
+                        self._active_tasks = active
+                        continue
                 elif not self._has_retained_capacity():
                     done, active = await self._wait_for_retained_capacity(active)
                     if not done:

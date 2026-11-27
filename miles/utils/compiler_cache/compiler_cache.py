@@ -171,6 +171,7 @@ def _core_triton_inputs(runtime_lock, settings, toolchain):
         "sglang_server_concurrency",
         "async_max_concurrent_samples",
         "async_max_retained_batches",
+        "async_auto_jit_pacing",
     ):
         miles.pop(key, None)
     # Only known single-GPU serving workers share a role key. Physical slot IDs

@@ -82,19 +82,30 @@ def snapshot(producer):
         else None
     )
     completed_queue_groups = len(buffer) if buffer is not None else None
+    buffered_group_indices = {
+        entry.prompt_group[0].group_index
+        for entry in (buffer or ())
+        if getattr(entry, "prompt_group", None) and hasattr(entry.prompt_group[0], "group_index")
+    }
+    owned_not_buffered = len(producer._producing_groups) - sum(
+        1 for group_index in producer._producing_groups if group_index in buffered_group_indices
+    )
     reserved_groups = len(getattr(producer, "_reserved_groups", None) or ())
     retained_groups = (
-        len(producer._producing_groups) + completed_queue_groups + reserved_groups
-        if completed_queue_groups is not None
-        else None
+        owned_not_buffered + completed_queue_groups + reserved_groups if completed_queue_groups is not None else None
     )
-    max_retained_batches = getattr(args, "async_max_retained_batches", None)
-    rollout_batch_size = getattr(args, "rollout_batch_size", None)
-    max_retained_groups = (
-        math.floor(max_retained_batches * rollout_batch_size)
-        if max_retained_batches is not None and math.isfinite(max_retained_batches) and rollout_batch_size
-        else None
-    )
+    pacer = getattr(producer, "_jit_pacer", None)
+    if pacer is not None:
+        max_retained_batches = pacer.target_batches
+        max_retained_groups = pacer.target_groups
+    else:
+        max_retained_batches = getattr(args, "async_max_retained_batches", None)
+        rollout_batch_size = getattr(args, "rollout_batch_size", None)
+        max_retained_groups = (
+            math.floor(max_retained_batches * rollout_batch_size)
+            if max_retained_batches is not None and math.isfinite(max_retained_batches) and rollout_batch_size
+            else None
+        )
     return {
         "completed_queue": completed,
         "producer_ready": ready_counts,
@@ -115,6 +126,7 @@ def snapshot(producer):
         "producer_owned_groups": len(producer._producing_groups),
         "producer_reserved_groups": reserved_groups,
         "retained_groups": retained_groups,
+        "jit_pacing_enabled": pacer is not None,
         "max_retained_batches": max_retained_batches,
         "max_retained_groups": max_retained_groups,
         "retained_ownership_saturated": (

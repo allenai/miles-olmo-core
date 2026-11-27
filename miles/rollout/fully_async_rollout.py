@@ -132,6 +132,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self._producer_resumed.set()
         self._output: DataBuffer | None = None
         self._jit_pacer: JitRetainedPacer | None = None
+        self._jit_cold_start_pending = False
         jit_enabled = bool(getattr(input.args, "async_auto_jit_pacing", False))
         explicit_max_groups = _resolve_max_retained_groups(input.args)
         if explicit_max_groups is not None or jit_enabled:
@@ -166,6 +167,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
                     initial_batches=initial_batches,
                 )
             )
+            self._jit_cold_start_pending = True
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if input.evaluation:
@@ -369,11 +371,14 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         pacer = getattr(self, "_jit_pacer", None)
         pacer_metrics: dict[str, float] = {}
         if pacer is not None and getattr(self, "_reserved_groups", None) is None:
+            cold_start = getattr(self, "_jit_cold_start_pending", False)
+            self._jit_cold_start_pending = False
             prev_groups = pacer.target_groups
             pacer.observe_step(
                 trainer_wait_seconds=drain_finished - drain_started,
                 queue_groups_after_drain=_buffered_group_count(self._output),
                 now=drain_finished,
+                cold_start=cold_start,
             )
             if pacer.target_groups > prev_groups:
                 for event in _drain_events(self._output):

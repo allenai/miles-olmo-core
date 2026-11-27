@@ -82,17 +82,18 @@ def snapshot(producer):
         else None
     )
     completed_queue_groups = len(buffer) if buffer is not None else None
-    buffered_group_indices = {
+    reserved_groups_list = getattr(producer, "_reserved_groups", None) or ()
+    downstream_group_indices = {
         entry.prompt_group[0].group_index
         for entry in (buffer or ())
         if getattr(entry, "prompt_group", None) and hasattr(entry.prompt_group[0], "group_index")
-    }
-    owned_not_buffered = len(producer._producing_groups) - sum(
-        1 for group_index in producer._producing_groups if group_index in buffered_group_indices
+    } | {group[0].group_index for group in reserved_groups_list if group and hasattr(group[0], "group_index")}
+    owned_not_downstream = len(producer._producing_groups) - sum(
+        1 for group_index in producer._producing_groups if group_index in downstream_group_indices
     )
-    reserved_groups = len(getattr(producer, "_reserved_groups", None) or ())
+    reserved_groups = len(reserved_groups_list)
     retained_groups = (
-        owned_not_buffered + completed_queue_groups + reserved_groups if completed_queue_groups is not None else None
+        owned_not_downstream + completed_queue_groups + reserved_groups if completed_queue_groups is not None else None
     )
     pacer = getattr(producer, "_jit_pacer", None)
     if pacer is not None:

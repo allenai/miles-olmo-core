@@ -88,6 +88,7 @@ class JitRetainedPacer:
         self._escape_count = 0
         self._bump_count = 0
         self._tighten_count = 0
+        self._last_metrics: dict[str, float] = self._build_metrics()
 
     @property
     def target_batches(self) -> float:
@@ -108,8 +109,13 @@ class JitRetainedPacer:
         queue_groups_after_drain: int,
         ready_before_consumer_seconds: float = 0.0,
         now: float | None = None,
+        cold_start: bool = False,
     ) -> float:
         """Update the retained-batch target after one completed training batch handoff.
+
+        Set ``cold_start=True`` on the initial step-0 direct drain (before any training
+        step has executed) so cold-start fill latency establishes the handoff clock
+        without snapping ``target_batches`` to ``max_batches`` before trainer compilation.
 
         Returns the updated ``target_batches``.
         """
@@ -118,6 +124,12 @@ class JitRetainedPacer:
         ready_early = max(0.0, float(ready_before_consumer_seconds))
         queue_batches = max(0.0, queue_groups_after_drain / cfg.rollout_batch_size)
         self._last_wait_seconds = wait
+
+        if cold_start:
+            if now is not None:
+                self._last_handoff_at = now
+            self._last_metrics = self._build_metrics()
+            return self._target_batches
 
         if now is not None:
             if self._last_handoff_at is not None:
@@ -138,6 +150,7 @@ class JitRetainedPacer:
                 self._escape_count += 1
             self._cooldown_remaining = cfg.escape_cooldown_steps
             self._clear_window()
+            self._last_metrics = self._build_metrics()
             return self._target_batches
 
         # 2. Gentle bump: respond to moderate trainer wait before it becomes a stall.
@@ -147,11 +160,13 @@ class JitRetainedPacer:
                 self._bump_count += 1
             self._cooldown_remaining = max(self._cooldown_remaining, cfg.bump_cooldown_steps)
             self._clear_window()
+            self._last_metrics = self._build_metrics()
             return self._target_batches
 
         # 3. Cooldown after any upward adjustment so generation latency settles.
         if self._cooldown_remaining > 0:
             self._cooldown_remaining -= 1
+            self._last_metrics = self._build_metrics()
             return self._target_batches
 
         # 4. Accumulate calm-step window and tighten only on sustained zero-wait + real slack.
@@ -160,6 +175,7 @@ class JitRetainedPacer:
         self._recent_ready_fractions.append(ready_fraction)
 
         if len(self._recent_waits) < cfg.window_steps:
+            self._last_metrics = self._build_metrics()
             return self._target_batches
 
         max_recent_wait = max(self._recent_waits)
@@ -182,6 +198,7 @@ class JitRetainedPacer:
                 self._tighten_count += 1
             self._clear_window()
 
+        self._last_metrics = self._build_metrics()
         return self._target_batches
 
     def _clear_window(self) -> None:
@@ -189,7 +206,7 @@ class JitRetainedPacer:
         self._recent_queue_batches.clear()
         self._recent_ready_fractions.clear()
 
-    def metrics(self) -> dict[str, float]:
+    def _build_metrics(self) -> dict[str, float]:
         prefix = "rollout/fully_async/jit_pacer/"
         result: dict[str, float] = {
             f"{prefix}target_retained_batches": self._target_batches,
@@ -206,3 +223,7 @@ class JitRetainedPacer:
                 self._recent_trainer_steps
             )
         return result
+
+    def metrics(self) -> dict[str, float]:
+        """Return a copy of the latest producer-loop metrics snapshot (safe across loops)."""
+        return dict(self._last_metrics)

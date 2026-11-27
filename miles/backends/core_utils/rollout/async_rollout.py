@@ -172,6 +172,7 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         if not consume and groups:
             self.data_source.requeue_pending_groups([g[0].group_index for g in groups])
         if consume and trainer_wait_seconds is not None and (pacer := getattr(self, "_jit_pacer", None)) is not None:
+            self._jit_cold_start_pending = False
             pacer.observe_step(
                 trainer_wait_seconds=trainer_wait_seconds,
                 queue_groups_after_drain=_buffered_group_count(self._output),
@@ -264,9 +265,14 @@ class ManagedFullyAsyncRolloutFn(FullyAsyncRolloutFn):
             self._draining_groups.append(entry.prompt_group)
 
     def _retained_group_count(self, producer_owned: int | None = None) -> int:
-        owned = len(getattr(self, "_producing_groups", ())) if producer_owned is None else producer_owned
-        reserved = len(getattr(self, "_reserved_groups", None) or ())
-        return owned + _buffered_group_count(getattr(self, "_output", None)) + reserved
+        reserved_groups = getattr(self, "_reserved_groups", None) or ()
+        if producer_owned is None:
+            producing = getattr(self, "_producing_groups", {})
+            reserved_ids = {g[0].group_index for g in reserved_groups if g and hasattr(g[0], "group_index")}
+            owned = len(producing) - sum(1 for group_index in producing if group_index in reserved_ids)
+        else:
+            owned = producer_owned
+        return owned + _buffered_group_count(getattr(self, "_output", None)) + len(reserved_groups)
 
     def _submit_managed_group(self) -> asyncio.Task:
         [group] = self.data_source.get_samples(1)

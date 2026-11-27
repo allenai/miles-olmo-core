@@ -772,9 +772,15 @@ def test_pipeline_observer_deduplicates_group_in_producing_and_buffer():
     assert snap["retained_groups"] == 2
     assert snap["max_retained_groups"] == 2
 
+    # Same deduplication holds when a group is reserved while still transiently in _producing_groups.
+    producer._output = SimpleNamespace(_buffer=[], _capacity=2)
+    producer._reserved_groups = [group0]
+    snap_reserved = pipeline_observer.snapshot(producer)
+    assert snap_reserved["retained_groups"] == 2
+
 
 def test_jit_pacer_tightens_on_slack_bumps_on_moderate_wait_and_escapes_on_stall():
-    """Verify reverse-AIMD control law: slow tighten on zero-wait slack, bump on >2s, snap-to-max on >10s."""
+    """Verify reverse-AIMD control law: cold-start ignored, slow tighten on slack, bump >2s, snap >10s."""
     min_b, max_b, init_b = default_bounds(
         rollout_batch_size=256,
         producer_group_budget=1092,
@@ -797,8 +803,19 @@ def test_jit_pacer_tightens_on_slack_bumps_on_moderate_wait_and_escapes_on_stall
     assert pacer.target_batches == 3.0
     assert pacer.target_groups == 768
 
-    # Zero wait WITHOUT slack (empty queue, not early) must NOT tighten.
+    # Step-0 cold-start drain waiting 120s must NOT trigger fast escape before trainer compilation.
     t = 100.0
+    pacer.observe_step(
+        trainer_wait_seconds=120.0,
+        queue_groups_after_drain=0,
+        ready_before_consumer_seconds=0.0,
+        now=t,
+        cold_start=True,
+    )
+    assert pacer.target_batches == 3.0
+    assert pacer.metrics()["rollout/fully_async/jit_pacer/escape_events"] == 0.0
+
+    # Zero wait WITHOUT slack (empty queue, not early) must NOT tighten.
     for _ in range(6):
         t += 120.0
         pacer.observe_step(
